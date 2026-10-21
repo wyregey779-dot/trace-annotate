@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.9+](https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg)](pyproject.toml)
-[![Tests: 13/13 Passing](https://img.shields.io/badge/Tests-13%2F13%20Passing-success.svg)](tests/)
+[![Tests: 33/33 Passing](https://img.shields.io/badge/Tests-33%2F33%20Passing-success.svg)](tests/)
 [![Offline: 100%](https://img.shields.io/badge/Offline-Zero%20External%20Traffic-orange.svg)](#)
 
 [English](README.md) | [中文说明](README_CN.md)
@@ -198,6 +198,29 @@ TraceAnnotate includes an automated verification engine that checks 21 quantitat
 - `video_windows_null == 0`: All video assets contain usable editing windows.
 - `face_missing == 0`, `ocr_missing == 0`, `clip_missing == 0`.
 - `fill_missing == 0`: 100% field-level provenance audit coverage.
+
+---
+
+## 🛡️ Production Reliability & Hardened Contracts (T01 - T14)
+
+TraceAnnotate prioritizes **"credible results, discoverable errors, traceable modifications, and recoverable failures"**. The entire pipeline is verified by a strict 14-point contract test suite:
+
+| ID | Contract Guarantee | Implementation & Verification |
+|:---:|---|---|
+| **T01** | **Path Traversal Protection** | Blocks `..`, absolute paths, and drive indicators via safe path resolvers; raises `PermissionError`. |
+| **T02** | **Atomic Write & Snapshot Fallback** | Atomic filesystem rename (`os.replace`) with `.bak` snapshot fallback; append-only revision logging. |
+| **T03** | **Staging Task Isolation** | Prevents concurrent deletion of in-use staged files (`lock_in_use`/`unlock_in_use`); dynamic space quota guard. |
+| **T04** | **Multi-Framerate Consistency** | Continuous-to-frame timestamp mapping verified across 25, 29.97, 30, and 60 FPS without drift. |
+| **T05** | **Temporal Schema Validation** | Rejects negative timestamps, inverted ranges (`start >= end`), and overlapping working segments. |
+| **T06** | **Label Studio Order Invariance** | Multi-pass parsing ensures attribute nodes appearing before regions are fully resolved; unlabelled values stay `None`. |
+| **T07** | **Global Action Mapping Stability** | Action segmentation exporters maintain stable class IDs across sequential batches without label drift. |
+| **T08** | **Multidimensional Agreement & Paradox** | Distinguishes temporal IoU from semantic conflicts (step, verdict, error_type); detects Kappa prevalence paradox. |
+| **T09** | **Out-of-Range Step Isolation** | Custom `ProcedureSpec` bounds step reconciliation; invalid steps (e.g. 999) never create artificial missing steps. |
+| **T10** | **Extractor Truthfulness** | Extractors without model weights return explicit `NOT_RUN` / `None`, never faking "zero persons" or "no screen". |
+| **T11** | **Tail Idle Duration Padding** | Uses actual video duration metadata to pad tail idle frames for training action segmenters (ActionFormer/MS-TCN). |
+| **T12** | **Audit Trail Rollback Preservation** | Rollback restores previous values as a new audit event without destroying subsequent revision history. |
+| **T13** | **Directory Overlap Guard** | Prohibits identical or nested source and staging roots to prevent data corruption. |
+| **T14** | **Deterministic Provenance Idempotency** | Normalized JSON input hashing guarantees identical provenance cache hits across pipeline reruns. |
 
 ---
 

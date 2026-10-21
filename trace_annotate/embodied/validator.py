@@ -4,6 +4,7 @@ Ensures strict compliance with Annotation Specification v2.1:
   - Diagnostic consistency (non-normal clips must have empty working and required report).
   - Verdict consistency (wrong segments must specify error_type in 7 classes with non-empty evidence).
   - Step numbering integrity.
+  - Temporal consistency (non-negative timestamps, start < end, non-overlapping working segments).
 """
 from __future__ import annotations
 import os
@@ -39,6 +40,8 @@ def validate_embodied_doc(doc: Dict[str, Any]) -> List[str]:
         return errors
 
     working = doc.get("working", [])
+    valid_time_segs = []
+
     for idx, w in enumerate(working):
         prefix = f"{clip_id} working[{idx}]"
         start = w.get("start")
@@ -46,8 +49,18 @@ def validate_embodied_doc(doc: Dict[str, Any]) -> List[str]:
 
         if start is None or end is None:
             errors.append(f"{prefix}: Missing start or end timestamp")
-        elif float(start) >= float(end):
-            errors.append(f"{prefix}: start ({start}) must be strictly less than end ({end})")
+        else:
+            try:
+                s_val = float(start)
+                e_val = float(end)
+                if s_val < 0:
+                    errors.append(f"{prefix}: start timestamp cannot be negative ({s_val})")
+                if s_val >= e_val:
+                    errors.append(f"{prefix}: start ({start}) must be strictly less than end ({end})")
+                else:
+                    valid_time_segs.append((s_val, e_val, idx))
+            except (ValueError, TypeError):
+                errors.append(f"{prefix}: Invalid numeric timestamp format")
 
         step = w.get("step_number")
         if not isinstance(step, int):
@@ -69,6 +82,16 @@ def validate_embodied_doc(doc: Dict[str, Any]) -> List[str]:
         elif verdict == Verdict.CORRECT.value:
             if w.get("error_type"):
                 errors.append(f"{prefix}: verdict='对' must not have error_type (found '{w.get('error_type')}')")
+
+    # Check for overlapping working segments
+    valid_time_segs.sort(key=lambda x: x[0])
+    for k in range(1, len(valid_time_segs)):
+        prev_s, prev_e, prev_idx = valid_time_segs[k - 1]
+        curr_s, curr_e, curr_idx = valid_time_segs[k]
+        if curr_s < prev_e:
+            errors.append(
+                f"{clip_id}: working segments overlap in time: working[{prev_idx}] ({prev_s}..{prev_e}) and working[{curr_idx}] ({curr_s}..{curr_e})"
+            )
 
     return errors
 

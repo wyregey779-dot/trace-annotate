@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.9+](https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg)](pyproject.toml)
-[![Tests: 13/13 Passing](https://img.shields.io/badge/Tests-13%2F13%20Passing-success.svg)](tests/)
+[![Tests: 33/33 Passing](https://img.shields.io/badge/Tests-33%2F33%20Passing-success.svg)](tests/)
 [![Offline: 100%](https://img.shields.io/badge/Offline-Zero%20External%20Traffic-orange.svg)](#)
 
 [English](README.md) | [中文说明](README_CN.md)
@@ -198,6 +198,29 @@ print(diff["out_of_order"])  # 乱序步骤: [{'previous_step': 1, 'current_step
 - `video_windows_null == 0`: 视频资产可用窗口必须有落值。
 - `face_missing == 0`, `ocr_missing == 0`, `clip_missing == 0`。
 - `fill_missing == 0`: 全量字段 100% 具备来源归因审计码。
+
+---
+
+## 🛡️ 生产级可靠性与硬约束契约（T01 - T14）
+
+TraceAnnotate 严格贯彻 **“结果可信、错误可发现、修改可追溯、失败可恢复”** 的工程哲学。整个系统通过了严格的 14 项契约回归测试：
+
+| 契约编号 | 核心保障能力 | 实现与校验方式 |
+|:---:|---|---|
+| **T01** | **冷存储路径防穿越与绝对路径注入防护** | 引入安全路径解析器，阻断 `..`、盘符越界与绝对路径攻击；非法路径直接抛出 `PermissionError`。 |
+| **T02** | **原子落盘、双重备份与审计追踪** | 采用操作系统底层原子替换（`os.replace`）与 `.bak` 快照兜底，告别“先删后写”的断电损毁风险。 |
+| **T03** | **暂存盘动态配额与活跃任务隔离** | 引入 `lock_in_use`/`unlock_in_use` 活跃状态锁，防止后台清理误删正在使用的视频片段；动态检查剩余空间。 |
+| **T04** | **多帧率映射一致性** | 严格校验证真 25, 29.97, 30, 60 FPS 连续时间戳到离散帧索引的双向映射，杜绝帧漂移与负区间。 |
+| **T05** | **时序 Schema 硬约束校验** | 拦截负时间戳、时间区间颠倒（`start >= end`）及工作段重叠异常（Overlapping intervals）。 |
+| **T06** | **Label Studio 乱序无关与缺失属性保护** | 采用多遍解构机制，属性节点先于区域出现时完全可靠绑定；未打标属性保留为 `None`，杜绝静默伪填“对”或“步骤1”。 |
+| **T07** | **动作分割全局类别映射抗漂移** | ActionFormer / ASFormer / MS-TCN 数据集导出器支持加载并维护持久化全局映射，避免分批导出类别 ID 冲突。 |
+| **T08** | **时间一致性与语义冲突严格正交** | 独立评估时间重合度（tIoU）与语义一致性（步骤、判定、错误类型）；数学检测并报告 Kappa 假阳性流行率悖论。 |
+| **T09** | **独立流程规范与离群步骤隔离** | 支持自定义 `ProcedureSpec` 流程规范；对异常离群步骤（如 step 999）直接标记为 invalid，不再虚假扩散 998 个 missing 遗漏步骤。 |
+| **T10** | **提取器运行状态真诚汇报** | 模型权重未加载或跳过运行时，明确返回 `NOT_RUN` 与 `None`，严禁伪报“无人物”或“无屏幕”。 |
+| **T11** | **视频真实总时长保持与尾部 Idle 补齐** | 严格按视频元数据真实时长对齐动作分割标签，尾部静默区间完整补全为 `idle`，杜绝训练集尾部截断。 |
+| **T12** | **安全回滚与审计历史永不删除** | 状态回滚操作作为全新修订事件追加记入，完整保留历次修改责任人、原因与旧值，审计链永不破损。 |
+| **T13** | **源目录与暂存目录重叠严禁启动** | 运行时严格检测并拒绝源盘与暂存盘相同、相互嵌套或父子包含，彻底隔绝递归复制或误清盘灾难。 |
+| **T14** | **全流程 Stage 确定性哈希与幂等重跑** | 规整 JSON 输入指纹哈希，确保相同输入与配置生成完全幂等的 provenance 审计缓存。 |
 
 ---
 

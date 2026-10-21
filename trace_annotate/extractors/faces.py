@@ -1,5 +1,5 @@
 """
-Face Detection Extractor with OpenCV 5.0 compatibility.
+Face Detection Extractor with OpenCV 5.0 compatibility and explicit execution status.
 Supports YuNet ONNX face detection loaded via memory buffers,
 calculating face count, crowd density, and bounding boxes.
 """
@@ -14,20 +14,21 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-from trace_annotate.extractors.base import BaseExtractor
+from trace_annotate.extractors.base import BaseExtractor, ExtractorStatus
 from trace_annotate.core.hasher import safe_load_image
 from trace_annotate.config import MetricThresholds
 
 
 class FaceExtractor(BaseExtractor):
-    """Detects faces using YuNet ONNX or provides safe fallbacks."""
+    """Detects faces using YuNet ONNX or provides safe fallbacks with explicit status."""
 
     def __init__(
         self,
         model_path: Optional[str] = None,
+        weights_path: Optional[str] = None,
         thresholds: Optional[MetricThresholds] = None
     ):
-        self.model_path = model_path
+        self.model_path = model_path or weights_path
         self.thresholds = thresholds or MetricThresholds()
         self.detector = None
         self._init_detector()
@@ -72,21 +73,31 @@ class FaceExtractor(BaseExtractor):
         h, w = img_bgr.shape[:2]
 
         if self.detector is None:
+            # Explicitly mark as not run, do not claim zero persons!
             return {
-                "face_count": 0,
-                "face_status": "无人物",
-                "crowd_level": "无人",
+                "status": ExtractorStatus.NOT_RUN.value,
+                "face_count": None,
+                "face_status": None,
+                "crowd_level": None,
                 "faces_detected": []
             }
 
         try:
             self.detector.setInputSize((w, h))
             _, faces = self.detector.detect(img_bgr)
-        except Exception:
-            faces = None
+        except Exception as e:
+            return {
+                "status": ExtractorStatus.FAILED.value,
+                "error": str(e),
+                "face_count": None,
+                "face_status": None,
+                "crowd_level": None,
+                "faces_detected": []
+            }
 
         if faces is None or len(faces) == 0:
             return {
+                "status": ExtractorStatus.SUCCESS.value,
                 "face_count": 0,
                 "face_status": "无人物",
                 "crowd_level": "无人",
@@ -130,19 +141,37 @@ class FaceExtractor(BaseExtractor):
             status = "人群密集"
 
         return {
+            "status": ExtractorStatus.SUCCESS.value,
             "face_count": count,
             "face_status": status,
             "crowd_level": crowd,
             "faces_detected": detected_list
         }
 
+    def detect_faces_in_video(self, video_path: str) -> Dict[str, Any]:
+        """Convenience wrapper for video face detection."""
+        if self.detector is None:
+            return {
+                "status": ExtractorStatus.NOT_RUN.value,
+                "face_count": None,
+                "face_status": None,
+                "crowd_level": None,
+                "faces_detected": []
+            }
+        return self.extract({}, video_path)
+
     def extract(self, asset_item: Dict[str, Any], staged_path: str) -> Dict[str, Any]:
         img = safe_load_image(staged_path)
         if img is None:
             return {
-                "face_count": 0,
-                "face_status": "无人物",
-                "crowd_level": "无人",
+                "status": ExtractorStatus.FAILED.value,
+                "face_count": None,
+                "face_status": None,
+                "crowd_level": None,
                 "faces_detected": []
             }
         return self.detect_faces(img)
+
+
+# Alias for backward compatibility
+FaceDetector = FaceExtractor

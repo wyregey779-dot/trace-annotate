@@ -1,66 +1,68 @@
 """
-Label Studio Integration & Configuration Generator.
-Generates XML task templates and converts Label Studio annotations to standardized format.
+Label Studio Integration & Bi-directional Bridge.
+Exports schema v2.1 configuration XML and ingests Label Studio task export JSON
+with order-independent multi-pass resolution and strict attribute preservation.
 """
 from __future__ import annotations
 import json
-from typing import Dict, Any, List, Optional
-from trace_annotate.embodied.schema import EmbodiedAnnotationDoc, WorkingSegment, MidSegment, IdleSegment
+from typing import Dict, Any, List, Optional, Union
+from trace_annotate.embodied.schema import (
+    EmbodiedAnnotationDoc,
+    WorkingSegment,
+    IdleSegment,
+    MidSegment,
+    ClipStatus,
+    Verdict,
+    ErrorType
+)
 
 
-LABEL_STUDIO_XML_TEMPLATE = """<View>
-  <Header value="第一步：整段诊断（先选这个，命中即停）" />
-  <Text name="description" value="$text_description" />
-  <Choices name="clip_status" toName="video" choice="single" showInline="true" required="true">
-    <Choice value="正常" />
-    <Choice value="佩戴问题" />
-    <Choice value="描述不符-整段无关" />
-    <Choice value="描述不符-仅部分工作" />
-    <Choice value="这里没有" />
+LABEL_STUDIO_XML_TEMPLATE = """
+<View>
+  <Video name="video" value="$video_url" sync="timeline"/>
+
+  <!-- Clip-Level Diagnostics -->
+  <Header value="第一步：整段诊断"/>
+  <Choices name="clip_status" toName="video" showInline="true" required="true">
+    <Choice value="正常"/>
+    <Choice value="佩戴问题"/>
+    <Choice value="描述不符-整段无关"/>
+    <Choice value="描述不符-仅部分工作"/>
+    <Choice value="这里没有"/>
   </Choices>
-  <TextArea name="clip_report" toName="video" editable="true" rows="1"
-    placeholder="选了佩戴问题/描述不符时必填：Quick ID（视频左上角）+ 一句话现象；正常则留空" />
+  <TextArea name="report" toName="video" placeholder="若非正常，填写Quick ID及事实依据" rows="2"/>
 
-  <Header value="第二步：画 working 段（绿）；段内 idle/视角异常画段中段（橙），不拆段" />
-  <Video name="video" value="$video_url" framerate="30.0" />
-  <VideoTimeline name="timeline" />
-  <Labels name="videoLabels" toName="video" allowCreate="false">
-    <Label value="working" background="#00C853" />
-    <Label value="段中段" background="#FF9800" />
-    <Label value="idle" background="#9E9E9E" />
-  </Labels>
+  <!-- Timeline Work/Idle Segmentation -->
+  <Header value="第二步：工作段圈定与细化"/>
+  <TimelineLabels name="timeline" toName="video">
+    <Label value="working" background="#22c55e"/>
+    <Label value="mid_segment" background="#eab308"/>
+    <Label value="idle" background="#94a3b8"/>
+  </TimelineLabels>
 
-  <Header value="第三步：点选每个绿色 working 段，先挂步骤编号，再判对错（橙/灰段不判）" />
-  <Number name="step_number" toName="video" perRegion="true"
-    perRegionControl="videoLabels" precision="0" min="1" max="30"
-    value="1"
-    hint="该段对应流程描述的第几步；工具据此自动 diff 遗漏/乱序/重复" />
-  <Choices name="seg_verdict" toName="video" choice="single" perRegion="true"
-    perRegionControl="videoLabels">
-    <Choice value="对" />
-    <Choice value="错" />
-    <Choice value="无法判断" />
+  <!-- Per-Region Working Properties -->
+  <Header value="工作段执行对错判断"/>
+  <Number name="step_number" toName="video" perRegion="true" min="1" max="100"/>
+  <Choices name="verdict" toName="video" perRegion="true" showInline="true">
+    <Choice value="对"/>
+    <Choice value="错"/>
+    <Choice value="无法判断"/>
   </Choices>
-  <Choices name="error_type" toName="video" choice="single" perRegion="true"
-    perRegionControl="videoLabels"
-    visibleWhen="choice-selected" whenChoiceFromName="seg_verdict" whenChoiceValue="错">
-    <Choice value="遗漏步骤" />
-    <Choice value="顺序错误" />
-    <Choice value="重复/多做" />
-    <Choice value="用错物体" />
-    <Choice value="操作方式错误" />
-    <Choice value="意外事故" />
-    <Choice value="其他" />
+
+  <Header value="错误类型（仅错时填写）"/>
+  <Choices name="error_type" toName="video" perRegion="true" showInline="true">
+    <Choice value="遗漏步骤"/>
+    <Choice value="顺序错误"/>
+    <Choice value="重复/多做"/>
+    <Choice value="用错物体"/>
+    <Choice value="操作方式错误"/>
+    <Choice value="意外事故"/>
+    <Choice value="其他"/>
   </Choices>
-  <TextArea name="seg_evidence" toName="video" editable="true" perRegion="true"
-    perRegionControl="videoLabels" rows="2"
-    placeholder="判错必填，按模板填：t=XX 用了A应为B / 第N步全程未出现 / t=XX 物体掉落"
-    visibleWhen="choice-selected" whenChoiceFromName="seg_verdict" whenChoiceValue="错" />
-  <TextArea name="correction_events" toName="video" editable="true" perRegion="true"
-    perRegionControl="videoLabels" rows="1"
-    placeholder="（选填）段内做错后自行纠正/拿错秒放的事件：t=XX 曾做错X已自行纠正；无则留空" />
+  <TextArea name="evidence" toName="video" perRegion="true" placeholder="填入事实证据（如：t=14s 用了改锥应为扳手）" rows="2"/>
+  <TextArea name="correction_events" toName="video" perRegion="true" placeholder="纠错动作描述（如：放回改锥，重新拿起扳手）" rows="2"/>
 </View>
-"""
+""".strip()
 
 
 def generate_label_studio_xml() -> str:
@@ -68,9 +70,11 @@ def generate_label_studio_xml() -> str:
     return LABEL_STUDIO_XML_TEMPLATE
 
 
-def parse_label_studio_export(raw_task: Dict[str, Any]) -> EmbodiedAnnotationDoc:
+def parse_single_label_studio_task(raw_task: Dict[str, Any]) -> EmbodiedAnnotationDoc:
     """
-    Parse a raw Label Studio task export JSON item into a standardized EmbodiedAnnotationDoc.
+    Parse a single Label Studio task item into a standardized EmbodiedAnnotationDoc.
+    Multi-pass parsing ensures order-invariance: properties appearing before regions are fully bound.
+    Missing attributes are preserved as None rather than silently defaulting to '对' or step 1.
     """
     data = raw_task.get("data", {})
     clip_name = data.get("video_url", "unknown.mp4").split("/")[-1]
@@ -89,70 +93,99 @@ def parse_label_studio_export(raw_task: Dict[str, Any]) -> EmbodiedAnnotationDoc
     latest = annotations[-1]
     result = latest.get("result", [])
 
-    working_map = {}
-    mid_segs = []
-    idle_segs = []
+    working_regions: Dict[str, Dict[str, Any]] = {}
+    mid_segs: List[Dict[str, Any]] = []
+    idle_segs: List[IdleSegment] = []
+    pending_attributes: Dict[str, Dict[str, Any]] = {}
 
+    # Pass 1: Collect clip diagnostics and categorize regions vs attributes
     for r in result:
-        val = r.get("value", {})
         from_name = r.get("from_name", "")
+        r_type = r.get("type", "")
+        val = r.get("value", {})
+        rid = r.get("id")
 
         if from_name == "clip_status":
             choices = val.get("choices", [])
             if choices:
                 doc.clip_status = choices[0]
-        elif from_name == "clip_report":
-            text = val.get("text", [])
-            if text:
-                doc.report = text[0]
+        elif from_name == "report":
+            texts = val.get("text", [])
+            if texts:
+                doc.report = texts[0]
+        elif r_type in ("labels", "timelinelabels", "videorectangle"):
+            # Temporal boundaries
+            start = val.get("start")
+            end = val.get("end")
+            seq = val.get("sequence", [])
+            if start is None and seq:
+                start = seq[0].get("time", 0.0)
+                end = seq[-1].get("time", start)
 
-        elif from_name == "videoLabels":
-            labels = val.get("labels", [])
-            start = float(val.get("start", 0.0))
-            end = float(val.get("end", 0.0))
-            region_id = r.get("id")
+            labels = val.get("labels", []) or val.get("timelinelabels", [])
+            label = labels[0] if labels else "working"
 
-            if "working" in labels:
-                working_map[region_id] = {
-                    "start": start,
-                    "end": end,
-                    "step_number": 1,
-                    "verdict": "对",
-                    "error_type": None,
-                    "evidence": None,
-                    "correction_events": [],
-                    "mid_segments": []
-                }
-            elif "段中段" in labels:
-                mid_segs.append({"start": start, "end": end, "reason": "idle"})
-            elif "idle" in labels:
-                idle_segs.append(IdleSegment(start=start, end=end))
+            if start is not None and end is not None:
+                start = float(start)
+                end = float(end)
+                if label == "working" or r_type == "videorectangle":
+                    working_regions[rid] = {
+                        "start": start,
+                        "end": end,
+                        "step_number": None,
+                        "verdict": None,
+                        "error_type": None,
+                        "evidence": None,
+                        "correction_events": []
+                    }
+                elif label == "mid_segment":
+                    mid_segs.append({"start": start, "end": end, "reason": "idle"})
+                elif label == "idle":
+                    idle_segs.append(IdleSegment(start=start, end=end))
 
-        elif from_name in {"step_number", "seg_verdict", "error_type", "seg_evidence", "correction_events"}:
-            region_id = r.get("id") or r.get("parent_id")
-            if region_id and region_id in working_map:
-                w = working_map[region_id]
-                if from_name == "step_number":
-                    w["step_number"] = int(val.get("number", 1))
-                elif from_name == "seg_verdict":
-                    choices = val.get("choices", [])
-                    if choices:
-                        w["verdict"] = choices[0]
-                elif from_name == "error_type":
-                    choices = val.get("choices", [])
-                    if choices:
-                        w["error_type"] = choices[0]
-                elif from_name == "seg_evidence":
+        elif rid is not None:
+            # Region-bound attribute node (might appear before or after region definition)
+            attr_dict = pending_attributes.setdefault(rid, {})
+
+            if r_type == "number" or from_name == "step_number":
+                step_val = val.get("number")
+                if step_val is not None:
+                    attr_dict["step_number"] = int(step_val)
+            elif r_type == "choices":
+                choices = val.get("choices", [])
+                if choices:
+                    c_val = choices[0]
+                    if c_val in [v.value for v in Verdict]:
+                        attr_dict["verdict"] = c_val
+                    elif c_val in [e.value for e in ErrorType]:
+                        attr_dict["error_type"] = c_val
+            elif r_type == "textarea":
+                if from_name == "evidence":
                     texts = val.get("text", [])
-                    if texts:
-                        w["evidence"] = texts[0]
+                    attr_dict["evidence"] = texts[0] if texts else None
                 elif from_name == "correction_events":
                     texts = val.get("text", [])
                     if texts:
-                        w["correction_events"].append(texts[0])
+                        attr_dict.setdefault("correction_events", []).append(texts[0])
 
+    # Pass 2: Order-independent binding of attributes to working regions
+    for rid, wdict in working_regions.items():
+        if rid in pending_attributes:
+            attrs = pending_attributes[rid]
+            if "step_number" in attrs and attrs["step_number"] is not None:
+                wdict["step_number"] = attrs["step_number"]
+            if "verdict" in attrs and attrs["verdict"] is not None:
+                wdict["verdict"] = attrs["verdict"]
+            if "error_type" in attrs:
+                wdict["error_type"] = attrs["error_type"]
+            if "evidence" in attrs:
+                wdict["evidence"] = attrs["evidence"]
+            if "correction_events" in attrs:
+                wdict["correction_events"] = attrs["correction_events"]
+
+    # Assemble sorted working segments
     working_list = []
-    for wid, wdict in sorted(working_map.items(), key=lambda x: x[1]["start"]):
+    for wid, wdict in sorted(working_regions.items(), key=lambda x: x[1]["start"]):
         matched_mids = []
         for m in mid_segs:
             if wdict["start"] <= m["start"] and m["end"] <= wdict["end"]:
@@ -172,3 +205,14 @@ def parse_label_studio_export(raw_task: Dict[str, Any]) -> EmbodiedAnnotationDoc
     doc.working = working_list
     doc.idle = idle_segs
     return doc
+
+
+def parse_label_studio_export(
+    raw_task_or_tasks: Union[Dict[str, Any], List[Dict[str, Any]]]
+) -> Union[EmbodiedAnnotationDoc, List[EmbodiedAnnotationDoc]]:
+    """
+    Parse a raw Label Studio task or list of tasks export JSON into standardized EmbodiedAnnotationDoc(s).
+    """
+    if isinstance(raw_task_or_tasks, list):
+        return [parse_single_label_studio_task(t) for t in raw_task_or_tasks]
+    return parse_single_label_studio_task(raw_task_or_tasks)

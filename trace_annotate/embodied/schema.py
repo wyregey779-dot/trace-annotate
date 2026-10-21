@@ -42,18 +42,24 @@ class MidSegment:
     end: float
     reason: str = "idle"  # "idle" or "wrist_anomaly"
 
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
 
 @dataclass
 class WorkingSegment:
     """A continuous interval of task action execution."""
     start: float
     end: float
-    step_number: int
-    verdict: str = "对"  # "对" | "错" | "无法判断"
+    step_number: Optional[int] = None
+    verdict: Optional[str] = None  # "对" | "错" | "无法判断" or None if unlabelled
     error_type: Optional[str] = None
     evidence: Optional[str] = None
     correction_events: List[str] = field(default_factory=list)
     mid_segments: List[MidSegment] = field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
 
 
 @dataclass
@@ -61,6 +67,9 @@ class IdleSegment:
     """Timeline complement intervals where no task action is happening."""
     start: float
     end: float
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
 
 
 @dataclass
@@ -72,6 +81,9 @@ class EmbodiedAnnotationDoc:
     working: List[WorkingSegment] = field(default_factory=list)
     idle: List[IdleSegment] = field(default_factory=list)
     report: Optional[str] = None
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

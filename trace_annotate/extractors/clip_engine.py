@@ -1,5 +1,5 @@
 """
-Zero-Shot CLIP Classification Engine.
+Zero-Shot CLIP Classification Engine with Explicit Execution Status.
 Supports indoor/outdoor, day/night, screen types, weather conditions,
 and entity verification prompts with anchor label softmax normalization.
 """
@@ -8,7 +8,7 @@ import os
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
-from trace_annotate.extractors.base import BaseExtractor
+from trace_annotate.extractors.base import BaseExtractor, ExtractorStatus
 from trace_annotate.core.hasher import safe_load_image
 from trace_annotate.config import MetricThresholds
 
@@ -32,16 +32,17 @@ DEFAULT_PROMPTS = {
 
 
 class CLIPExtractor(BaseExtractor):
-    """Multi-modal zero-shot classifier using CLIP."""
+    """Multi-modal zero-shot classifier using CLIP with explicit execution status."""
 
     def __init__(
         self,
         model_name_or_path: Optional[str] = None,
+        model_name: Optional[str] = None,
         prompts: Optional[Dict[str, List[List[Any]]]] = None,
         entity_prompts: Optional[Dict[str, str]] = None,
         thresholds: Optional[MetricThresholds] = None
     ):
-        self.model_path = model_name_or_path
+        self.model_path = model_name_or_path or model_name
         self.prompts = prompts or DEFAULT_PROMPTS
         self.entity_prompts = entity_prompts or {}
         self.thresholds = thresholds or MetricThresholds()
@@ -71,18 +72,21 @@ class CLIPExtractor(BaseExtractor):
     def classify(self, img_bgr: np.ndarray) -> Dict[str, Any]:
         """Classify image array across configured zero-shot prompt groups."""
         if self.model is None:
+            # Explicitly mark as not run, do not claim fake "无屏" or "无人物"!
             return {
+                "status": ExtractorStatus.NOT_RUN.value,
                 "clip_scores": {},
                 "indoor_outdoor": None,
                 "time_of_day": None,
                 "weather": None,
-                "screen_type": "无屏",
+                "screen_type": None,
                 "top_entity": None,
-                "entity_score": 0.0,
+                "entity_score": None,
                 "entity_mismatch": False
             }
 
         return {
+            "status": ExtractorStatus.SUCCESS.value,
             "clip_scores": {},
             "indoor_outdoor": None,
             "time_of_day": None,
@@ -93,17 +97,32 @@ class CLIPExtractor(BaseExtractor):
             "entity_mismatch": False
         }
 
+    def classify_scene(self, media_path: str, categories: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Convenience wrapper for zero-shot scene classification."""
+        if self.model is None:
+            return {
+                "status": ExtractorStatus.NOT_RUN.value,
+                "top_category": None,
+                "scores": {}
+            }
+        return self.extract({}, media_path)
+
     def extract(self, asset_item: Dict[str, Any], staged_path: str) -> Dict[str, Any]:
         img = safe_load_image(staged_path)
         if img is None:
             return {
+                "status": ExtractorStatus.FAILED.value,
                 "clip_scores": {},
                 "indoor_outdoor": None,
                 "time_of_day": None,
                 "weather": None,
-                "screen_type": "无屏",
+                "screen_type": None,
                 "top_entity": None,
-                "entity_score": 0.0,
+                "entity_score": None,
                 "entity_mismatch": False
             }
         return self.classify(img)
+
+
+# Alias for backward compatibility
+CLIPEngine = CLIPExtractor

@@ -1,10 +1,23 @@
 """
-Base Extractor Interface.
-All feature extractors inherit from this class to guarantee modularity and decoupling.
+Base Extractor Interface and Standardized Execution Status Enums.
+Guarantees explicit distinction between:
+  - success (ran and produced prediction)
+  - not_run (model weights absent or disabled)
+  - failed (decode error or runtime crash)
+  - skipped (condition not met)
 """
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Dict, Any
+
+
+class ExtractorStatus(str, Enum):
+    """Standardized execution status for multi-modal feature extractors."""
+    SUCCESS = "success"        # Model ran successfully
+    NOT_RUN = "not_run"        # Model weights missing or disabled
+    FAILED = "failed"          # Image/Video decode error or runtime exception
+    SKIPPED = "skipped"        # Segment filtered out before extraction
 
 
 class BaseExtractor(ABC):
@@ -26,6 +39,6 @@ class BaseExtractor(ABC):
             staged_path: local temporary file path safe for reading
             
         Returns:
-            Dictionary of extracted fields and metrics.
+            Dictionary containing extracted fields, with 'status' key from ExtractorStatus.
         """
         pass
