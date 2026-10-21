@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible problem with TraceAnnotate
+body:
+  - type: markdown
+    attributes:
+      value: For security-sensitive reports, read SECURITY.md before posting. Use synthetic or redacted examples instead of private media or credentials.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include TraceAnnotate version, Python version, OS and installation command.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps and minimal input
+      description: Include the command and a small synthetic annotation that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Include relevant error output with sensitive data removed.
+    validations:
+      required: true

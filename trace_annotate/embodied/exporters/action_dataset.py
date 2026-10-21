@@ -6,7 +6,19 @@ Supports persistent global mapping, true video duration padding, and unknown ste
 """
 from __future__ import annotations
 import os
+import ntpath
+import unicodedata
 from typing import List, Dict, Any, Tuple, Optional, Union
+
+
+_WINDOWS_DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {
+    prefix + digit for prefix in ("COM", "LPT") for digit in "123456789¹²³"
+}
+
+
+def _portable_name_key(name: str) -> str:
+    """Reject canonical Unicode and case aliases independently of host OS."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
 
 
 def load_or_init_mapping(
@@ -75,6 +87,33 @@ def export_to_action_segmentation(
         mapping_path: path to mapping file
         gt_files: list of generated ground truth files
     """
+    # Reject input-controlled paths before writing mapping.txt or any labels.
+    # Use Windows path rules too, so a dataset stays safe across platforms.
+    clip_names = []
+    for d in docs:
+        raw_clip = d.get("clip", "video.mp4")
+        if not isinstance(raw_clip, str) or not raw_clip.strip():
+            raise ValueError("clip must be a non-empty filename")
+        if (os.path.isabs(raw_clip) or ntpath.isabs(raw_clip)
+                or ntpath.splitdrive(raw_clip)[0] or "/" in raw_clip
+                or "\\" in raw_clip or "\x00" in raw_clip or ":" in raw_clip):
+            raise ValueError(f"clip must be a filename without directory components: {raw_clip!r}")
+        if any(ord(character) < 32 or character in '<>"|?*' for character in raw_clip):
+            raise ValueError(f"clip contains characters reserved by Windows: {raw_clip!r}")
+        clip_name = os.path.splitext(raw_clip)[0]
+        if clip_name in ("", ".", ".."):
+            raise ValueError(f"Invalid clip filename: {raw_clip!r}")
+        if raw_clip != raw_clip.rstrip(" .") or clip_name != clip_name.rstrip(" ."):
+            raise ValueError(f"clip and its stem must not end in spaces or dots: {raw_clip!r}")
+        # Windows device aliases remain reserved even with multiple extensions
+        # (NUL.tar.gz) or spaces immediately before the first extension.
+        device_basename = clip_name.split(".", 1)[0].rstrip(" ").upper()
+        if device_basename in _WINDOWS_DEVICE_NAMES:
+            raise ValueError(f"clip uses a reserved Windows device name: {raw_clip!r}")
+        clip_names.append(clip_name)
+    if len({_portable_name_key(name) for name in clip_names}) != len(clip_names):
+        raise ValueError("Clip filenames must produce unique ground-truth filenames")
+
     os.makedirs(output_dir, exist_ok=True)
     gt_dir = os.path.join(output_dir, "groundTruth")
     os.makedirs(gt_dir, exist_ok=True)
@@ -103,9 +142,8 @@ def export_to_action_segmentation(
             f.write(f"{idx} {label}\n")
 
     gt_files = []
-    for d in docs:
+    for d, clip_name in zip(docs, clip_names):
         raw_clip = d.get("clip", "video.mp4")
-        clip_name = os.path.splitext(raw_clip)[0]
         working = d.get("working", [])
 
         # Determine true duration: clip_durations > doc['duration'] > segment bounds

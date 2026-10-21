@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trace-annotate"
-version = "1.0.0"
-description = "Production-grade cold-storage-safe multi-modal data pipeline & embodied AI annotation suite."
+version = "1.0.1"
+description = "Local media staging, annotation provenance, and embodied video annotation tools."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -55,3 +55,6 @@ trace-annotate = "trace_annotate.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["trace_annotate*"]
+
+[tool.setuptools.package-data]
+trace_annotate = ["templates/*.json", "templates/*.xml", "embodied/ui/*.html"]

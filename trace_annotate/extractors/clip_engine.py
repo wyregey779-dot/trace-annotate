@@ -1,7 +1,7 @@
 """
-Zero-Shot CLIP Classification Engine with Explicit Execution Status.
-Supports indoor/outdoor, day/night, screen types, weather conditions,
-and entity verification prompts with anchor label softmax normalization.
+Unfinished CLIP adapter with explicit execution status.
+Prompt configuration is retained for future inference work. This version does
+not load weights or produce model predictions; classification reports not_run.
 """
 from __future__ import annotations
 import os
@@ -32,7 +32,7 @@ DEFAULT_PROMPTS = {
 
 
 class CLIPExtractor(BaseExtractor):
-    """Multi-modal zero-shot classifier using CLIP with explicit execution status."""
+    """Placeholder CLIP interface that explicitly reports missing inference."""
 
     def __init__(
         self,
@@ -54,23 +54,11 @@ class CLIPExtractor(BaseExtractor):
         return "clip"
 
     def _init_model(self) -> None:
-        """Attempt to initialize local cn_clip or transformers model if available."""
-        try:
-            import torch
-            import cn_clip.clip as clip
-            from cn_clip.clip import load_from_name
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if self.model_path and os.path.exists(self.model_path):
-                self.model, self.preprocess = clip.load_from_name(
-                    "ViT-B-16", device=device, download_root=os.path.dirname(self.model_path)
-                )
-            else:
-                self.model = None
-        except Exception:
-            self.model = None
+        """Keep the unfinished inference adapter disabled without downloading weights."""
+        self.model = None
 
     def classify(self, img_bgr: np.ndarray) -> Dict[str, Any]:
-        """Classify image array across configured zero-shot prompt groups."""
+        """Return an explicit not_run result until inference is implemented."""
         if self.model is None:
             # Explicitly mark as not run, do not claim fake "无屏" or "无人物"!
             return {
@@ -86,14 +74,14 @@ class CLIPExtractor(BaseExtractor):
             }
 
         return {
-            "status": ExtractorStatus.SUCCESS.value,
+            "status": ExtractorStatus.NOT_RUN.value,
             "clip_scores": {},
             "indoor_outdoor": None,
             "time_of_day": None,
             "weather": None,
-            "screen_type": "无屏",
+            "screen_type": None,
             "top_entity": None,
-            "entity_score": 0.0,
+            "entity_score": None,
             "entity_mismatch": False
         }
 

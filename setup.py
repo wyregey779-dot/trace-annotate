@@ -1,13 +1,4 @@
-from setuptools import setup, find_packages
+"""Compatibility shim; package metadata and data files live in pyproject.toml."""
+from setuptools import setup
 
-setup(
-    name="trace-annotate",
-    version="1.0.0",
-    packages=find_packages(),
-    include_package_data=True,
-    entry_points={
-        "console_scripts": [
-            "trace-annotate=trace_annotate.cli:main",
-        ],
-    },
-)
+setup()

@@ -6,6 +6,8 @@ and inter-annotator agreement into a standalone visual report.
 from __future__ import annotations
 import os
 import json
+import re
+from html import escape
 from typing import List, Dict, Any, Optional
 
 
@@ -45,7 +47,7 @@ QC_HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="card">
         <div class="card-title">质检视频总数</div>
         <div class="card-value">__TOTAL_CLIPS__</div>
-        <div class="card-sub">段落完整性 100%</div>
+        <div class="card-sub">仅统计输入标注，完整性请另行校验</div>
       </div>
       <div class="card">
         <div class="card-title">Working 工作总时长</div>
@@ -131,9 +133,9 @@ def generate_qc_report(
     clip_rows = []
 
     for d in docs:
-        clip_name = d.get("clip", "video.mp4")
-        desc = d.get("text_description", "")
-        status = d.get("clip_status", "正常")
+        clip_name = escape(str(d.get("clip", "video.mp4")))
+        desc = escape(str(d.get("text_description", "")))
+        status = escape(str(d.get("clip_status", "未标注")))
         working = d.get("working", [])
         idle = d.get("idle", [])
 
@@ -153,7 +155,12 @@ def generate_qc_report(
                 if etype not in error_samples and w.get("evidence"):
                     error_samples[etype] = w["evidence"]
 
-        verd_badge = '<span class="badge badge-error">含错误段</span>' if has_error else '<span class="badge badge-success">全部正确</span>'
+        if has_error:
+            verd_badge = '<span class="badge badge-error">含错误段</span>'
+        elif working and all(w.get("verdict") == "对" for w in working):
+            verd_badge = '<span class="badge badge-success">全部正确</span>'
+        else:
+            verd_badge = '<span class="badge badge-idle">待判定</span>'
         status_badge = f'<span class="badge badge-success">{status}</span>' if status == "正常" else f'<span class="badge badge-idle">{status}</span>'
 
         clip_rows.append(f"""
@@ -177,14 +184,14 @@ def generate_qc_report(
             sample = error_samples.get(etype, "无详细证据文本")
             error_rows.append(f"""
             <tr>
-              <td><span class="badge badge-error">{etype}</span></td>
+              <td><span class="badge badge-error">{escape(str(etype))}</span></td>
               <td><b>{cnt}</b> 次</td>
               <td>{pct}%</td>
-              <td style="color: #cbd5e1;">{sample}</td>
+              <td style="color: #cbd5e1;">{escape(str(sample))}</td>
             </tr>
             """)
     else:
-        error_rows.append("<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>暂无错误记录 (100% 正确)</td></tr>")
+        error_rows.append("<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>暂无错误记录（不代表已全部判定）</td></tr>")
 
     html_content = QC_HTML_TEMPLATE
     html_content = html_content.replace("__TOTAL_CLIPS__", str(total_clips))
@@ -195,8 +202,9 @@ def generate_qc_report(
     html_content = html_content.replace("__ERROR_COUNT__", str(error_count))
     html_content = html_content.replace("__TOTAL_WORKING_SEGS__", str(total_working_segs))
     html_content = html_content.replace("__ERROR_COLOR__", "#f87171" if error_count > 0 else "#4ade80")
-    html_content = html_content.replace("__ERROR_ROWS__", "\n".join(error_rows))
-    html_content = html_content.replace("__CLIP_ROWS__", "\n".join(clip_rows))
+    # Substitute row placeholders once: user text may itself contain placeholder names.
+    rows = {"__ERROR_ROWS__": "\n".join(error_rows), "__CLIP_ROWS__": "\n".join(clip_rows)}
+    html_content = re.sub(r"__ERROR_ROWS__|__CLIP_ROWS__", lambda match: rows[match.group()], html_content)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_html_path)), exist_ok=True)
     with open(output_html_path, "w", encoding="utf-8") as f:

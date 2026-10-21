@@ -7,6 +7,7 @@ import sys
 import os
 import json
 import argparse
+import math
 import webbrowser
 from typing import List
 
@@ -81,13 +82,62 @@ def cmd_asset_sheet(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _duration_seconds(value) -> float:
+    """Require a usable clip length before generating timeline complements."""
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        duration = float(value)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("duration must be a finite positive number") from None
+    return duration
+
+
+def _duration_argument(value: str) -> float:
+    try:
+        return _duration_seconds(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def cmd_embodied_idle(args: argparse.Namespace) -> None:
     """Compute idle complement for an embodied annotation doc."""
-    doc = json.load(open(args.file, "r", encoding="utf-8"))
-    working = doc.get("working", [])
-    total_dur = args.duration or max([float(w["end"]) for w in working] or [0.0])
+    with open(args.file, "r", encoding="utf-8") as stream:
+        doc = json.load(stream)
+    if not isinstance(doc, dict) or not isinstance(doc.get("working"), list):
+        raise ValueError("annotation must be a JSON object with a working array")
+    working = doc["working"]
+    working_end = 0.0
+    for index, segment in enumerate(working):
+        try:
+            if not isinstance(segment, dict):
+                raise ValueError
+            if isinstance(segment.get("start"), bool) or isinstance(segment.get("end"), bool):
+                raise ValueError
+            start, end = float(segment["start"]), float(segment["end"])
+            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"working[{index}] requires finite timestamps with 0 <= start < end") from None
+        working_end = max(working_end, end)
+    if args.duration is not None:
+        total_dur = args.duration
+    elif doc.get("duration") is not None:
+        total_dur = doc["duration"]
+    else:
+        total_dur = max(
+            [float(w["end"]) for w in working]
+            + [float(i["end"]) for i in doc.get("idle", [])]
+            + [0.0]
+        )
+    total_dur = _duration_seconds(total_dur)
+    if total_dur < working_end:
+        raise ValueError("duration must be at least the maximum working end timestamp")
 
     idle = compute_idle_complement(working, total_dur)
+    doc["duration"] = total_dur
     doc["idle"] = idle
 
     if args.inplace:
@@ -268,7 +318,7 @@ def main() -> None:
     # Embodied Idle
     p_idle = subparsers.add_parser("embodied-idle", help="Generate timeline idle complement intervals")
     p_idle.add_argument("file", help="Path to embodied annotation JSON file")
-    p_idle.add_argument("--duration", type=float, help="Total clip duration in seconds")
+    p_idle.add_argument("--duration", type=_duration_argument, help="Finite positive total clip duration in seconds")
     p_idle.add_argument("--inplace", action="store_true", help="Modify file in-place")
     p_idle.set_defaults(func=cmd_embodied_idle)
 

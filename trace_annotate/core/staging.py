@@ -6,6 +6,7 @@ boundary escape prevention, directory overlap guards, and bidirectional head1mb_
 from __future__ import annotations
 import os
 import shutil
+import tempfile
 from typing import List, Generator, Tuple, Optional, Dict, Set
 from trace_annotate.config import StagingConfig
 from trace_annotate.core.hasher import head1mb_md5
@@ -21,14 +22,23 @@ class StagingSecurityError(PermissionError, ValueError):
     pass
 
 
+def _is_within(root: str, path: str) -> bool:
+    """Compare canonical paths with the platform's case and drive semantics."""
+    root = os.path.normcase(os.path.realpath(root))
+    path = os.path.normcase(os.path.realpath(path))
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:
+        return False
+
+
 def resolve_safe_source_path(source_root: str, rel_path: str) -> str:
     """Resolve relative path against source_root and guarantee it cannot escape source boundary."""
     source_root = os.path.realpath(os.path.abspath(source_root))
     if os.path.isabs(rel_path) or (len(rel_path) > 1 and rel_path[1] == ":"):
         raise StagingSecurityError(f"Path traversal detected: absolute paths not permitted: {rel_path}")
     full_path = os.path.realpath(os.path.abspath(os.path.join(source_root, rel_path)))
-    src_prefix = source_root.rstrip(os.sep) + os.sep
-    if not (full_path + os.sep).startswith(src_prefix) and full_path != source_root:
+    if not _is_within(source_root, full_path):
         raise StagingSecurityError(
             f"Path traversal detected: '{rel_path}' attempts to escape source directory '{source_root}'"
         )
@@ -40,9 +50,10 @@ def resolve_safe_staging_path(staging_root: str, rel_path: str) -> str:
     staging_root = os.path.realpath(os.path.abspath(staging_root))
     if os.path.isabs(rel_path) or (len(rel_path) > 1 and rel_path[1] == ":"):
         raise StagingSecurityError(f"Path traversal detected: absolute paths not permitted: {rel_path}")
-    full_path = os.path.abspath(os.path.join(staging_root, rel_path))
-    stg_prefix = staging_root.rstrip(os.sep) + os.sep
-    if not (full_path + os.sep).startswith(stg_prefix) and full_path != staging_root:
+    # realpath follows both POSIX links and Windows directory junctions. A
+    # lexical abspath check alone allows copy and cleanup to affect other disks.
+    full_path = os.path.realpath(os.path.abspath(os.path.join(staging_root, rel_path)))
+    if not _is_within(staging_root, full_path):
         raise StagingSecurityError(
             f"Path traversal detected: '{rel_path}' attempts to escape staging directory '{staging_root}'"
         )
@@ -77,18 +88,16 @@ class StagingManager:
 
     def _validate_directories(self) -> None:
         """Verify source and staging directories do not overlap."""
-        if self.source_root == self.staging_root:
+        if os.path.normcase(self.source_root) == os.path.normcase(self.staging_root):
             raise StagingSecurityError(
                 f"Staging root cannot be identical to source root: {self.source_root}"
             )
         # Check parent-child overlap
-        src_with_sep = self.source_root.rstrip(os.sep) + os.sep
-        stg_with_sep = self.staging_root.rstrip(os.sep) + os.sep
-        if stg_with_sep.startswith(src_with_sep):
+        if _is_within(self.source_root, self.staging_root):
             raise StagingSecurityError(
                 f"Staging root cannot be inside source root ({self.staging_root} inside {self.source_root})"
             )
-        if src_with_sep.startswith(stg_with_sep):
+        if _is_within(self.staging_root, self.source_root):
             raise StagingSecurityError(
                 f"Source root cannot be inside staging root ({self.source_root} inside {self.staging_root})"
             )
@@ -133,6 +142,7 @@ class StagingManager:
                 rel_path = os.path.relpath(full_path, self.staging_root)
                 rel_norm = rel_path.replace("\\", "/")
                 if rel_norm not in self._in_use_locks:
+                    full_path = self.resolve_safe_staging_path(rel_path)
                     cleaned.append(rel_norm)
                     if not dry_run:
                         try:
@@ -174,13 +184,30 @@ class StagingManager:
 
             try:
                 for rel, src_path, dst_path in resolved_pairs:
+                    # Recheck after yielding a previous batch: staging may have
+                    # been changed by another process between batches.
+                    dst_path = self.resolve_safe_staging_path(rel)
                     parent_dir = os.path.dirname(dst_path)
                     os.makedirs(parent_dir, exist_ok=True)
                     if os.path.abspath(parent_dir) != self.staging_root and parent_dir.startswith(self.staging_root):
                         created_dirs.add(parent_dir)
 
                     # Copy to staging
-                    shutil.copy2(src_path, dst_path)
+                    dst_path = self.resolve_safe_staging_path(rel)
+                    # Replace a completed private copy rather than writing
+                    # through an existing hard link to an unrelated file.
+                    fd, copy_path = tempfile.mkstemp(prefix=".trace-copy-", dir=parent_dir)
+                    os.close(fd)
+                    try:
+                        shutil.copy2(src_path, copy_path)
+                        checked_dst = self.resolve_safe_staging_path(rel)
+                        if os.path.normcase(checked_dst) != os.path.normcase(dst_path):
+                            raise StagingSecurityError(f"Staging path changed during copy: {rel}")
+                        os.replace(copy_path, dst_path)
+                    finally:
+                        if os.path.exists(copy_path):
+                            os.remove(copy_path)
+                    staged_map[rel] = dst_path
 
                     # Double verify size and head1mb_md5
                     if self.config.verify_checksum:
@@ -198,8 +225,6 @@ class StagingManager:
                                 f"Staging head1mb_md5 mismatch for {rel}: {src_h1m} != {dst_h1m}"
                             )
 
-                    staged_map[rel] = dst_path
-
                 yield staged_map
 
             finally:
@@ -207,9 +232,14 @@ class StagingManager:
                 for rel, dst_path in staged_map.items():
                     rel_norm = rel.replace("\\", "/")
                     if rel_norm not in self._in_use_locks:
-                        if os.path.exists(dst_path):
+                        # Never follow a junction inserted while the caller
+                        # was processing the yielded batch.
+                        safe_path = self.resolve_safe_staging_path(rel)
+                        if os.path.normcase(safe_path) != os.path.normcase(dst_path):
+                            raise StagingSecurityError(f"Staging path changed during processing: {rel}")
+                        if os.path.exists(safe_path):
                             try:
-                                os.remove(dst_path)
+                                os.remove(safe_path)
                             except Exception:
                                 pass
 

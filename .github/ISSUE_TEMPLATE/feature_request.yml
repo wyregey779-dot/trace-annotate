@@ -1,0 +1,17 @@
+name: Feature request
+description: Describe a concrete annotation or maintenance need
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+      description: Describe the workflow and who would use this capability.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and alternatives
+      description: Include a small input/output example if possible.
+    validations:
+      required: true

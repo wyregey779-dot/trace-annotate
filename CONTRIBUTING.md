@@ -1,45 +1,47 @@
 # Contributing to TraceAnnotate
 
-Thank you for your interest in contributing to **TraceAnnotate**!
+We welcome reproducible bug reports, documentation corrections, tests, and focused improvements to local media review and temporal annotation.
 
-We welcome contributions of all kinds: bug fixes, new extractors, heuristic improvements, documentation enhancements, and additional embodied AI adapters.
+## Report a problem
 
----
+Open a [GitHub issue](https://github.com/wyregey779-dot/trace-annotate/issues) with the package version, Python/OS versions, command, expected behavior and actual result. Prefer a small synthetic example over private footage. Do not publish credentials or personal data.
 
-## Code of Conduct & Core Philosophy
+For a potential security vulnerability, use the repository's private vulnerability reporting option when available. Do not post working exploit details or sensitive data in a public issue.
 
-TraceAnnotate was forged from real-world, high-stakes production environments processing multi-terabyte raw media libraries. When contributing, keep our four core principles in mind:
+## Development setup
 
-1. **Zero-Trust Cold Storage Safety (R1-R5)**: Never write directly to raw source media drives. Staging must always be chunked, checksum-verified, and purged immediately.
-2. **Field-Level Provenance**: Every predicted value must have a clear `fill` origin tag (`auto_metric`, `auto_rule`, `auto_path`, `candidate_only`, `pending_review`, `human_confirmed`). Never silently synthesize fake ground truth.
-3. **Decouple Confirmed from Candidate**: Dirty field data contains edge cases (statues with faces, street signs with phone numbers). Always use composite heuristics (F1-F3) to tier annotations before marking them confirmed.
-4. **Offline First**: All core processing must be capable of running fully offline without external cloud API dependencies.
+```bash
+git clone https://github.com/wyregey779-dot/trace-annotate.git
+cd trace-annotate
+python -m venv .venv
+```
 
----
+Activate the environment (`.venv\Scripts\Activate.ps1` in PowerShell, `source .venv/bin/activate` on Linux/macOS), then:
 
-## Development Setup
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest tests -q
+trace-annotate --help
+```
 
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/wyregey779-dot/trace-annotate.git
-   cd trace-annotate
-   ```
+Install optional extras only when your change needs them. Vision and OCR integrations may require additional local model weights; the CLIP adapter is incomplete. See [README](README.md) and the [roadmap](docs/ROADMAP.md).
 
-2. **Install in editable mode**:
-   ```bash
-   pip install -e ".[full,dev]"
-   ```
+## Make a change
 
-3. **Run the test suite**:
-   ```bash
-   pytest tests/ -v
-   ```
+1. Create a branch from the current `main`.
+2. Keep the change focused and explain the user-visible problem.
+3. Add a regression test for a functional bug or new behavior. Use temporary directories and synthetic data; tests must not delete user files, require private datasets, or download model weights.
+4. Run the relevant tests, then the suite when shared behavior changes. For packaging changes, also build and install a wheel outside the checkout to check bundled resources and CLI behavior.
+5. Open a pull request with the change, verification commands and any known limitations. Do not claim tests passed unless you ran them; report skipped dependencies and checks.
 
----
+## Design principles
 
-## Submitting Pull Requests
+- Preserve source media. Use dedicated staging directories, validate path boundaries and document cleanup behavior.
+- Keep annotation provenance explicit. Distinguish rules, model outputs, unrun/failed extractors and human confirmation.
+- Treat heuristics as review aids. Avoid fabricated ground truth and unsupported accuracy claims.
+- Keep core processing local. Make any model download or network requirement clear.
+- Maintain deterministic data exchange. Validate intervals and schemas, and document limitations of external adapters.
 
-1. Create a feature branch (`git checkout -b feature/my-new-feature`).
-2. Add comprehensive unit tests in `tests/` covering your changes.
-3. Verify that all 33+ tests pass and no regression occurs.
-4. Submit your pull request with a clear description of the problem solved and test evidence.
+Be respectful in issues and reviews. Discuss behavior and evidence, and help others reproduce problems.
+
+Contributions are distributed under the project's [MIT License](LICENSE). Do not include datasets, model weights or copied code without checking their licenses and your right to redistribute them.
