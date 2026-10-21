@@ -7,6 +7,7 @@ import sys
 import os
 import json
 import argparse
+import webbrowser
 from typing import List
 
 from trace_annotate import __version__
@@ -18,6 +19,11 @@ from trace_annotate.embodied.differ import diff_expected_steps
 from trace_annotate.embodied.agreement import calculate_temporal_kappa
 from trace_annotate.embodied.validator import validate_embodied_export
 from trace_annotate.embodied.label_studio import generate_label_studio_xml
+from trace_annotate.embodied.exporters.srt import export_to_srt
+from trace_annotate.embodied.exporters.cvat import export_to_cvat_xml
+from trace_annotate.embodied.exporters.action_dataset import export_to_action_segmentation
+from trace_annotate.embodied.qc_report import generate_qc_report
+from trace_annotate.embodied.motion import extract_motion_energy, propose_idle_pauses
 
 
 def cmd_asset_verify(args: argparse.Namespace) -> None:
@@ -154,6 +160,88 @@ def cmd_embodied_xml(args: argparse.Namespace) -> None:
         print(xml_content)
 
 
+def cmd_embodied_export(args: argparse.Namespace) -> None:
+    """Export annotation document to SRT subtitles or CVAT XML."""
+    doc = json.load(open(args.file, "r", encoding="utf-8"))
+    fmt = args.format.lower()
+
+    if fmt == "srt":
+        srt_content = export_to_srt(doc)
+        out = args.output or os.path.splitext(args.file)[0] + ".srt"
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+        print(f"[OK] Exported SRT subtitles to {out} (can be loaded in VLC/PotPlayer)")
+
+    elif fmt == "cvat":
+        xml_content = export_to_cvat_xml(doc)
+        out = args.output or os.path.splitext(args.file)[0] + "_cvat.xml"
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(xml_content)
+        print(f"[OK] Exported CVAT Track XML to {out}")
+
+    elif fmt == "action":
+        out_dir = args.output or "./action_dataset"
+        m_file, gts = export_to_action_segmentation([doc], out_dir)
+        print(f"[OK] Exported Action Segmentation dataset to {out_dir}:")
+        print(f"  Mapping: {m_file}")
+        print(f"  Ground truth files: {len(gts)}")
+
+
+def cmd_embodied_qc(args: argparse.Namespace) -> None:
+    """Generate visual HTML quality control report."""
+    docs = []
+    if os.path.isdir(args.input):
+        for root, _, files in os.walk(args.input):
+            for f in files:
+                if f.endswith((".json", ".jsonl")):
+                    p = os.path.join(root, f)
+                    with open(p, "r", encoding="utf-8") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if line:
+                                try:
+                                    data = json.loads(line)
+                                    if isinstance(data, list):
+                                        docs.extend(data)
+                                    else:
+                                        docs.append(data)
+                                except Exception:
+                                    pass
+    else:
+        with open(args.input, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            if isinstance(data, list):
+                docs = data
+            else:
+                docs = [data]
+
+    out = args.output or "qc_report.html"
+    generate_qc_report(docs, out)
+    print(f"[OK] HTML QC inspection report generated at: {os.path.abspath(out)}")
+
+
+def cmd_embodied_ui(args: argparse.Namespace) -> None:
+    """Open interactive Web video timeline annotator in browser."""
+    ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "embodied", "ui", "annotator.html")
+    if os.path.exists(ui_path):
+        print(f"Opening TraceAnnotate Web Timeline Annotator: {ui_path}")
+        webbrowser.open(f"file://{ui_path}")
+    else:
+        print(f"Error: UI file not found: {ui_path}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_embodied_motion(args: argparse.Namespace) -> None:
+    """Analyze video motion energy and propose idle intervals."""
+    print(f"Analyzing motion energy on {args.video}...")
+    profile = extract_motion_energy(args.video, sample_fps=args.fps)
+    pauses = propose_idle_pauses(profile, min_pause_s=args.min_pause)
+    print(f"Extracted {len(profile)} motion samples.")
+    print(f"Discovered {len(pauses)} candidate idle intervals (>={args.min_pause}s):")
+    for idx, p in enumerate(pauses, 1):
+        print(f"  #{idx}: [{p['start']}s -> {p['end']}s] (Duration: {p['duration']}s)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="trace-annotate",
@@ -206,6 +294,30 @@ def main() -> None:
     p_xml = subparsers.add_parser("embodied-xml", help="Generate Label Studio XML configuration")
     p_xml.add_argument("-o", "--output", help="Output file path (prints to stdout if omitted)")
     p_xml.set_defaults(func=cmd_embodied_xml)
+
+    # Embodied Export
+    p_exp = subparsers.add_parser("embodied-export", help="Export to SRT subtitles, CVAT XML, or ActionFormer")
+    p_exp.add_argument("file", help="Path to embodied annotation JSON file")
+    p_exp.add_argument("--format", default="srt", choices=["srt", "cvat", "action"], help="Export format")
+    p_exp.add_argument("-o", "--output", help="Output file or directory path")
+    p_exp.set_defaults(func=cmd_embodied_export)
+
+    # Embodied QC Report
+    p_qc = subparsers.add_parser("embodied-qc", help="Generate interactive HTML quality control report")
+    p_qc.add_argument("input", help="Path to annotation JSON/JSONL file or folder")
+    p_qc.add_argument("-o", "--output", default="qc_report.html", help="Output HTML file path")
+    p_qc.set_defaults(func=cmd_embodied_qc)
+
+    # Embodied UI
+    p_ui = subparsers.add_parser("embodied-ui", help="Launch interactive browser timeline annotator")
+    p_ui.set_defaults(func=cmd_embodied_ui)
+
+    # Embodied Motion
+    p_mot = subparsers.add_parser("embodied-motion", help="Extract motion energy and propose idle intervals")
+    p_mot.add_argument("video", help="Path to video file")
+    p_mot.add_argument("--fps", type=float, default=4.0, help="Sampling FPS")
+    p_mot.add_argument("--min-pause", type=float, default=2.0, help="Minimum pause duration in seconds")
+    p_mot.set_defaults(func=cmd_embodied_motion)
 
     args = parser.parse_args()
     if hasattr(args, "func"):

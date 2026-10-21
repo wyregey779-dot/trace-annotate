@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>TraceAnnotate 具身智能视频时序标注工作台 (Web Timeline Annotator)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+    header { background: #111827; border-bottom: 1px solid #1f2937; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; }
+    header h1 { font-size: 18px; color: #38bdf8; display: flex; align-items: center; gap: 8px; }
+    .btn { background: #2563eb; color: #fff; border: none; padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+    .btn:hover { background: #1d4ed8; }
+    .btn-secondary { background: #374151; }
+    .btn-secondary:hover { background: #4b5563; }
+    .btn-success { background: #16a34a; }
+    .btn-success:hover { background: #15803d; }
+    .btn-danger { background: #dc2626; }
+    .btn-danger:hover { background: #b91c1c; }
+    
+    .main { display: flex; flex: 1; overflow: hidden; }
+    .video-pane { flex: 1; display: flex; flex-direction: column; background: #000; position: relative; }
+    video { width: 100%; height: 100%; max-height: calc(100vh - 280px); object-fit: contain; }
+    
+    .timeline-container { background: #111827; border-top: 1px solid #1f2937; padding: 14px 20px; height: 140px; display: flex; flex-direction: column; justify-content: space-between; }
+    .timeline-bar { height: 48px; background: #1e293b; border-radius: 6px; position: relative; cursor: pointer; overflow: hidden; }
+    .track-segment { position: absolute; top: 0; height: 100%; border-radius: 3px; font-size: 11px; display: flex; align-items: center; justify-content: center; font-weight: bold; overflow: hidden; white-space: nowrap; transition: opacity 0.15s; }
+    .track-segment:hover { opacity: 0.9; }
+    .track-working { background: #16a34a; color: #fff; border-left: 2px solid #4ade80; border-right: 2px solid #4ade80; }
+    .track-error { background: #dc2626; color: #fff; border-left: 2px solid #f87171; border-right: 2px solid #f87171; }
+    .track-idle { background: #475569; color: #cbd5e1; }
+    .track-mid { background: #f59e0b; color: #000; height: 16px; top: 2px; }
+    .playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #ef4444; z-index: 10; pointer-events: none; }
+    
+    .controls-bar { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: #94a3b8; }
+    
+    .sidebar { width: 360px; background: #111827; border-left: 1px solid #1f2937; display: flex; flex-direction: column; padding: 16px; overflow-y: auto; }
+    .sidebar h2 { font-size: 15px; color: #e2e8f0; margin-bottom: 12px; border-bottom: 1px solid #1f2937; padding-bottom: 6px; }
+    .form-group { margin-bottom: 12px; }
+    .form-group label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+    .form-control { width: 100%; background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 7px 10px; color: #fff; font-size: 13px; }
+    .form-control:focus { outline: none; border-color: #38bdf8; }
+    textarea.form-control { resize: vertical; min-height: 60px; }
+    .seg-list { list-style: none; margin-top: 10px; }
+    .seg-item { background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 8px 12px; margin-bottom: 8px; cursor: pointer; font-size: 13px; display: flex; justify-content: space-between; align-items: center; }
+    .seg-item.active { border-color: #38bdf8; background: #1e3a5f; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ TraceAnnotate · 具身智能动作时序标注工作台</h1>
+  <div style="display: flex; gap: 8px;">
+    <button class="btn btn-secondary" onclick="document.getElementById('fileInput').click()">📂 打开本地视频</button>
+    <input type="file" id="fileInput" accept="video/mp4,video/webm" style="display:none;" onchange="loadVideoFile(this)">
+    <button class="btn btn-secondary" onclick="exportJSON()">💾 导出 JSON</button>
+    <button class="btn btn-success" onclick="autoComputeIdle()">⚡ 自动计算 Idle 补集</button>
+  </div>
+</header>
+
+<div class="main">
+  <div class="video-pane">
+    <video id="videoPlayer" src="" controls></video>
+    <div class="timeline-container">
+      <div class="controls-bar">
+        <div>
+          <button class="btn btn-secondary" onclick="stepFrame(-1)">◀ 逐帧退</button>
+          <button class="btn btn-secondary" onclick="togglePlay()">⏯ 播放/暂停 (Space)</button>
+          <button class="btn btn-secondary" onclick="stepFrame(1)">逐帧进 ▶</button>
+          <span style="margin-left: 12px; font-family: monospace;" id="timeDisplay">00:00.00 / 00:00.00</span>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-success" onclick="markWorkingStart()">[ 设为起点</button>
+          <button class="btn btn-success" onclick="markWorkingEnd()">设为终点 ]</button>
+        </div>
+      </div>
+      <div class="timeline-bar" id="timelineBar" onclick="seekTimeline(event)">
+        <div class="playhead" id="playhead"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sidebar">
+    <h2>🎯 步骤与段落属性质检</h2>
+    <div class="form-group">
+      <label>流程步骤编号 (step_number)</label>
+      <input type="number" id="inpStep" class="form-control" value="1" min="1" max="30" onchange="updateSelectedSegment()">
+    </div>
+    <div class="form-group">
+      <label>执行判定 (verdict)</label>
+      <select id="selVerdict" class="form-control" onchange="onVerdictChange()">
+        <option value="对">对 (正确执行)</option>
+        <option value="错">错 (执行失败/违背规程)</option>
+        <option value="无法判断">无法判断</option>
+      </select>
+    </div>
+    <div class="form-group" id="grpErrorType" style="display:none;">
+      <label>错误 7 子类 (error_type)</label>
+      <select id="selErrorType" class="form-control" onchange="updateSelectedSegment()">
+        <option value="遗漏步骤">遗漏步骤</option>
+        <option value="顺序错误">顺序错误</option>
+        <option value="重复/多做">重复/多做</option>
+        <option value="用错物体">用错物体</option>
+        <option value="操作方式错误">操作方式错误</option>
+        <option value="意外事故">意外事故</option>
+        <option value="其他">其他</option>
+      </select>
+    </div>
+    <div class="form-group" id="grpEvidence" style="display:none;">
+      <label>结构化证据模板 (evidence)</label>
+      <textarea id="txtEvidence" class="form-control" placeholder="例: t=22s 第3步固定螺母出现在第2步支撑轴之前" onchange="updateSelectedSegment()"></textarea>
+    </div>
+    <div style="display: flex; gap: 8px; margin-top: 8px;">
+      <button class="btn btn-danger" style="flex:1" onclick="deleteSelectedSegment()">🗑 删除当前段</button>
+    </div>
+
+    <h2 style="margin-top: 24px;">📋 已标注段落清单</h2>
+    <ul class="seg-list" id="segList"></ul>
+  </div>
+</div>
+
+<script>
+let video = document.getElementById('videoPlayer');
+let playhead = document.getElementById('playhead');
+let timelineBar = document.getElementById('timelineBar');
+let timeDisplay = document.getElementById('timeDisplay');
+
+let annotation = {
+  clip: "sample.mp4",
+  text_description: "任务动作流程",
+  clip_status: "正常",
+  working: [
+    { start: 2.0, end: 12.0, step_number: 1, verdict: "对", error_type: null, evidence: "" }
+  ],
+  idle: []
+};
+let selectedIdx = 0;
+let tempStart = 0.0;
+
+function loadVideoFile(input) {
+  if (input.files && input.files[0]) {
+    let file = input.files[0];
+    annotation.clip = file.name;
+    video.src = URL.createObjectURL(file);
+    video.load();
+  }
+}
+
+video.ontimeupdate = () => {
+  let cur = video.currentTime;
+  let dur = video.duration || 1;
+  timeDisplay.innerText = formatTime(cur) + " / " + formatTime(dur);
+  playhead.style.left = (cur / dur * 100) + "%";
+};
+
+video.onloadedmetadata = () => {
+  renderTimeline();
+};
+
+function formatTime(s) {
+  let m = Math.floor(s / 60);
+  let sec = (s % 60).toFixed(2);
+  return (m < 10 ? "0" + m : m) + ":" + (sec < 10 ? "0" + sec : sec);
+}
+
+function togglePlay() {
+  if (video.paused) video.play(); else video.pause();
+}
+
+function stepFrame(delta) {
+  video.pause();
+  video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + delta * (1 / 30.0)));
+}
+
+function seekTimeline(e) {
+  let rect = timelineBar.getBoundingClientRect();
+  let ratio = (e.clientX - rect.left) / rect.width;
+  video.currentTime = ratio * (video.duration || 1);
+}
+
+function markWorkingStart() {
+  tempStart = video.currentTime;
+}
+
+function markWorkingEnd() {
+  let end = video.currentTime;
+  if (end > tempStart) {
+    annotation.working.push({
+      start: parseFloat(tempStart.toFixed(2)),
+      end: parseFloat(end.toFixed(2)),
+      step_number: annotation.working.length + 1,
+      verdict: "对",
+      error_type: null,
+      evidence: ""
+    });
+    annotation.working.sort((a,b) => a.start - b.start);
+    selectedIdx = annotation.working.findIndex(w => w.start === parseFloat(tempStart.toFixed(2)));
+    renderTimeline();
+  }
+}
+
+function renderTimeline() {
+  let dur = video.duration || 60;
+  // Clear old segments
+  let old = timelineBar.querySelectorAll('.track-segment');
+  old.forEach(el => el.remove());
+
+  // Render idle
+  annotation.idle.forEach(i => {
+    let el = document.createElement('div');
+    el.className = 'track-segment track-idle';
+    el.style.left = (i.start / dur * 100) + "%";
+    el.style.width = ((i.end - i.start) / dur * 100) + "%";
+    el.innerText = "idle";
+    timelineBar.appendChild(el);
+  });
+
+  // Render working
+  annotation.working.forEach((w, idx) => {
+    let el = document.createElement('div');
+    el.className = 'track-segment ' + (w.verdict === '错' ? 'track-error' : 'track-working');
+    el.style.left = (w.start / dur * 100) + "%";
+    el.style.width = ((w.end - w.start) / dur * 100) + "%";
+    el.innerText = "步骤 " + w.step_number + (w.verdict === '错' ? ' (错)' : '');
+    el.onclick = (e) => { e.stopPropagation(); selectSegment(idx); };
+    timelineBar.appendChild(el);
+  });
+
+  renderList();
+  loadSelectedSegmentToForm();
+}
+
+function selectSegment(idx) {
+  selectedIdx = idx;
+  renderTimeline();
+}
+
+function renderList() {
+  let list = document.getElementById('segList');
+  list.innerHTML = "";
+  annotation.working.forEach((w, idx) => {
+    let li = document.createElement('li');
+    li.className = 'seg-item ' + (idx === selectedIdx ? 'active' : '');
+    li.innerHTML = `<span>步骤 ${w.step_number} [${w.start}s - ${w.end}s]</span><span style="color:${w.verdict==='错'?'#f87171':'#4ade80'}">${w.verdict}</span>`;
+    li.onclick = () => selectSegment(idx);
+    list.appendChild(li);
+  });
+}
+
+function loadSelectedSegmentToForm() {
+  if (annotation.working.length === 0 || selectedIdx < 0 || selectedIdx >= annotation.working.length) return;
+  let w = annotation.working[selectedIdx];
+  document.getElementById('inpStep').value = w.step_number;
+  document.getElementById('selVerdict').value = w.verdict;
+  document.getElementById('selErrorType').value = w.error_type || "操作方式错误";
+  document.getElementById('txtEvidence').value = w.evidence || "";
+  onVerdictChange();
+}
+
+function onVerdictChange() {
+  let isWrong = document.getElementById('selVerdict').value === '错';
+  document.getElementById('grpErrorType').style.display = isWrong ? 'block' : 'none';
+  document.getElementById('grpEvidence').style.display = isWrong ? 'block' : 'none';
+  updateSelectedSegment();
+}
+
+function updateSelectedSegment() {
+  if (selectedIdx < 0 || selectedIdx >= annotation.working.length) return;
+  let w = annotation.working[selectedIdx];
+  w.step_number = parseInt(document.getElementById('inpStep').value, 10);
+  w.verdict = document.getElementById('selVerdict').value;
+  if (w.verdict === '错') {
+    w.error_type = document.getElementById('selErrorType').value;
+    w.evidence = document.getElementById('txtEvidence').value;
+  } else {
+    w.error_type = null;
+    w.evidence = "";
+  }
+  renderList();
+}
+
+function deleteSelectedSegment() {
+  if (selectedIdx >= 0 && selectedIdx < annotation.working.length) {
+    annotation.working.splice(selectedIdx, 1);
+    selectedIdx = Math.max(0, selectedIdx - 1);
+    renderTimeline();
+  }
+}
+
+function autoComputeIdle() {
+  let dur = video.duration || 60;
+  let sorted = [...annotation.working].sort((a,b) => a.start - b.start);
+  let idles = [];
+  let cursor = 0.0;
+  sorted.forEach(w => {
+    if (w.start > cursor) idles.push({ start: cursor, end: w.start });
+    cursor = Math.max(cursor, w.end);
+  });
+  if (cursor < dur) idles.push({ start: cursor, end: dur });
+  annotation.idle = idles;
+  renderTimeline();
+  alert("已自动生成 " + idles.length + " 个 idle 空闲补集区间！");
+}
+
+function exportJSON() {
+  let blob = new Blob([JSON.stringify(annotation, null, 2)], { type: "application/json" });
+  let url = URL.createObjectURL(blob);
+  let a = document.createElement('a');
+  a.href = url;
+  a.download = annotation.clip.replace(/\.[^/.]+$/, "") + "_annotation_v2.1.json";
+  a.click();
+}
+
+// Keyboard shortcuts
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+  else if (e.code === 'ArrowLeft') { e.preventDefault(); stepFrame(-1); }
+  else if (e.code === 'ArrowRight') { e.preventDefault(); stepFrame(1); }
+  else if (e.key === '[') { markWorkingStart(); }
+  else if (e.key === ']') { markWorkingEnd(); }
+});
+
+renderTimeline();
+</script>
+</body>
+</html>
