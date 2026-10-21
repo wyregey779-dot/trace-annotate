@@ -1,6 +1,7 @@
 """Regressions for file formats, timeline duration, and filesystem boundaries."""
 import json
 import os
+import posixpath
 import subprocess
 from argparse import Namespace
 
@@ -84,13 +85,48 @@ def test_validator_rejects_nonfinite_times(value):
     assert any("finite" in message for message in validate_embodied_doc(doc))
 
 
+def test_validator_checks_all_segment_fields_despite_nonfinite_times():
+    document = _doc()
+    document["working"] = [
+        {"start": 0, "end": float("nan"), "step_number": True, "verdict": "invalid"},
+        {"start": float("inf"), "end": 4, "step_number": None,
+         "verdict": "错", "error_type": "invalid", "evidence": ""},
+    ]
+    errors = validate_embodied_doc(document)
+    for index in (0, 1):
+        segment_errors = [error for error in errors if f"working[{index}]" in error]
+        assert any("finite" in error for error in segment_errors)
+        assert any("step_number" in error for error in segment_errors)
+    assert any("Invalid verdict" in error and "working[0]" in error for error in errors)
+    assert any("error_type" in error and "working[1]" in error for error in errors)
+    assert any("evidence" in error and "working[1]" in error for error in errors)
+    assert not any("overlap in time" in error for error in errors)
+
+
 @pytest.mark.parametrize("override, expected_end", [(None, 10.0), (12.0, 12.0)])
 def test_idle_cli_preserves_tail_using_document_duration(tmp_path, capsys, override, expected_end):
     path = tmp_path / "annotations.json"
     path.write_text(json.dumps(_doc()), encoding="utf-8")
     cmd_embodied_idle(Namespace(file=str(path), duration=override, inplace=False))
     result = json.loads(capsys.readouterr().out)
+    assert result["duration"] == expected_end
     assert result["idle"] == [{"start": 0.0, "end": 1.0}, {"start": 2.0, "end": expected_end}]
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+def test_idle_duration_override_survives_action_dataset_export(tmp_path, capsys, inplace):
+    path = tmp_path / "annotations.json"
+    path.write_text(json.dumps(_doc()), encoding="utf-8")
+    cmd_embodied_idle(Namespace(file=str(path), duration=12.0, inplace=inplace))
+    printed = capsys.readouterr().out
+    document = json.loads(path.read_text(encoding="utf-8") if inplace else printed)
+    assert document["duration"] == 12.0
+    assert document["idle"][-1]["end"] == 12.0
+    _, ground_truth = export_to_action_segmentation([document], str(tmp_path / "dataset"), fps=1.0)
+    with open(ground_truth[0], encoding="utf-8") as stream:
+        labels = stream.read().splitlines()
+    assert len(labels) == 12
+    assert labels == ["idle", "step_1"] + ["idle"] * 10
 
 
 @pytest.mark.parametrize("duration", [0, -1, True, float("nan"), float("inf"), 1.5])
@@ -136,6 +172,50 @@ def test_action_export_rejects_colliding_output_names_before_write(tmp_path):
     doc_b["clip"] = "example.mov"
     with pytest.raises(ValueError, match="unique"):
         export_to_action_segmentation([doc_a, doc_b], str(output))
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("first, second", [
+    ("Task.mp4", "task.mov"),
+    ("Caf\u00e9.mp4", "Cafe\u0301.mov"),
+    ("Stra\u00dfe.mp4", "STRASSE.mov"),
+])
+def test_action_export_rejects_portable_name_collisions_before_writes(tmp_path, monkeypatch, first, second):
+    output = tmp_path / "dataset"
+    doc_a, doc_b = _doc(), _doc()
+    doc_a["clip"], doc_b["clip"] = first, second
+    # POSIX normcase does not fold case, including on macOS volumes whose
+    # filesystem itself treats case aliases as a single output file.
+    with monkeypatch.context() as context:
+        context.setattr("trace_annotate.embodied.exporters.action_dataset.os.path.normcase", posixpath.normcase)
+        with pytest.raises(ValueError, match="unique"):
+            export_to_action_segmentation([doc_a, doc_b], str(output))
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("device", ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"] + [
+    prefix + digit for prefix in ("COM", "LPT") for digit in "123456789¹²³"
+])
+def test_action_export_rejects_windows_devices_with_or_without_extensions(tmp_path, device):
+    for index, extension in enumerate(("", ".mp4", ".backup.mp4")):
+        output = tmp_path / f"dataset-{index}"
+        document = _doc()
+        document["clip"] = device.lower() + extension
+        with pytest.raises(ValueError, match="reserved Windows device"):
+            export_to_action_segmentation([document], str(output))
+        assert not output.exists()
+
+
+@pytest.mark.parametrize("clip", [
+    "clip.mp4 ", "clip.mp4.", "clip .mp4", "clip..mp4",
+    "NUL .mp4", "NUL .backup.mp4", "clip\t.mp4", "clip?.mp4",
+])
+def test_action_export_rejects_windows_name_aliases_before_writes(tmp_path, clip):
+    output = tmp_path / "dataset"
+    document = _doc()
+    document["clip"] = clip
+    with pytest.raises(ValueError):
+        export_to_action_segmentation([document], str(output))
     assert not output.exists()
 
 

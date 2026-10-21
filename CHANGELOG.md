@@ -7,8 +7,9 @@ This patch addresses problems found during a reproducible review of the initial 
 - Include the browser annotator and JSON/XML templates in built packages; check an installed wheel outside the source checkout in CI.
 - Read standard JSON annotation documents as well as JSONL during validation.
 - Reject missing or malformed annotation structures, boolean step numbers, and invalid or too-short durations before in-place idle updates.
-- Use document duration when computing idle intervals, preserving the trailing idle span.
-- Reject unsafe or colliding clip output names in action dataset export.
+- Use document duration when computing idle intervals and persist validated overrides, preserving the trailing idle span in downstream exports.
+- Reject unsafe clip output names, case/Unicode aliases, and Windows reserved device names before writing action datasets.
+- Continue reporting other invalid segment fields when timestamps are non-finite.
 - Resolve filesystem links when checking staging paths and recheck paths before copying or cleaning up.
 - Escape annotation text in QC reports and mark empty or unjudged work as pending rather than correct.
 - Keep the unfinished CLIP inference adapter explicitly `not_run`, without automatic model loading or placeholder predictions.

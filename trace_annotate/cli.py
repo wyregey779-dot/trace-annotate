@@ -137,6 +137,7 @@ def cmd_embodied_idle(args: argparse.Namespace) -> None:
         raise ValueError("duration must be at least the maximum working end timestamp")
 
     idle = compute_idle_complement(working, total_dur)
+    doc["duration"] = total_dur
     doc["idle"] = idle
 
     if args.inplace:

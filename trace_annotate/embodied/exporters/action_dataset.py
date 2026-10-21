@@ -7,7 +7,18 @@ Supports persistent global mapping, true video duration padding, and unknown ste
 from __future__ import annotations
 import os
 import ntpath
+import unicodedata
 from typing import List, Dict, Any, Tuple, Optional, Union
+
+
+_WINDOWS_DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {
+    prefix + digit for prefix in ("COM", "LPT") for digit in "123456789¹²³"
+}
+
+
+def _portable_name_key(name: str) -> str:
+    """Reject canonical Unicode and case aliases independently of host OS."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
 
 
 def load_or_init_mapping(
@@ -87,11 +98,20 @@ def export_to_action_segmentation(
                 or ntpath.splitdrive(raw_clip)[0] or "/" in raw_clip
                 or "\\" in raw_clip or "\x00" in raw_clip or ":" in raw_clip):
             raise ValueError(f"clip must be a filename without directory components: {raw_clip!r}")
+        if any(ord(character) < 32 or character in '<>"|?*' for character in raw_clip):
+            raise ValueError(f"clip contains characters reserved by Windows: {raw_clip!r}")
         clip_name = os.path.splitext(raw_clip)[0]
         if clip_name in ("", ".", ".."):
             raise ValueError(f"Invalid clip filename: {raw_clip!r}")
+        if raw_clip != raw_clip.rstrip(" .") or clip_name != clip_name.rstrip(" ."):
+            raise ValueError(f"clip and its stem must not end in spaces or dots: {raw_clip!r}")
+        # Windows device aliases remain reserved even with multiple extensions
+        # (NUL.tar.gz) or spaces immediately before the first extension.
+        device_basename = clip_name.split(".", 1)[0].rstrip(" ").upper()
+        if device_basename in _WINDOWS_DEVICE_NAMES:
+            raise ValueError(f"clip uses a reserved Windows device name: {raw_clip!r}")
         clip_names.append(clip_name)
-    if len({os.path.normcase(name) for name in clip_names}) != len(clip_names):
+    if len({_portable_name_key(name) for name in clip_names}) != len(clip_names):
         raise ValueError("Clip filenames must produce unique ground-truth filenames")
 
     os.makedirs(output_dir, exist_ok=True)

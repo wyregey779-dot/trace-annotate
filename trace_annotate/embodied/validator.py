@@ -79,13 +79,13 @@ def validate_embodied_doc(doc: Dict[str, Any]) -> List[str]:
                 e_val = float(end)
                 if not math.isfinite(s_val) or not math.isfinite(e_val):
                     errors.append(f"{prefix}: timestamps must be finite numbers")
-                    continue
-                if s_val < 0:
-                    errors.append(f"{prefix}: start timestamp cannot be negative ({s_val})")
-                if s_val >= e_val:
-                    errors.append(f"{prefix}: start ({start}) must be strictly less than end ({end})")
                 else:
-                    valid_time_segs.append((s_val, e_val, idx))
+                    if s_val < 0:
+                        errors.append(f"{prefix}: start timestamp cannot be negative ({s_val})")
+                    if s_val >= e_val:
+                        errors.append(f"{prefix}: start ({start}) must be strictly less than end ({end})")
+                    else:
+                        valid_time_segs.append((s_val, e_val, idx))
             except (ValueError, TypeError):
                 errors.append(f"{prefix}: Invalid numeric timestamp format")
 
