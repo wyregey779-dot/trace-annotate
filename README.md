@@ -89,7 +89,7 @@ However, real-world engineering teams handling **multi-terabyte raw media librar
 ### 1. Installation
 
 ```bash
-git clone https://github.com/your-username/trace-annotate.git
+git clone https://github.com/wyregey779-dot/trace-annotate.git
 cd trace-annotate
 
 # Install lightweight core

@@ -21,7 +21,7 @@ TraceAnnotate was forged from real-world, high-stakes production environments pr
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/<your-username>/trace-annotate.git
+   git clone https://github.com/wyregey779-dot/trace-annotate.git
    cd trace-annotate
    ```
 

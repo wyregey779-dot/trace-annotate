@@ -89,7 +89,7 @@
 ### 1. 安装
 
 ```bash
-git clone https://github.com/your-username/trace-annotate.git
+git clone https://github.com/wyregey779-dot/trace-annotate.git
 cd trace-annotate
 
 # 安装轻量核心包
