@@ -1,0 +1,52 @@
+<View>
+  <Header value="第一步：整段诊断（先选这个，命中即停）" />
+  <Text name="description" value="$text_description" />
+  <Choices name="clip_status" toName="video" choice="single" showInline="true" required="true">
+    <Choice value="正常" />
+    <Choice value="佩戴问题" />
+    <Choice value="描述不符-整段无关" />
+    <Choice value="描述不符-仅部分工作" />
+    <Choice value="这里没有" />
+  </Choices>
+  <TextArea name="clip_report" toName="video" editable="true" rows="1"
+    placeholder="选了佩戴问题/描述不符时必填：Quick ID（视频左上角）+ 一句话现象；正常则留空" />
+
+  <Header value="第二步：画 working 段（绿）；段内 idle/视角异常画段中段（橙），不拆段" />
+  <Video name="video" value="$video_url" framerate="30.0" />
+  <VideoTimeline name="timeline" />
+  <Labels name="videoLabels" toName="video" allowCreate="false">
+    <Label value="working" background="#00C853" />
+    <Label value="段中段" background="#FF9800" />
+    <Label value="idle" background="#9E9E9E" />
+  </Labels>
+
+  <Header value="第三步：点选每个绿色 working 段，先挂步骤编号，再判对错（橙/灰段不判）" />
+  <Number name="step_number" toName="video" perRegion="true"
+    perRegionControl="videoLabels" precision="0" min="1" max="30"
+    value="1"
+    hint="该段对应流程描述的第几步；工具据此自动 diff 遗漏/乱序/重复" />
+  <Choices name="seg_verdict" toName="video" choice="single" perRegion="true"
+    perRegionControl="videoLabels">
+    <Choice value="对" />
+    <Choice value="错" />
+    <Choice value="无法判断" />
+  </Choices>
+  <Choices name="error_type" toName="video" choice="single" perRegion="true"
+    perRegionControl="videoLabels"
+    visibleWhen="choice-selected" whenChoiceFromName="seg_verdict" whenChoiceValue="错">
+    <Choice value="遗漏步骤" />
+    <Choice value="顺序错误" />
+    <Choice value="重复/多做" />
+    <Choice value="用错物体" />
+    <Choice value="操作方式错误" />
+    <Choice value="意外事故" />
+    <Choice value="其他" />
+  </Choices>
+  <TextArea name="seg_evidence" toName="video" editable="true" perRegion="true"
+    perRegionControl="videoLabels" rows="2"
+    placeholder="判错必填，按模板填：t=XX 用了A应为B / 第N步全程未出现 / t=XX 物体掉落"
+    visibleWhen="choice-selected" whenChoiceFromName="seg_verdict" whenChoiceValue="错" />
+  <TextArea name="correction_events" toName="video" editable="true" perRegion="true"
+    perRegionControl="videoLabels" rows="1"
+    placeholder="（选填）段内做错后自行纠正/拿错秒放的事件：t=XX 曾做错X已自行纠正；无则留空" />
+</View>

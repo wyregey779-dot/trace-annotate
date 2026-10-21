@@ -1,0 +1,66 @@
+{
+  "vocab_ver": 3,
+  "note": "Domain-independent controlled vocabulary template for TraceAnnotate",
+  "primary_entities": [
+    "未定",
+    "景区地标",
+    "展厅展品",
+    "雕塑雕像",
+    "城市街区",
+    "商铺门头",
+    "自然风光",
+    "交通车站",
+    "餐饮美食",
+    "活动现场"
+  ],
+  "screen_type": [
+    "无屏",
+    "户外大屏",
+    "橱窗",
+    "店招",
+    "手机屏"
+  ],
+  "indoor_outdoor": [
+    "室内",
+    "室外",
+    "半室内"
+  ],
+  "time_of_day": [
+    "白天",
+    "夜",
+    "黄昏黎明"
+  ],
+  "weather": [
+    "晴朗",
+    "雨",
+    "雪",
+    "雾",
+    "阴天"
+  ],
+  "crowd_level": [
+    "无人",
+    "单人",
+    "双人",
+    "少量3-5人",
+    "密集>5人"
+  ],
+  "face_subject_kind": [
+    "none",
+    "real_person",
+    "statue_face",
+    "artifact_face"
+  ],
+  "entity_status": [
+    "none",
+    "candidate",
+    "confirmed"
+  ],
+  "ui_strong_pattern": "Wi-?Fi|电量|信号格|拨号|通讯录|短信|相册|点赞|评论|转发|粉丝|播放量|小时前|分钟前|订阅|正在播放",
+  "ui_weak_pattern": "微信|支付宝|二维码|扫码|付款|收银",
+  "artifact_keywords": [
+    "文物", "展厅", "博物院", "展览", "马王堆", "木俑", "辛追", "陶俑", "古墓", "陈列"
+  ],
+  "statue_keywords": [
+    "雕像", "塑像", "铜像", "石雕", "造像", "毛主席像", "人物像", "蜡像"
+  ]
+}

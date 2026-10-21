@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace-annotate"
+version = "1.0.0"
+description = "Production-grade cold-storage-safe multi-modal data pipeline & embodied AI annotation suite."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "TraceAnnotate Contributors" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "pillow>=9.0.0",
+    "tqdm>=4.60.0"
+]
+
+[project.optional-dependencies]
+cv = [
+    "opencv-python>=4.5.0",
+    "pillow-heif>=0.8.0"
+]
+ocr = [
+    "rapidocr-onnxruntime>=1.2.0"
+]
+clip = [
+    "torch>=1.10.0",
+    "torchvision>=0.11.0"
+]
+full = [
+    "opencv-python>=4.5.0",
+    "pillow-heif>=0.8.0",
+    "rapidocr-onnxruntime>=1.2.0",
+    "torch>=1.10.0",
+    "torchvision>=0.11.0",
+    "scenedetect>=0.6.0"
+]
+dev = [
+    "pytest>=7.0.0"
+]
+
+[project.scripts]
+trace-annotate = "trace_annotate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["trace_annotate*"]
