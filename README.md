@@ -1,238 +1,127 @@
-<div align="center">
+# TraceAnnotate
 
-# TraceAnnotate ⚡
+Python tools for local media asset review and temporal annotation of embodied AI video.
 
-**Production-Grade, Cold-Storage Safe Multi-Modal Data Pipeline & Embodied AI Annotation Suite**
-
+[![CI](https://github.com/wyregey779-dot/trace-annotate/actions/workflows/ci.yml/badge.svg)](https://github.com/wyregey779-dot/trace-annotate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python: 3.9+](https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg)](pyproject.toml)
-[![Tests: 33/33 Passing](https://img.shields.io/badge/Tests-33%2F33%20Passing-success.svg)](tests/)
-[![Offline: 100%](https://img.shields.io/badge/Offline-Zero%20External%20Traffic-orange.svg)](#)
 
 [English](README.md) | [中文说明](README_CN.md)
 
-</div>
+TraceAnnotate combines media staging, annotation provenance, and working/idle timeline utilities. It is an early-stage project: the automated tests and synthetic examples demonstrate specific behaviors, while adoption and performance at scale have not been established. Contributions and reproducible bug reports are welcome.
 
----
+## What it does
 
-## 💡 Why TraceAnnotate?
+| Area | Available tools |
+| --- | --- |
+| Media preparation | Batched staging, source/staging boundary checks, size and first-MiB MD5 copy checks, image dHash and duplicate clustering |
+| Asset review | Brightness/sharpness metrics, configurable face/entity/screen heuristics, contact sheets and prioritized review queues |
+| Provenance | Per-field `fill` origins, human overrides, revision history and rollback |
+| Temporal annotation | Working/idle complements, expected-step reconciliation, interval validation and sampled temporal agreement |
+| Review and exchange | Local browser timeline editor, HTML QC reports, Label Studio configuration/parsing, SRT, CVAT-style XML and action-label text exports |
 
-Existing open-source annotation tools (CVAT, Label Studio, AnyLabeling, FiftyOne) primarily focus on **interactive bounding-box GUIs** or **cloud-first MLOps platforms**. 
+The heuristics and quality thresholds are review aids, not ground truth. Label Studio “v2.1” in this repository refers to the project's annotation convention, not an official Label Studio product version. Export adapters are covered by local tests; compatibility with every external application or training pipeline has not been verified.
 
-However, real-world engineering teams handling **multi-terabyte raw media libraries** and **first-person robotic/embodied video datasets** face critical production blockers:
-1. **Fragile External Storage**: Direct concurrent I/O on external hard drives or SD cards causes disconnections (`WinError 21`) or disk corruption.
-2. **Black-Box AI Tagging**: Downstream users cannot audit whether a tag was predicted by an AI model, derived from path rules, or confirmed by a human.
-3. **Dirty Field False Positives**: Statues detected as human faces, street shop signs falsely flagged as smartphone screens, and tickets confused with scenic landmarks.
-4. **Labor-Intensive Video Audit**: Opening thousands of high-resolution video clips one-by-one is painfully slow.
+## Install
 
-**TraceAnnotate** bridges this gap. It combines **cold-storage hardware protection (R1-R5)**, **field-level provenance tracking (`fill` codes)**, **composite domain heuristics (F1-F3)**, and a complete **Embodied AI video temporal annotation suite** into a unified, offline-first Python framework.
-
----
-
-## 📊 Feature Comparison
-
-| Capability | CVAT / Label Studio | FiftyOne | **TraceAnnotate** (Ours) |
-|---|:---:|:---:|:---:|
-| **Cold Storage Staging Protocol (R1-R5)** | ❌ (Direct I/O only) | ❌ (No drive guard) | **✅ Chunked copy, read-only guard, double-checksum** |
-| **Field-Level Provenance Tracking** | ❌ (Flat values) | ⚠️ (Field tags only) | **✅ `fill` dictionary (`auto_metric`, `human_confirmed`, etc.)** |
-| **Statue / Artifact Face Disambiguation (F1)**| ❌ (Counts as person) | ❌ (No heuristic) | **✅ Decouples sculpture faces from living persons** |
-| **Mobile Screen vs Storefront OCR (F3)** | ❌ | ❌ | **✅ OCR UI keywords + morphology disambiguation** |
-| **Near-Duplicate Clustering** | ⚠️ (Plugin required) | ✅ (Embedding-based) | **✅ Perceptual dHash + Disjoint-Set Union (并查集)** |
-| **Rapid 4x4 Visual Audit Sheets** | ❌ | ⚠️ (Web grid only) | **✅ High-density contact sheets (`sheet_generator`)** |
-| **Embodied Task Temporal Segmentation** | ⚠️ (Manual UI) | ❌ | **✅ Working/Idle complement, step diff, 7-class failure diagnosis** |
-| **Inter-Annotator Temporal Kappa ($\ge 0.80$)**| ❌ | ❌ | **✅ Second-by-second timeline IoU Cohen's Kappa** |
-| **100% Offline / Zero Cloud Traffic** | ⚠️ (Self-hostable) | ⚠️ | **✅ Native local execution, zero external downloads** |
-
----
-
-## 🏗️ Architecture Overview
-
-```
-                      ┌──────────────────────────────────────────────┐
-                      │       Cold Storage (Source Drive / H:\)      │
-                      └──────────────────────┬───────────────────────┘
-                                             │ Staging (R1-R5 protocol)
-                                             ▼
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                                Core Pipeline Engine                                │
-│                                                                                    │
-│  [1. Technical Grounding]      [2. Multi-Modal Extractors]  [3. Composite Heuristics]│
-│  - size & head1mb_md5          - Visual Metrics (Laplacian) - F1: Statue Face (YN)   │
-│  - Perceptual dHash            - YuNet Face Detector        - F2: Entity Tiering     │
-│  - DSU Near-Dup Clustering     - RapidOCR Sign Extractor    - F3: Mobile Screen OCR  │
-│                                - Zero-Shot CLIP             - Calibrated Scene Cut   │
-│                                                                                    │
-│  [4. Provenance & Consensus Tracking]                                              │
-│  fill: { auto_metric | auto_rule | auto_path | pending_review | human_confirmed }  │
-└────────────────────────────────────────────┬───────────────────────────────────────┘
-                                             │
-                                             ▼
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                           Human-in-the-Loop Fast Audit                             │
-│  - 4x4 Visual Contact Sheets   - P1-P4 Prioritized Queue   - Append-Only Overrides │
-└────────────────────────────────────────────┬───────────────────────────────────────┘
-                                             │
-                                             ▼
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                           Embodied AI Video Annotation                             │
-│  - Clip-Level Diagnosis         - Hand-Object Working Segment Boundaries           │
-│  - Mid-Segment Holes            - Automatic Idle Timeline Complements              │
-│  - Expected Step Diffing S=[1..N]- 7-Class Failure Diagnosis & Template Evidence   │
-│  - Temporal Cohen's Kappa Eval  - Label Studio v2.1 XML / JSON Roundtrip Export    │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🚀 Quickstart
-
-### 1. Installation
+Use Python 3.9 or newer. See [CI](https://github.com/wyregey779-dot/trace-annotate/actions/workflows/ci.yml) for the versions currently tested.
 
 ```bash
 git clone https://github.com/wyregey779-dot/trace-annotate.git
 cd trace-annotate
-
-# Install lightweight core
-pip install -e .
-
-# Or install full multi-modal suite (OpenCV, RapidOCR, PyTorch)
-pip install -e ".[full]"
+python -m venv .venv
 ```
 
-### 2. Run Built-In Demos
+Activate the virtual environment (`.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` on Linux/macOS), then install:
 
 ```bash
-# 1. Media Asset Pipeline Demo (Cold staging, dHash clustering, heuristics, 21-point verification)
-python examples/demo_asset_pipeline.py
+python -m pip install -e ".[dev]"
+trace-annotate --help
+python -m pytest tests -q
+```
 
-# 2. Embodied AI Annotation Demo (Working/Idle, Step Diff, 7-class failure, Cohen's Kappa)
+The core depends on NumPy, Pillow and tqdm. Install optional components only for the functions you need:
+
+| Extra or dependency | Purpose and limitations |
+| --- | --- |
+| `python -m pip install -e ".[cv]"` | OpenCV video/motion processing and optional HEIF image support; YuNet face detection also requires a compatible local ONNX model. |
+| `python -m pip install -e ".[ocr]"` | RapidOCR integration; model/runtime availability depends on the installed package. |
+| `python -m pip install -e ".[full]"` | Optional vision/OCR dependencies; larger install, and not a promise that model inference is complete. |
+| `ffmpeg` executable on `PATH` | Required by the FFmpeg scene-cut helper; this executable is not installed by pip. |
+
+**CLIP is unfinished.** The current adapter does not perform complete image/text inference. The `clip` extra installs PyTorch/torchvision, but does not install `cn_clip` or provide model weights. Do not use its output as a model prediction. See the [roadmap](docs/ROADMAP.md).
+
+The core examples and timeline calculations run locally without an OpenAI API key. Installation and optional model packages may need network access. Prepare and verify all dependencies and weights before using the tools in an offline environment.
+
+## Try the examples
+
+```bash
+python examples/demo_asset_pipeline.py
 python examples/demo_embodied_pipeline.py
 ```
 
-### 3. CLI Reference
+The asset example creates synthetic images and uses simulated face/CLIP fields to demonstrate the data flow; it does not measure detection accuracy. It creates and removes `examples/_demo_scratch`, so keep that directory free of your own files. The embodied example constructs synthetic annotations and reports idle intervals, step order and agreement.
 
-```bash
-# Verify 21-point consistency of an annotation catalog
-trace-annotate asset-verify my_annotations.jsonl --inventory my_inventory.jsonl
-
-# Generate 4x4 visual audit contact sheet
-trace-annotate asset-sheet thumbs/*.jpg -o audit_sheet.jpg --cols 4
-
-# Compute idle intervals automatically for embodied task video
-trace-annotate embodied-idle clip_001.json --inplace
-
-# Reconcile expected steps S = [1..N] (detect missing, out-of-order, duplicates)
-trace-annotate embodied-diff clip_001.json --nsteps 5
-
-# Compute inter-annotator temporal Cohen's Kappa
-trace-annotate embodied-kappa annotator_A.jsonl annotator_B.jsonl --fps 2.0
-
-# Export standardized Label Studio v2.1 XML configuration
-trace-annotate embodied-xml -o label_studio_config.xml
-```
-
----
-
-## 🧠 Python API Examples
-
-### Example 1: Cold-Storage Staging & Perceptual Clustering
+For a minimal, model-free step check:
 
 ```python
-from trace_annotate.core.staging import StagingManager
-from trace_annotate.core.hasher import compute_dhash
-from trace_annotate.core.cluster import cluster_by_dhash
-
-# Enforce R1-R5 cold-storage safety: 4 files per batch, verified with head1mb_md5
-staging = StagingManager(source_root="E:/RawFootage", staging_root="./staging")
-
-hashes = {}
-for batch in staging.stage_batch(["clip1.mp4", "clip2.mp4", "img3.jpg"]):
-    for rel_path, staged_path in batch.items():
-        hashes[rel_path] = compute_dhash(staged_path)
-    # Staged copies are automatically purged after the loop body!
-
-# Group near-duplicates (Hamming distance <= 10)
-item_to_cluster, clusters = cluster_by_dhash(hashes, hamming_threshold=10)
-print(f"Discovered {len(clusters)} unique visual clusters.")
-```
-
-### Example 2: Embodied AI Temporal Segmentation & Step Diffing
-
-```python
-from trace_annotate.embodied.schema import EmbodiedAnnotationDoc, WorkingSegment, Verdict
 from trace_annotate.embodied.complement import compute_idle_complement
 from trace_annotate.embodied.differ import diff_expected_steps
 
-doc = EmbodiedAnnotationDoc(
-    clip="wrist_assembly_01.mp4",
-    text_description="1. Pick base; 2. Insert shaft; 3. Tighten nut",
-    working=[
-        WorkingSegment(start=2.0, end=15.0, step_number=1, verdict=Verdict.CORRECT.value),
-        WorkingSegment(start=18.0, end=30.0, step_number=3, verdict=Verdict.WRONG.value) # Step 3 before 2!
-    ]
-)
-
-# 1. Automatic Idle Complement calculation
-idle_intervals = compute_idle_complement(
-    [{"start": w.start, "end": w.end} for w in doc.working],
-    total_duration=45.0
-)
-
-# 2. Automated Step Reconciliation
-diff = diff_expected_steps([{"step_number": w.step_number} for w in doc.working], expected_step_count=3)
-print(diff["missing"])       # [2]
-print(diff["out_of_order"])  # [{'previous_step': 1, 'current_step': 3}]
+working = [
+    {"start": 2.0, "end": 10.0, "step_number": 1},
+    {"start": 15.0, "end": 20.0, "step_number": 3},
+]
+print(compute_idle_complement(working, total_duration=30.0))
+# [{'start': 0.0, 'end': 2.0}, {'start': 10.0, 'end': 15.0},
+#  {'start': 20.0, 'end': 30.0}]
+result = diff_expected_steps(working, expected_step_count=3)
+print(result["missing"])       # [2]
+print(result["out_of_order"])  # []: no decreasing step transition
 ```
 
----
+## Command line
 
-## 🔬 21-Point Integrity Verification Suite
+These commands use your own annotation files; see the [annotation SOP](docs/EMBODIED_ANNOTATION_SOP.md) for the document structure.
 
-TraceAnnotate includes an automated verification engine that checks 21 quantitative integrity invariants:
+```bash
+# Validate an annotation document
+trace-annotate embodied-validate clip.json
 
-- `row_count_match`: Annotation count matches source inventory.
-- `asset_id_missing == 0`: No unassigned asset IDs.
-- `duplicate_ids == 0`: Primary keys are strictly unique.
-- `key_missing == {}`: All 46 schema keys populated in every record.
-- `phash_missing == 0`: Perceptual fingerprinting completeness.
-- `video_windows_null == 0`: All video assets contain usable editing windows.
-- `face_missing == 0`, `ocr_missing == 0`, `clip_missing == 0`.
-- `fill_missing == 0`: 100% field-level provenance audit coverage.
+# Compute idle intervals, including the tail to the known video duration
+trace-annotate embodied-idle clip.json --duration 60
 
----
+# Compare steps with the expected procedure
+trace-annotate embodied-diff clip.json --nsteps 5
 
-## 🛡️ Production Reliability & Hardened Contracts (T01 - T14)
+# Compare two annotators using timeline samples
+trace-annotate embodied-kappa annotator_A.jsonl annotator_B.jsonl --fps 2
 
-TraceAnnotate prioritizes **"credible results, discoverable errors, traceable modifications, and recoverable failures"**. The entire pipeline is verified by a strict 14-point contract test suite:
+# Generate a local review report or open the timeline editor
+trace-annotate embodied-qc clip.json -o qc_report.html
+trace-annotate embodied-ui
 
-| ID | Contract Guarantee | Implementation & Verification |
-|:---:|---|---|
-| **T01** | **Path Traversal Protection** | Blocks `..`, absolute paths, and drive indicators via safe path resolvers; raises `PermissionError`. |
-| **T02** | **Atomic Write & Snapshot Fallback** | Atomic filesystem rename (`os.replace`) with `.bak` snapshot fallback; append-only revision logging. |
-| **T03** | **Staging Task Isolation** | Prevents concurrent deletion of in-use staged files (`lock_in_use`/`unlock_in_use`); dynamic space quota guard. |
-| **T04** | **Multi-Framerate Consistency** | Continuous-to-frame timestamp mapping verified across 25, 29.97, 30, and 60 FPS without drift. |
-| **T05** | **Temporal Schema Validation** | Rejects negative timestamps, inverted ranges (`start >= end`), and overlapping working segments. |
-| **T06** | **Label Studio Order Invariance** | Multi-pass parsing ensures attribute nodes appearing before regions are fully resolved; unlabelled values stay `None`. |
-| **T07** | **Global Action Mapping Stability** | Action segmentation exporters maintain stable class IDs across sequential batches without label drift. |
-| **T08** | **Multidimensional Agreement & Paradox** | Distinguishes temporal IoU from semantic conflicts (step, verdict, error_type); detects Kappa prevalence paradox. |
-| **T09** | **Out-of-Range Step Isolation** | Custom `ProcedureSpec` bounds step reconciliation; invalid steps (e.g. 999) never create artificial missing steps. |
-| **T10** | **Extractor Truthfulness** | Extractors without model weights return explicit `NOT_RUN` / `None`, never faking "zero persons" or "no screen". |
-| **T11** | **Tail Idle Duration Padding** | Uses actual video duration metadata to pad tail idle frames for training action segmenters (ActionFormer/MS-TCN). |
-| **T12** | **Audit Trail Rollback Preservation** | Rollback restores previous values as a new audit event without destroying subsequent revision history. |
-| **T13** | **Directory Overlap Guard** | Prohibits identical or nested source and staging roots to prevent data corruption. |
-| **T14** | **Deterministic Provenance Idempotency** | Normalized JSON input hashing guarantees identical provenance cache hits across pipeline reruns. |
+# Export the project's Label Studio configuration or subtitles
+trace-annotate embodied-xml -o label_studio_config.xml
+trace-annotate embodied-export clip.json --format srt -o clip.srt
 
----
+# Check an asset catalog or create a contact sheet
+trace-annotate asset-verify annotations.jsonl --inventory inventory.jsonl
+trace-annotate asset-sheet thumb1.jpg thumb2.jpg -o audit_sheet.jpg --cols 4
+```
 
-## 📖 Documentation
+`embodied-idle --inplace` overwrites its input; omit it to inspect JSON on stdout first. Supply the actual `--duration` to preserve idle time after the last working segment. Staging cleanup removes staged copies, so use a dedicated staging directory and retain source backups. Copy checks use file size and the first MiB, not a full-file cryptographic integrity check or a hardware write lock.
 
-- [System Architecture](docs/ARCHITECTURE.md)
-- [Embodied Annotation SOP v2.1](docs/EMBODIED_ANNOTATION_SOP.md)
-- [46-Key Schema & Provenance Guide](docs/PROVENANCE_SCHEMA.md)
-- [Fast Visual Audit Workflow](docs/FAST_AUDIT_WORKFLOW.md)
+## Documentation and contributions
 
----
+- [Architecture](docs/ARCHITECTURE.md)
+- [Embodied annotation SOP](docs/EMBODIED_ANNOTATION_SOP.md)
+- [Asset schema and provenance](docs/PROVENANCE_SCHEMA.md)
+- [Visual audit workflow](docs/FAST_AUDIT_WORKFLOW.md)
+- [Known limitations and roadmap](docs/ROADMAP.md)
+- [Contribution guide](CONTRIBUTING.md)
 
-## 📄 License
+Report bugs and discuss improvements in [GitHub Issues](https://github.com/wyregey779-dot/trace-annotate/issues). Include the command, package version, operating system and a small synthetic reproducer. Do not upload private footage or credentials.
 
-This project is licensed under the [MIT License](LICENSE).
+## License
+
+[MIT](LICENSE). External model weights, optional runtimes and datasets may have their own licenses.

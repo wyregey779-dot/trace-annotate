@@ -1,238 +1,127 @@
-<div align="center">
+# TraceAnnotate
 
-# TraceAnnotate ⚡
+面向本地媒体资产复核与具身智能视频时序标注的 Python 工具集。
 
-**面向多模态媒体资产与具身智能视频的高性能、冷存储安全、全链路来源可溯标注套件**
-
+[![CI](https://github.com/wyregey779-dot/trace-annotate/actions/workflows/ci.yml/badge.svg)](https://github.com/wyregey779-dot/trace-annotate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python: 3.9+](https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg)](pyproject.toml)
-[![Tests: 33/33 Passing](https://img.shields.io/badge/Tests-33%2F33%20Passing-success.svg)](tests/)
-[![Offline: 100%](https://img.shields.io/badge/Offline-Zero%20External%20Traffic-orange.svg)](#)
 
 [English](README.md) | [中文说明](README_CN.md)
 
-</div>
+TraceAnnotate 将媒体暂存、字段来源记录和 working/idle 时间轴处理组合在一起。项目目前处于早期阶段：自动化测试与合成示例验证部分具体行为，尚无公开证据证明大规模采用或规模化性能。欢迎贡献与可复现的问题报告。
 
----
+## 当前能力
 
-## 💡 项目背景与解决的痛点
+| 领域 | 已有工具 |
+| --- | --- |
+| 媒体准备 | 分批暂存、源目录与暂存目录边界检查、文件大小与前 1 MiB MD5 校验、图像 dHash 与近重复聚类 |
+| 资产复核 | 亮度与清晰度指标、可配置的人脸/实体/屏幕规则、联系表拼图与优先级复核队列 |
+| 来源记录 | 字段级 `fill` 来源、人工覆写、修订历史与回滚 |
+| 时序标注 | working/idle 补集、预期步骤对账、区间校验与采样时间轴一致性评估 |
+| 复核与交换 | 本地浏览器时间轴编辑器、HTML 质检报告、Label Studio 配置与解析、SRT、CVAT 风格 XML 和动作标签文本导出 |
 
-市面现有的开源标注工具（如 CVAT、Label Studio、AnyLabeling、FiftyOne）大多聚焦在**“画框/打点等前端交互”**或**“重型大模型云端 API”**。
+规则与质量阈值用于辅助复核，不能直接当作真实标签。仓库中的 Label Studio “v2.1” 指本项目的标注约定，并非 Label Studio 官方产品版本。导出适配器有本地测试，但尚未验证所有外部软件或训练流程的导入兼容性。
 
-但面对**几十GB/数TB的实拍长视频脏数据**以及**腕部/第一人称具身智能动作视频标注**时，工程师常常遭遇以下致命工程痛点：
-1. **外置硬盘与冷存储极度脆弱**：并发直接读写外置硬盘极易造成 I/O 堵塞、掉盘断连（`WinError 21`）甚至物理数据损坏。
-2. **AI 标注黑盒化、不敢信**：传统平铺 JSON 无法分清哪些字段是模型猜的、哪些是规则推的、哪些是人工确认的。
-3. **真实脏数据误报率高**：景区历史雕像被误当成人脸、街头招牌电话被误当手机屏、景区门票特写被误判为自然风景。
-4. **视频复核成本极高**：逐一打开几千个高码率视频用肉眼看，时间成本无法承受。
+## 安装
 
-**TraceAnnotate** 诞生于生产级高压数据工程实践，首创**“冷存储安全 Staging 协议 (R1-R5)”**、**“字段级全链路来源溯源 (Fill 字典)”**、**“实拍脏数据复合判据 (F1-F3)”**，并完整融合了**“具身智能时序切片与 7 类错误归因套件 (Specification v2.1)”**。
-
----
-
-## 📊 与市面主流工具对比
-
-| 核心特性 | CVAT / Label Studio | FiftyOne | **TraceAnnotate** (本项目) |
-|---|:---:|:---:|:---:|
-| **冷存储保护 Staging 协议 (R1-R5)** | ❌ (仅支持直接读写) | ❌ (无硬件防爆机制) | **✅ 批次暂存、源盘只读白名单、双校验即用即删** |
-| **字段级来源溯源 (Provenance)** | ❌ (仅输出平铺值) | ⚠️ (仅支持字段标签) | **✅ 独创 `fill` 字典 (`auto_metric`, `human_confirmed` 等)** |
-| **雕像/文物假人脸拆分判据 (F1)**| ❌ (误报为真人) | ❌ (无领域规则) | **✅ 结合语境拆解 `statue_face`，解除真人假阳性** |
-| **手机屏 vs 街头店招 OCR 判据 (F3)** | ❌ | ❌ | **✅ 界面形态词 + 文本区域形态复合判据** |
-| **相似素材快速聚类** | ⚠️ (需插件扩展) | ✅ (向量相似度) | **✅ 感知 dHash + 并查集 (DSU) 高速聚类** |
-| **4x4 快速拼板视觉审计** | ❌ (单图/单视频) | ⚠️ (Web 网格) | **✅ 秒级生成 4x4 拼板图 (`sheet_generator`)** |
-| **具身智能动作时序切片** | ⚠️ (需手工拉框) | ❌ | **✅ Working/Idle 自动补集、步骤对账、7类错误归因** |
-| **标注员逐秒 IoU Kappa 一致性 ($\ge 0.80$)**| ❌ | ❌ | **✅ 内置逐秒 tIoU 时间轴 Cohen's Kappa 测评** |
-| **100% 纯本地离线 / 零外网流量** | ⚠️ (依赖容器) | ⚠️ | **✅ 零依赖离线执行，杜绝数据泄露** |
-
----
-
-## 🏗️ 整体架构设计
-
-```
-                    ┌──────────────────────────────────────────────┐
-                    │       Cold Storage (只读源盘 / H:\ / 移动硬盘) │
-                    └──────────────────────┬───────────────────────┘
-                                           │ Staging (R1-R5 安全暂存)
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                             Core Pipeline Engine                                 │
-│                                                                                  │
-│  [1. 物理技术底账]           [2. 离线轻量推理]           [3. 复合判据与共识]       │
-│  - size & head1mb_md5        - 图像质量 (Laplacian CV5)  - F1: 雕像假人脸拆分      │
-│  - 感知 dHash 指纹           - YuNet 人脸检测器          - F2: 实体候选/确信分档   │
-│  - 并查集 (DSU) 相似聚类     - RapidOCR 招牌提取         - F3: 手机屏/店招 OCR     │
-│                              - 中文 CLIP zero-shot       - 场景 0.35 全帧切分      │
-│                                                                                  │
-│  [4. 全链路来源溯源 (Provenance)]                                                │
-│  fill: { auto_metric | auto_rule | auto_path | pending_review | human_confirmed }│
-└──────────────────────────────────────────┬───────────────────────────────────────┘
-                                           │
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                         Human-in-the-Loop 快速视觉审计                           │
-│  - 4x4 拼板核验板 (Contact Sheet) - P1-P4 优先级复核队列 - 追加式覆写 (human_overrides)│
-└──────────────────────────────────────────┬───────────────────────────────────────┘
-                                           │
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                         具身智能时序标注与质检引擎                               │
-│  - 整段诊断 (正常/佩戴异常/描述不符) - 手部操作 Working 段边界判定                 │
-│  - 段中段 Hole (橙色)             - 自动化 Idle 补集时间轴计算                   │
-│  - 预期步骤对账 diff S=[1..N]     - 7 种错误子类归因与证据模板                   │
-│  - 逐秒 tIoU 统计与 Kappa 达标评估 - Label Studio v2.1 规范 XML / JSON 互转      │
-└──────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🚀 快速上手
-
-### 1. 安装
+使用 Python 3.9 或更新版本。当前验证版本以 [CI](https://github.com/wyregey779-dot/trace-annotate/actions/workflows/ci.yml) 为准。
 
 ```bash
 git clone https://github.com/wyregey779-dot/trace-annotate.git
 cd trace-annotate
-
-# 安装轻量核心包
-pip install -e .
-
-# 安装完整多模态套件（含 OpenCV、RapidOCR、PyTorch）
-pip install -e ".[full]"
+python -m venv .venv
 ```
 
-### 2. 运行开箱即用示例
+激活虚拟环境：PowerShell 使用 `.venv\Scripts\Activate.ps1`，Linux/macOS 使用 `source .venv/bin/activate`。然后安装并验证：
 
 ```bash
-# 1. 运行媒体资产管线全流程演示（冷存储暂存、dHash聚类、复合判据、21键质检）
-python examples/demo_asset_pipeline.py
+python -m pip install -e ".[dev]"
+trace-annotate --help
+python -m pytest tests -q
+```
 
-# 2. 运行具身智能视频标注演示（Working/Idle切片、步骤对账、7类错误诊断、Kappa评估）
+核心依赖为 NumPy、Pillow 和 tqdm。按需安装可选组件：
+
+| 组件或依赖 | 用途与限制 |
+| --- | --- |
+| `python -m pip install -e ".[cv]"` | OpenCV 视频/运动处理与可选 HEIF 图像支持；YuNet 人脸检测还需兼容的本地 ONNX 权重。 |
+| `python -m pip install -e ".[ocr]"` | RapidOCR 接口，模型和运行时是否可用取决于实际安装的包。 |
+| `python -m pip install -e ".[full]"` | 安装可选视觉/OCR 依赖，安装体积较大，不代表所有模型推理功能已完成。 |
+| `PATH` 中的 `ffmpeg` 可执行文件 | FFmpeg 场景切分辅助函数需要此工具；pip 不会安装该可执行文件。 |
+
+**CLIP 接口尚未完成。** 当前适配器没有完整的图像/文本推理实现。`clip` 扩展只安装 PyTorch/torchvision，没有安装 `cn_clip` 或提供模型权重。请勿将其输出当作模型预测，后续事项见[路线图](docs/ROADMAP.md)。
+
+核心示例与时间轴计算在本地运行，无需 OpenAI API 密钥。安装及可选模型包可能访问网络；离线使用前应准备并验证依赖与权重。
+
+## 运行示例
+
+```bash
+python examples/demo_asset_pipeline.py
 python examples/demo_embodied_pipeline.py
 ```
 
-### 3. CLI 命令行工具速查
+资产示例创建合成图片，并使用模拟人脸/CLIP 字段演示数据流，不用于测量检测准确率。它会创建并删除 `examples/_demo_scratch`，请勿在该目录存放自己的文件。具身标注示例构造合成记录，展示 idle 区间、步骤顺序与一致性结果。
 
-```bash
-# 对标注总表执行 21 键终检回归
-trace-annotate asset-verify my_annotations.jsonl --inventory my_inventory.jsonl
-
-# 快速生成 4x4 视觉核验拼板图
-trace-annotate asset-sheet thumbs/*.jpg -o audit_sheet.jpg --cols 4
-
-# 具身智能：根据 working 段自动补全 timeline idle 补集
-trace-annotate embodied-idle clip_001.json --inplace
-
-# 具身智能：对账预期流程 S = [1..N]（秒出遗漏、乱序、重复步骤）
-trace-annotate embodied-diff clip_001.json --nsteps 5
-
-# 具身智能：双人背靠背试标计算时间轴 Cohen's Kappa（对标 EgoOops 0.80 门槛）
-trace-annotate embodied-kappa annotator_A.jsonl annotator_B.jsonl --fps 2.0
-
-# 具身智能：导出官方 Label Studio v2.1 界面配置 XML
-trace-annotate embodied-xml -o label_studio_config.xml
-```
-
----
-
-## 🧠 Python 核心代码演示
-
-### 示例 1：冷存储安全暂存与相似素材聚类
+无需模型的最小步骤对账：
 
 ```python
-from trace_annotate.core.staging import StagingManager
-from trace_annotate.core.hasher import compute_dhash
-from trace_annotate.core.cluster import cluster_by_dhash
-
-# 遵守 R1-R5 铁律：源盘只读、4个一组分批暂存、双校验、处理完立即释放本地空间
-staging = StagingManager(source_root="E:/RawFootage", staging_root="./staging")
-
-hashes = {}
-for batch in staging.stage_batch(["clip1.mp4", "clip2.mp4", "img3.jpg"]):
-    for rel_path, staged_path in batch.items():
-        hashes[rel_path] = compute_dhash(staged_path)
-    # 循环体结束后，暂存副本立即被自动物理删除！
-
-# 使用并查集按汉明距离 <= 10 进行聚类
-item_to_cluster, clusters = cluster_by_dhash(hashes, hamming_threshold=10)
-print(f"聚类发现 {len(clusters)} 个独立相似素材簇。")
-```
-
-### 示例 2：具身智能时序标注与步骤对账
-
-```python
-from trace_annotate.embodied.schema import EmbodiedAnnotationDoc, WorkingSegment, Verdict
 from trace_annotate.embodied.complement import compute_idle_complement
 from trace_annotate.embodied.differ import diff_expected_steps
 
-doc = EmbodiedAnnotationDoc(
-    clip="wrist_assembly_01.mp4",
-    text_description="1. 拾取左侧底板; 2. 安装支撑轴; 3. 拧紧固定螺母",
-    working=[
-        WorkingSegment(start=2.0, end=15.0, step_number=1, verdict=Verdict.CORRECT.value),
-        WorkingSegment(start=18.0, end=30.0, step_number=3, verdict=Verdict.WRONG.value) # 第3步在第2步前执行！
-    ]
-)
-
-# 1. 自动计算全时间轴 idle 补集
-idle_intervals = compute_idle_complement(
-    [{"start": w.start, "end": w.end} for w in doc.working],
-    total_duration=45.0
-)
-
-# 2. 预期步骤自动化对账 diff
-diff = diff_expected_steps([{"step_number": w.step_number} for w in doc.working], expected_step_count=3)
-print(diff["missing"])       # 遗漏步骤: [2]
-print(diff["out_of_order"])  # 乱序步骤: [{'previous_step': 1, 'current_step': 3}]
+working = [
+    {"start": 2.0, "end": 10.0, "step_number": 1},
+    {"start": 15.0, "end": 20.0, "step_number": 3},
+]
+print(compute_idle_complement(working, total_duration=30.0))
+# [{'start': 0.0, 'end': 2.0}, {'start': 10.0, 'end': 15.0},
+#  {'start': 20.0, 'end': 30.0}]
+result = diff_expected_steps(working, expected_step_count=3)
+print(result["missing"])       # [2]
+print(result["out_of_order"])  # []：没有步骤编号递减的相邻转换
 ```
 
----
+## 命令行
 
-## 🔬 21 键终检完整性检验体系
+以下命令使用你自己的标注文件；记录结构见[标注 SOP](docs/EMBODIED_ANNOTATION_SOP.md)。
 
-系统内置自动化终检引擎，针对全库主表进行 21 项量化指标硬性检验：
+```bash
+# 校验标注记录
+trace-annotate embodied-validate clip.json
 
-- `row_count_match`: 标注行数与底账 inventory 严格一致。
-- `asset_id_missing == 0`: 零未命名主键资产。
-- `duplicate_ids == 0`: 严格无重复主键。
-- `key_missing == {}`: 46 个 Schema 键在全量行位无一缺失。
-- `phash_missing == 0`: 感知指纹覆盖率 100%。
-- `video_windows_null == 0`: 视频资产可用窗口必须有落值。
-- `face_missing == 0`, `ocr_missing == 0`, `clip_missing == 0`。
-- `fill_missing == 0`: 全量字段 100% 具备来源归因审计码。
+# 计算 idle 补集，补齐至视频真实总时长
+trace-annotate embodied-idle clip.json --duration 60
 
----
+# 对账预期流程步骤
+trace-annotate embodied-diff clip.json --nsteps 5
 
-## 🛡️ 生产级可靠性与硬约束契约（T01 - T14）
+# 采样比较两位标注员的时间轴
+trace-annotate embodied-kappa annotator_A.jsonl annotator_B.jsonl --fps 2
 
-TraceAnnotate 严格贯彻 **“结果可信、错误可发现、修改可追溯、失败可恢复”** 的工程哲学。整个系统通过了严格的 14 项契约回归测试：
+# 生成本地质检报告，或打开时间轴编辑器
+trace-annotate embodied-qc clip.json -o qc_report.html
+trace-annotate embodied-ui
 
-| 契约编号 | 核心保障能力 | 实现与校验方式 |
-|:---:|---|---|
-| **T01** | **冷存储路径防穿越与绝对路径注入防护** | 引入安全路径解析器，阻断 `..`、盘符越界与绝对路径攻击；非法路径直接抛出 `PermissionError`。 |
-| **T02** | **原子落盘、双重备份与审计追踪** | 采用操作系统底层原子替换（`os.replace`）与 `.bak` 快照兜底，告别“先删后写”的断电损毁风险。 |
-| **T03** | **暂存盘动态配额与活跃任务隔离** | 引入 `lock_in_use`/`unlock_in_use` 活跃状态锁，防止后台清理误删正在使用的视频片段；动态检查剩余空间。 |
-| **T04** | **多帧率映射一致性** | 严格校验证真 25, 29.97, 30, 60 FPS 连续时间戳到离散帧索引的双向映射，杜绝帧漂移与负区间。 |
-| **T05** | **时序 Schema 硬约束校验** | 拦截负时间戳、时间区间颠倒（`start >= end`）及工作段重叠异常（Overlapping intervals）。 |
-| **T06** | **Label Studio 乱序无关与缺失属性保护** | 采用多遍解构机制，属性节点先于区域出现时完全可靠绑定；未打标属性保留为 `None`，杜绝静默伪填“对”或“步骤1”。 |
-| **T07** | **动作分割全局类别映射抗漂移** | ActionFormer / ASFormer / MS-TCN 数据集导出器支持加载并维护持久化全局映射，避免分批导出类别 ID 冲突。 |
-| **T08** | **时间一致性与语义冲突严格正交** | 独立评估时间重合度（tIoU）与语义一致性（步骤、判定、错误类型）；数学检测并报告 Kappa 假阳性流行率悖论。 |
-| **T09** | **独立流程规范与离群步骤隔离** | 支持自定义 `ProcedureSpec` 流程规范；对异常离群步骤（如 step 999）直接标记为 invalid，不再虚假扩散 998 个 missing 遗漏步骤。 |
-| **T10** | **提取器运行状态真诚汇报** | 模型权重未加载或跳过运行时，明确返回 `NOT_RUN` 与 `None`，严禁伪报“无人物”或“无屏幕”。 |
-| **T11** | **视频真实总时长保持与尾部 Idle 补齐** | 严格按视频元数据真实时长对齐动作分割标签，尾部静默区间完整补全为 `idle`，杜绝训练集尾部截断。 |
-| **T12** | **安全回滚与审计历史永不删除** | 状态回滚操作作为全新修订事件追加记入，完整保留历次修改责任人、原因与旧值，审计链永不破损。 |
-| **T13** | **源目录与暂存目录重叠严禁启动** | 运行时严格检测并拒绝源盘与暂存盘相同、相互嵌套或父子包含，彻底隔绝递归复制或误清盘灾难。 |
-| **T14** | **全流程 Stage 确定性哈希与幂等重跑** | 规整 JSON 输入指纹哈希，确保相同输入与配置生成完全幂等的 provenance 审计缓存。 |
+# 导出本项目的 Label Studio 配置或字幕
+trace-annotate embodied-xml -o label_studio_config.xml
+trace-annotate embodied-export clip.json --format srt -o clip.srt
 
----
+# 检查资产总表，或生成拼图
+trace-annotate asset-verify annotations.jsonl --inventory inventory.jsonl
+trace-annotate asset-sheet thumb1.jpg thumb2.jpg -o audit_sheet.jpg --cols 4
+```
 
-## 📖 详细文档
+`embodied-idle --inplace` 会覆盖输入文件；首次使用可不加此参数，先查看标准输出。传入真实 `--duration`，才能保留最后一个 working 段之后的 idle。暂存清理会删除暂存副本，请使用专用暂存目录并保留源文件备份。复制校验仅检查大小与前 1 MiB，并非全文件加密完整性验证或硬件写保护。
 
-- [系统核心架构设计](docs/ARCHITECTURE.md)
-- [具身智能视频标注 SOP 规范 v2.1](docs/EMBODIED_ANNOTATION_SOP.md)
-- [46 键主表 Schema 与 Fill 溯源字典规范](docs/PROVENANCE_SCHEMA.md)
-- [4x4 拼板目检与追加式覆盖工作流](docs/FAST_AUDIT_WORKFLOW.md)
+## 文档与参与
 
----
+- [架构](docs/ARCHITECTURE.md)
+- [具身标注 SOP](docs/EMBODIED_ANNOTATION_SOP.md)
+- [资产 Schema 与字段来源](docs/PROVENANCE_SCHEMA.md)
+- [视觉复核工作流](docs/FAST_AUDIT_WORKFLOW.md)
+- [已知限制与路线图](docs/ROADMAP.md)
+- [贡献指南](CONTRIBUTING.md)
 
-## 📄 开源许可证
+可通过 [GitHub Issues](https://github.com/wyregey779-dot/trace-annotate/issues) 报告问题和讨论改进。请附上命令、版本、操作系统与最小合成复现，不要上传私人视频或密钥。
 
-本项目基于 [MIT License](LICENSE) 开源发布。
+## 许可证
+
+[MIT](LICENSE)。外部模型权重、可选运行时和数据集可能使用各自的许可证。
