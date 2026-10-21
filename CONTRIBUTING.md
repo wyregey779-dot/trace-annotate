@@ -41,5 +41,5 @@ TraceAnnotate was forged from real-world, high-stakes production environments pr
 
 1. Create a feature branch (`git checkout -b feature/my-new-feature`).
 2. Add comprehensive unit tests in `tests/` covering your changes.
-3. Verify that all 13+ tests pass and no regression occurs.
+3. Verify that all 33+ tests pass and no regression occurs.
 4. Submit your pull request with a clear description of the problem solved and test evidence.
