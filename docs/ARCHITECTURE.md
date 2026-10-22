@@ -1,86 +1,64 @@
-# TraceAnnotate System Architecture
+# Architecture
 
-## Overview
+TraceAnnotate provides local Python modules, command-line tools and a browser editor for media review and temporal annotation. The core annotation workflow does not require a hosted service or model API.
 
-TraceAnnotate is designed around two interlocking engines:
-1. **Media Asset Data Pipeline Engine**: Ingests, hashes, stages, clusters, and semantically tags multi-terabyte raw video/image archives.
-2. **Embodied AI Temporal Annotation Suite**: Fine-grained egocentric action segmentation, working/idle phase extraction, 7-class error diagnosis, and inter-annotator agreement evaluation.
+## Modules and data flow
 
-```
-                    ┌──────────────────────────────────────────────┐
-                    │       Cold Storage (Source Drive / H:\)      │
-                    └──────────────────────┬───────────────────────┘
-                                           │ Staging (R1-R5 protocol)
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                             Core Pipeline Engine                                 │
-│                                                                                  │
-│  [1. Technical Grounding]    [2. Multi-Modal Extractors]  [3. Composite Heuristics]│
-│  - size & head1mb_md5        - Visual Metrics (Laplacian) - F1: Statue Face (YN)   │
-│  - Perceptual dHash          - YuNet Face Detector        - F2: Entity Tiering     │
-│  - DSU Near-Dup Clustering   - RapidOCR Sign Extractor    - F3: Mobile Screen OCR  │
-│                              - Zero-Shot CLIP             - Calibrated Scene Cut   │
-│                                                                                  │
-│  [4. Provenance & Consensus Tracking]                                            │
-│  fill: { auto_metric | auto_rule | auto_path | pending_review | human_confirmed }│
-└──────────────────────────────────────────┬───────────────────────────────────────┘
-                                           │
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                         Human-in-the-Loop Fast Audit                             │
-│  - 4x4 Visual Contact Sheets   - P1-P4 Prioritized Queue   - Append-Only Overrides│
-└──────────────────────────────────────────┬───────────────────────────────────────┘
-                                           │
-                                           ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                         Embodied AI Video Annotation                             │
-│  - Clip-Level Diagnosis         - Hand-Object Working Segment Boundaries           │
-│  - Mid-Segment Holes            - Automatic Idle Timeline Complements              │
-│  - Expected Step Diffing S=[1..N]- 7-Class Failure Diagnosis & Template Evidence │
-│  - Temporal Cohen's Kappa Eval  - Label Studio v2.1 XML / JSON Roundtrip Export  │
-└──────────────────────────────────────────────────────────────────────────────────┘
+| Module | Responsibility |
+| --- | --- |
+| `core` | Staged copies, size and partial-hash verification, perceptual hashes, duplicate clustering and field provenance |
+| `extractors` | Optional visual metrics, face detection, OCR and scene-cut adapters; CLIP inference is not implemented |
+| `heuristics` | Rules that turn available measurements and path hints into review candidates |
+| `audit` | Contact sheets, a prioritized review queue and recorded human overrides |
+| `embodied` | Annotation structure checks, idle intervals, expected-step comparison and agreement calculations |
+| `exporters` | SRT, frame labels and a CVAT-style XML export |
+| `ui` | A packaged HTML editor for loading local video, marking intervals and downloading annotations |
+
+These modules can be used separately. The example scripts show how to compose selected operations; they are not a complete automatic labeling pipeline. External annotation formats require compatibility checks against the destination tool.
+
+A typical temporal annotation workflow is:
+
+```text
+Local video → browser editor → annotation JSON
+                                  ↓
+                       validate and calculate idle
+                                  ↓
+                          review report / SRT
 ```
 
----
+The [quickstart](QUICKSTART.md) exercises the JSON-to-report path with a synthetic fixture.
 
-## 1. Cold Storage Safety Protocol (R1-R5)
+## Staging lifecycle
 
-Handling large-scale footage on external storage (e.g., HDDs or SD cards) presents real hardware risks:
-- Device disconnections (`WinError 21`) during high-concurrency read/write.
-- Accidental mutation or corruption of raw archival footage.
-- Local SSD space exhaustion.
+`StagingManager` copies a batch from a source root into a separate staging directory. It checks path boundaries, checks available disk space before copying and can verify the copied size and a hash of the file's first megabyte. This is a partial-content check, not a full-file checksum.
 
-TraceAnnotate enforces strict cold-storage rules:
-* **R1**: Source directory is read-only. No processing outputs, cache files, or temporary frames are ever written back to source.
-* **R2**: Staging is performed in small, fixed-size batches (default 4 files).
-* **R3**: Every staged file is bidirectional verified (`size` + `head1mb_md5`) before processing.
-* **R4**: Free disk space on the host machine is guarded by a hard floor (default 2GB).
-* **R5**: Staged temporary copies are purged immediately after batch completion.
+Consumers can call `lock_in_use` before processing a staged file and `unlock_in_use` after processing. Cleanup protects locked entries and their resolved targets. It unlinks eligible file symlinks by their directory entry, skips directory symlinks and Windows junctions, and reports deletion failures.
 
----
+The caller must control the staging directory while operations run. Path checks do not provide atomic protection against concurrent directory replacement. A free-space check is not a reservation, and the `read_only_source` configuration field does not change filesystem permissions. Source permissions, backup policy and consumer lock lifetimes belong to the application using the stager.
 
-## 2. Field-Level Provenance Architecture
+## Annotation checks
 
-Standard annotation tools produce flat JSONs where human reviewers cannot tell whether a tag was predicted by an AI model, inferred from a file path, or validated by a domain expert.
+The project uses its own clip and interval schema. The [annotation SOP](EMBODIED_ANNOTATION_SOP.md) defines its labels and review conventions.
 
-TraceAnnotate solves this with the `fill` dictionary:
+The validator checks supported statuses, segment fields, timing constraints and evidence requirements. It cannot decide whether a label accurately describes the video. Idle calculation needs a known clip duration to include the interval after the last working segment. Agreement statistics compare annotators on sampled time bins; they do not establish label accuracy.
+
+See the [roadmap](ROADMAP.md) for planned format round-trip checks and measured performance work.
+
+## Provenance and human review
+
+A record's `fill` mapping identifies the origin or review state of individual fields:
+
 ```json
 {
-  "primary_entity": "杜甫江阁",
+  "primary_entity": "stone sculpture",
   "face_count": 0,
-  "indoor_outdoor": "室外",
   "fill": {
     "primary_entity": "human_confirmed",
-    "face_count": "auto_metric",
-    "indoor_outdoor": "auto_rule"
+    "face_count": "auto_metric"
   }
 }
 ```
-Tier Hierarchy:
-1. `human_confirmed`: Human judgment. Overrides all machine predictions.
-2. `auto_metric`: Direct algorithmic measurement (Laplacian variance, dimensions, dHash, ffprobe).
-3. `auto_rule`: Deterministic business logic rules.
-4. `auto_path_confirmed`: Deep directory hierarchy match.
-5. `candidate_only`: Machine proposal with uncertainty.
-6. `pending_review`: Explicitly flagged for human auditor review.
-7. `pending_tool`: Awaiting external specialized sensor/tool.
+
+The available states include `auto_metric`, `auto_rule`, `auto_path`, `auto_path_confirmed`, `candidate_only`, `pending_review`, `pending_tool` and `human_confirmed`. They describe how a field was populated; they are not confidence scores.
+
+Human overrides store revisions and support rollback. The caller explicitly applies them to records and saves the resulting table. The JSON files are ordinary local files, not signed audit records or a concurrent database. See [provenance fields](PROVENANCE_SCHEMA.md) and the [review workflow](FAST_AUDIT_WORKFLOW.md).

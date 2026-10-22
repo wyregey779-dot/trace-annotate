@@ -1,22 +1,62 @@
-# Known limitations and roadmap
+# Roadmap and acceptance criteria
 
-This is a list of current limitations and proposed work, not a claim that the work is implemented or scheduled. Priorities can change after reproducible user feedback.
+The next work focuses on filesystem behavior, annotation interchange and optional model integration. Each item below includes the checks needed before it can be described as supported. Priorities may change after reproducible user reports; no delivery dates are committed.
 
-## Current limitations
+## Current boundaries
 
-- The CLIP adapter is incomplete. Its optional extra does not install `cn_clip` or weights, and its current classifier is not a complete inference path.
-- Optional face/OCR/scene integrations depend on external runtimes, model files or the `ffmpeg` executable. Missing dependencies and third-party model behavior need additional coverage.
-- Export adapters are tested locally. Import compatibility with specific Label Studio/CVAT releases and action-recognition training tools still needs end-to-end validation with documented versions.
-- Timeline agreement is calculated from samples. A high working/idle agreement score alone does not establish semantic label quality.
-- Staging copy verification compares size and a hash of the first MiB. It is not full-file verification, a hardware write lock or a guarantee against storage failure. Use a dedicated staging directory and backups.
-- Synthetic examples and unit tests do not establish performance at scale, model accuracy or broad adoption. No public download or deployment metrics are claimed.
+- Core processing runs locally without an API key. Optional runtimes and weights need separate installation and verification.
+- The CLIP adapter returns `not_run`; complete image/text inference is not implemented.
+- Export adapters have local format tests. Compatibility with specific annotation applications and training pipelines still needs end-to-end checks.
+- Copy verification covers file size and the first MiB, not the entire file. Use a dedicated staging directory for disposable copies; concurrent filesystem mutation remains outside the guarantees of the current path checks.
+- Timeline agreement samples time intervals. It does not replace semantic label review.
+- Synthetic fixtures and regression tests do not establish model accuracy, public adoption or performance at scale. No download or deployment counts are claimed.
 
-## Proposed work
+## Workstreams
 
-- Implement real CLIP inference with local weight selection, explicit download behavior and tests of successful, missing-model and failed-model states.
-- Validate representative round trips in external annotation tools and publish the tested formats and versions.
-- Improve CLI error reporting for malformed JSON/JSONL, invalid arguments and missing optional dependencies.
-- Extend the installed-wheel/resource and model-free example checks added in 1.0.1 to more optional integrations.
-- Collect opt-in, reproducible feedback from users and benchmark synthetic or redistributable datasets before publishing performance claims.
+| Workstream | Intended result | Evidence required |
+| --- | --- | --- |
+| Filesystem lifecycle | Preserve source boundaries and staged files marked in use | Regressions for links, junctions, lock aliases and cleanup failures on supported platforms |
+| First-run workflow | A reproducible path from an annotation record to reviewable outputs | Versioned fixture, copyable commands, expected results and installed-package checks |
+| External formats | Move annotations between tools without silently changing timing or labels | Named tool versions, round-trip fixtures and comparison of retained/lost fields |
+| Optional integrations | Distinguish useful predictions from missing or failed extractors | Explicit statuses, dependency/weight instructions and failure-path tests |
+| Performance | Publish measurements that others can reproduce | Defined workload, hardware, repeated measurements and correctness checks |
 
-Discuss a proposal in [GitHub Issues](https://github.com/wyregey779-dot/trace-annotate/issues) before starting a broad change. Use synthetic reproducers and avoid private footage or credentials.
+## CLIP inference
+
+Status: **planned; not implemented**. Installing the `clip` extra does not enable a complete inference path.
+
+Completion requires:
+
+1. A supported backend, package versions, local model format and weight license.
+2. Explicit weight configuration. Any download must be a documented user action.
+3. Actual image/text encoding and scoring, with documented score meaning and output provenance.
+4. Tests for success, missing dependency, missing weights and failed inference. An unrun or failed model must not emit placeholder predictions.
+5. A small permitted fixture and a reproducible inference check. Accuracy claims require a separate evaluation with a defined dataset and method.
+
+## External annotation round trips
+
+Start with one Label Studio or CVAT version and one documented task configuration. A completed check should include:
+
+- A permitted synthetic fixture containing working, idle, uncertain and error-labelled segments.
+- Steps to import, inspect and re-export the fixture in the selected application.
+- A comparison of duration, interval boundaries, step identity, verdict and evidence before and after conversion.
+- Explicit handling or rejection of unsupported fields.
+- An automated format regression and a record of the application version used for the manual check.
+
+Action-recognition adapters need equivalent checks against a named consumer and its time-unit/frame-sampling convention. Parsing generated XML locally does not establish application compatibility.
+
+## Performance measurements
+
+Before publishing throughput or scale claims:
+
+- Provide the fixture generator or redistribution rights, dataset size, operating system, Python version, hardware and storage type.
+- Separate file I/O, hashing, timeline processing and model initialization/inference measurements.
+- Record elapsed time and peak memory across repeated runs; document warm/cold-cache conditions where relevant.
+- Include correctness checks and failure counts alongside throughput.
+- Limit conclusions to the measured workload and environment.
+
+## Feedback and contribution
+
+A useful report describes the task, exact command or workflow, expected output, observed output and environment. Prefer small synthetic reproducers to private footage. Maintainer-authored issues can track genuine work but are not evidence of independent users or adoption.
+
+Discuss a focused proposal in [GitHub Issues](https://github.com/wyregey779-dot/trace-annotate/issues), then submit a pull request with matching tests and documentation. See [CONTRIBUTING](../CONTRIBUTING.md) for the workflow and [SECURITY](../SECURITY.md) for security reports.

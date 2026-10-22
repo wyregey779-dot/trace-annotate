@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.2
+
+- Unlink in-tree file symlinks without deleting their targets during staging cleanup. Skip directory symlinks and Windows junctions.
+- Normalize in-use lock paths and retain protection when a file is locked through an alias. Report deletion failures instead of listing a failed removal as completed.
+- Add filesystem regression cases for cleanup, link boundaries, locks and dry runs.
+- Add a synthetic annotation fixture and a runnable quickstart that produces a validated annotation, a QC report and SRT subtitles without model dependencies.
+- Reorganize the English and Chinese guides around supported workflows, with an actual report preview and explicit integration status.
+- Include usage guides, examples and maintenance scripts in source distributions. Validate wheel/source contents and generate SHA-256 checksums for release downloads.
+- Add a tag-triggered workflow that builds and checks packages before uploading them to a GitHub release.
+
 ## 1.0.1
 
 This patch addresses problems found during a reproducible review of the initial release.

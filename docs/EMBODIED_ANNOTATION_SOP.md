@@ -1,6 +1,8 @@
 # Embodied AI Egocentric Video Annotation SOP (v2.1)
 
-Standard Operating Procedure for First-Person Task Video Temporal Annotation, aligned with **EgoProceAssist**, **Assembly101**, **Ego4D**, and **EgoOops**.
+TraceAnnotate's project-specific convention for first-person task video annotation. The version number describes this convention, not an external annotation standard. Dataset-specific mappings require separate validation.
+
+The timing rules below are suggested human annotation guidelines. The validator checks document structure, working-segment timestamps, steps and verdict consistency; it does not automatically verify semantic correctness or every guideline in this document.
 
 ---
 
@@ -20,8 +22,8 @@ Inspect the overall clip before drawing intervals. If non-normal, stop immediate
 | **正常 (Normal)** | Wrist/hand perspective visible, content relevant to task | Proceed to Step 2 |
 | **佩戴问题 (Wear Issue)** | Hands not visible: occluded, upside down, black screen, selfie | Do not segment. Fill Quick ID + description in report. |
 | **描述不符-整段无关** | Footage completely unrelated to text prompt | Do not segment. Report. |
-| **描述不符-仅部分工作** | Only a sub-part of task performed | Segment only conforming parts. Report. |
-| **这里没有 (Empty)** | No work performed (empty background, insects) | Do not segment. |
+| **描述不符-仅部分工作** | Only a sub-part of task performed | Record a report and leave working empty. Split out relevant footage and annotate it as a separate normal clip if needed. |
+| **这里没有 (Empty)** | No work performed (empty background, insects) | Do not segment. Record a report. |
 
 ---
 
@@ -64,9 +66,8 @@ Every working segment must be assigned a `step_number` corresponding to $S = [1.
 
 ---
 
-## 6. Quality Metrics & Cohen's Kappa Benchmark
+## 6. Working/Idle Agreement
 
-- **Temporal IoU Sampling**: Sampled at $2\text{Hz}$ along video timeline.
-- **Inter-Annotator Agreement Benchmark**:
-  - Pilot Training Target: $\kappa \ge 0.80$ (Target for production clearance).
-  - Minimum Baseline Bar: $\kappa \ge 0.70$.
+- The agreement command samples working/idle states at $2\text{Hz}$ by default. This is not a measurement of semantic label accuracy or per-step temporal IoU.
+- The report includes reference flags for $\kappa \ge 0.80$ and $\kappa \ge 0.70$. These are project defaults, not validated production acceptance criteria.
+- Choose acceptance criteria for your own dataset, sampling rate and review process. Inspect disagreements and class balance alongside any aggregate score.

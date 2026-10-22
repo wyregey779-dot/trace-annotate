@@ -11,10 +11,10 @@ from typing import Dict, List, Optional, Any
 
 @dataclass
 class StagingConfig:
-    """Cold storage staging protocol parameters (R1-R5 compliant)."""
+    """Batch size, free-space threshold and copy verification settings."""
     group_size: int = 4                    # Number of files processed in a single staging chunk
     free_disk_guard_bytes: int = 2 * 1024**3 # 2GB safety guard on local disk
-    read_only_source: bool = True          # Ensure source storage is strictly never modified
+    read_only_source: bool = True          # Compatibility setting; does not change filesystem permissions
     verify_checksum: bool = True           # Verify size + head1mb md5 upon ingestion
 
 

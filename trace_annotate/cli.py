@@ -196,7 +196,7 @@ def cmd_embodied_validate(args: argparse.Namespace) -> None:
             print(f"  ... and {len(report['violations']) - 20} more.")
         sys.exit(1)
     else:
-        print("[OK] Specification v2.1 100% Compliant!")
+        print("[OK] No violations found by the annotation validator.")
 
 
 def cmd_embodied_xml(args: argparse.Namespace) -> None:
@@ -295,7 +295,7 @@ def cmd_embodied_motion(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="trace-annotate",
-        description="Production-grade multi-modal asset staging and embodied AI annotation engine."
+        description="Local media review and temporal video annotation tools."
     )
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
@@ -336,7 +336,7 @@ def main() -> None:
     p_kappa.set_defaults(func=cmd_embodied_kappa)
 
     # Embodied Validate
-    p_val = subparsers.add_parser("embodied-validate", help="Validate export compliance against Specification v2.1")
+    p_val = subparsers.add_parser("embodied-validate", help="Validate TraceAnnotate annotation structure and segment fields")
     p_val.add_argument("target", help="JSON file or folder to validate")
     p_val.set_defaults(func=cmd_embodied_validate)
 
