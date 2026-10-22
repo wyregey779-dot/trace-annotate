@@ -8,5 +8,5 @@ Features:
   - Embodied AI egocentric workflow annotation (working/idle, 7-class error diagnosis, Kappa agreement)
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __author__ = "TraceAnnotate Contributors"

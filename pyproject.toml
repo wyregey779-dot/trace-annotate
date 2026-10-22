@@ -1,20 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "trace-annotate"
-version = "1.0.1"
+version = "1.0.2"
 description = "Local media staging, annotation provenance, and embodied video annotation tools."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "TraceAnnotate Contributors" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Multimedia :: Video",
     "Topic :: Scientific/Engineering :: Artificial Intelligence"
@@ -24,6 +24,13 @@ dependencies = [
     "pillow>=9.0.0",
     "tqdm>=4.60.0"
 ]
+
+[project.urls]
+Homepage = "https://github.com/wyregey779-dot/trace-annotate"
+Documentation = "https://github.com/wyregey779-dot/trace-annotate/blob/main/docs/QUICKSTART.md"
+Repository = "https://github.com/wyregey779-dot/trace-annotate"
+Issues = "https://github.com/wyregey779-dot/trace-annotate/issues"
+Changelog = "https://github.com/wyregey779-dot/trace-annotate/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 cv = [

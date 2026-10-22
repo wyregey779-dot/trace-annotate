@@ -1,52 +1,51 @@
-# Fast Visual Auditing Workflow (Proof Sheet + Append-Only Overrides)
+# Visual review workflow
 
-In large datasets ($> 5,000$ assets), opening video clips or images one by one is prohibitively slow. TraceAnnotate implements an ultra-fast visual audit workflow:
+Use contact sheets to compare candidate frames, then inspect the original image or video before confirming a label. A thumbnail can help locate a questionable result, but cannot establish every detail in the source media.
 
-```
-[Candidate / Conflict Queue]
-          │
-          ▼
-[4x4 Contact Sheet Generator]  ───▶  Reviewer audits 16 clips in 2 seconds
-          │
-          ▼
-[Append-Only human_overrides.json]
-          │
-          ▼
-[In-Place Table Upgrade (fill = human_confirmed, status = confirmed)]
-```
+## Generate a contact sheet
 
----
-
-## 1. 4x4 Contact Sheet Generation
-
-Batch up to 16 thumbnails into a unified proof grid with overlay identifiers:
+Pass explicit image paths so the command works consistently across shells:
 
 ```bash
-trace-annotate asset-sheet thumbs/*.jpg -o audit_grid_01.jpg --cols 4 --title "Statue Face Audit"
+trace-annotate asset-sheet thumbs/frame-01.jpg thumbs/frame-02.jpg -o output/contact-sheet.jpg --cols 4 --title "Frame review"
 ```
 
-A human reviewer glances at the image for 2-3 seconds to spot edge cases (e.g., an ancient statue detected as a human face, or a ticket falsely predicted as a scenic location).
+Create the output directory first. Missing or unreadable images appear as placeholders. Each cell shows a thumbnail and a shortened filename. Keep the source paths available for follow-up inspection.
 
----
+The Python review-queue helper prioritizes unresolved entities and conflicts, blacklist or face-review flags, video candidates, and unsuitable frames. These priorities are rules for organizing work; they do not replace a reviewer's decision.
 
-## 2. Append-Only Overrides
+## Record a decision
 
-When an error is spotted, the reviewer records a ground-truth judgment in `human_overrides.json`:
+After checking the original frame, record the decision with its author, basis and reason:
 
-```json
-{
-  "scenic/statue_01.jpg": {
-    "primary_entity": "青年毛主席雕像",
-    "face_status": "无人物",
-    "note": "Audited: historical stone sculpture, no living person present"
-  }
+```python
+from trace_annotate.audit.overrides import HumanOverrideManager
+
+manager = HumanOverrideManager("output/review/human_overrides.json")
+revision = manager.record_override(
+    "frames/frame-01.jpg",
+    primary_entity="stone sculpture",
+    author="reviewer-01",
+    basis="original_frame_inspection",
+    reason="Confirmed the subject against the original image.",
+)
+
+record = {
+    "rel_path": "frames/frame-01.jpg",
+    "primary_entity": "unresolved",
 }
+manager.apply_to_record(record)
+
+print(record["primary_entity"])
+print(record["fill"])
 ```
 
-### Key Principles:
-1. **Never mutate raw history**: Original machine metrics in the archive remain intact.
-2. **Deterministic Precedence**: The pipeline automatically injects `human_overrides.json` during the merge phase.
-3. **Fill Elevation**:
-   - `entity_status` is automatically elevated to `confirmed`.
-   - `fill["primary_entity"]` is marked `human_confirmed`.
-   - `fill["face_status"]` is marked `human_confirmed`.
+`apply_to_record` updates the supplied record in memory and marks applicable fields as `human_confirmed`. The caller must save the updated records or table. Loading an override file does not automatically merge decisions into other project files.
+
+## Inspect and correct history
+
+`get_revision_history(rel_path)` returns the recorded revisions. `rollback_revision(rel_path, revision_id, ...)` appends a rollback revision and makes its selected values current; the earlier entries remain in the history.
+
+Keep one writer per override file and back it up with the associated annotations. The manager uses temporary-file replacement when saving, but it does not coordinate concurrent writers or provide a tamper-proof audit log.
+
+For field definitions, see [provenance and overrides](PROVENANCE_SCHEMA.md). For timing and label conventions, see the [annotation SOP](EMBODIED_ANNOTATION_SOP.md).

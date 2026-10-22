@@ -21,7 +21,10 @@ import trace_annotate
 
 source_root = Path(__import__("sys").argv[1]).resolve()
 installed_path = Path(trace_annotate.__file__).resolve()
-assert source_root not in installed_path.parents, f"Imported checkout: {installed_path}"
+source_package = source_root / "trace_annotate"
+assert source_package not in installed_path.parents, f"Imported checkout: {installed_path}"
+site_roots = {Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "platlib")}
+assert any(root in installed_path.parents for root in site_roots), f"Not installed in site-packages: {installed_path}"
 assert metadata.version("trace-annotate") == trace_annotate.__version__
 package = resources.files("trace_annotate")
 for name in ("schema_v2.json", "default_vocab.json"):
