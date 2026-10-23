@@ -1,0 +1,45 @@
+TraceAnnotate bundled media hashing dependency
+
+Component: js-sha256 0.11.1 (SHA-256 incremental implementation)
+Project: https://github.com/emn178/js-sha256
+Upstream commit: 7912494a5ae277660131557401b91f11f47c96d2
+Source: https://raw.githubusercontent.com/emn178/js-sha256/7912494a5ae277660131557401b91f11f47c96d2/build/sha256.min.js
+npm archive: https://registry.npmjs.org/js-sha256/-/js-sha256-0.11.1.tgz
+npm archive integrity (SHA-512, verified against registry metadata):
+sha512-o6WSo/LUvY2uC4j7mO50a2ms7E/EAdbP0swigLV+nzHKTTaYnaLIWJ02VdXrsJX0vGedDESQnLsOekr94ryfjg==
+Vendored build SHA-256 (9229 bytes):
+4b53da9acab6a5d4010107be2025002fe1a22da64804dd5200b46895cb899219
+Upstream license SHA-256 (1076 bytes):
+0fea2e0cffe72ee17adc25c42e55daf5c87c6e9cd5b3362ee4213890bda0ee7c
+
+media-hash.js contains the unchanged upstream build as the SHA256_SOURCE
+JavaScript string. It executes only inside the local Blob Worker. The wrapper
+and Worker read loop are maintained by TraceAnnotate. No runtime download or
+network service is used. The vendored build and license were checked byte for
+byte against the pinned GitHub commit and the integrity-verified npm archive.
+The pin is a reproducible dependency selection, not a security certification.
+
+----- Upstream MIT license (unchanged text) -----
+
+Copyright (c) 2014-2025 Chen, Yi-Cyuan
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

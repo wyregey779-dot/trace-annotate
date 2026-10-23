@@ -26,6 +26,18 @@ trace-annotate --help
 
 Install optional extras only when your change needs them. Vision and OCR integrations may require additional local model weights; the CLIP adapter is incomplete. See [README](README.md) and the [roadmap](docs/ROADMAP.md).
 
+For changes to the general video editor, install `python -m pip install -e ".[dev,browser-test]"`, install the FFmpeg executable, and run `python -m playwright install chromium`. Then run:
+
+```bash
+python scripts/check_general_editor.py --output output/browser-check
+python scripts/check_editor_integrity.py --output output/editor-integrity-check
+python scripts/check_media_identity.py --output output/media-identity-check
+python scripts/check_media_admission.py --output output/media-admission-check
+python scripts/check_prepared_editor.py --output output/prepared-editor-check
+```
+
+Choose a new output directory on each run. The checks create synthetic media and open an isolated headless browser. The general check exercises annotation/save/recovery/download flows and compares browser subtitle files with the Python parser; the integrity check verifies unchanged native strings, review invalidation, undo and dirty-form recovery; the identity check distinguishes same-name/size/duration media, verifies full hashes, migrations, renaming and cancelled loads. Admission checks cover audio-only/undecodable inputs and project preservation; preparation checks exercise ProRes/VFR conversion, actual loopback Range playback, annotation downloads and recovery. They save JSON results, media/exports and screenshots. To use an already installed Chrome for local development, add `--channel chrome`. They do not connect to your logged-in browser or test the native operating-system file picker. The separate browser CI job runs all five checks with bundled Chromium.
+
 ## Make a change
 
 1. Create a branch from the current `main`.

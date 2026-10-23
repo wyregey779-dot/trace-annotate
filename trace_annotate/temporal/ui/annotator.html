@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>通用视频片段标注 · TraceAnnotate</title>
+  <style>
+    :root { color-scheme: dark; --bg: #111820; --panel: #19232e; --raised: #22303d; --line: #415264; --text: #ecf0f3; --muted: #b1bec9; --accent: #91d3c2; --danger: #ffb6b0; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 1rem/1.55 system-ui, "Microsoft YaHei", sans-serif; }
+    button, input, textarea, select { font: inherit; }
+    button, .file-label { min-block-size: 2.75rem; padding: .55rem .85rem; border: 1px solid var(--line); border-radius: .45rem; background: var(--raised); color: var(--text); cursor: pointer; }
+    button:hover, .file-label:hover { background: #2c4050; }
+    button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
+    button.primary { background: #8acbbb; border-color: #8acbbb; color: #0d2924; font-weight: 700; }
+    button.danger { color: var(--danger); }
+    :where(button, input, textarea, select, a, summary):focus-visible { outline: 3px solid #c8f3e7; outline-offset: 3px; }
+    .file-input { position: absolute; inline-size: 1px; block-size: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+    .file-input:focus-visible + .file-label { outline: 3px solid #c8f3e7; outline-offset: 3px; }
+    .skip { position: absolute; inset-block-start: -5rem; inset-inline-start: 1rem; background: var(--text); color: var(--bg); padding: .7rem; z-index: 10; }
+    .skip:focus { inset-block-start: 1rem; }
+    header { padding: 1.2rem 1.5rem; border-block-end: 1px solid var(--line); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; }
+    h1 { font-size: 1.25rem; margin: 0; letter-spacing: .015em; }
+    h2 { font-size: 1rem; margin: 0; }
+    p { margin: .35rem 0; }
+    .eyebrow { color: var(--accent); font-size: .75rem; letter-spacing: .15em; margin: 0 0 .2rem; }
+    .muted, .hint { color: var(--muted); }
+    .hint, .small { font-size: .82rem; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(20rem, 25rem); gap: 1rem; max-inline-size: 110rem; margin: auto; padding: 1rem 1.5rem; align-items: start; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: .65rem; overflow: hidden; }
+    .panel-head { display: flex; justify-content: space-between; gap: .7rem; flex-wrap: wrap; padding: .85rem 1rem; border-block-end: 1px solid var(--line); }
+    .video-wrap { background: #080c10; }
+    video { display: block; inline-size: 100%; aspect-ratio: 16 / 9; max-block-size: 57vh; object-fit: contain; }
+    .video-note { padding: .6rem 1rem; color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
+    .media-load { padding: .6rem 1rem; border-block-start: 1px solid var(--line); }
+    #hashProgress { inline-size: min(100%, 28rem); accent-color: var(--accent); }
+    .player-tools { padding: .8rem 1rem; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .7rem; }
+    .time { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+    .timeline-section { margin-block-start: 1rem; padding: 1rem; }
+    .seek-label { display: flex; justify-content: space-between; gap: 1rem; }
+    #seek { inline-size: 100%; accent-color: var(--accent); min-block-size: 2.75rem; }
+    .timeline-tracks { display: grid; gap: .8rem; margin-block-start: .8rem; }
+    .track-label { font-size: .82rem; margin-block-end: .25rem; overflow-wrap: anywhere; }
+    .lane { position: relative; min-block-size: 2.5rem; background: #101c26; border: 1px solid #324658; border-radius: .3rem; margin-block-end: .2rem; }
+    .clip { position: absolute; inset-block: 2px; min-inline-size: 4px; min-block-size: 0; padding: .2rem .4rem; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border: 1px solid #92b6cf; background: #314f63; font-size: .75rem; text-align: start; }
+    .clip.reviewed { border-color: #8ed5bc; background: #294f46; }
+    .clip[aria-pressed="true"] { box-shadow: inset 0 0 0 2px #e7f6ff; }
+    .track-cursor { position: absolute; inset-block: 0; inline-size: 2px; background: #ffce82; pointer-events: none; }
+    .empty { color: var(--muted); padding: 1rem; text-align: center; border: 1px dashed var(--line); border-radius: .4rem; }
+    .editor { padding: 1rem; }
+    fieldset { border: 0; padding: 0; margin: 0; min-inline-size: 0; }
+    legend { font-weight: 700; padding: 0; margin-block-end: .8rem; }
+    .field { margin-block-end: .9rem; }
+    label { display: block; margin-block-end: .25rem; font-size: .88rem; }
+    input:not([type="checkbox"]):not([type="range"]):not([type="file"]), textarea, select { inline-size: 100%; min-block-size: 2.75rem; border: 1px solid #697d8f; border-radius: .35rem; padding: .5rem .65rem; background: #101b25; color: var(--text); }
+    textarea { resize: vertical; min-block-size: 5.5rem; }
+    textarea.compact { min-block-size: 3.5rem; }
+    .times { display: grid; grid-template-columns: 1fr 1fr; gap: .7rem; }
+    .check { display: flex; align-items: center; gap: .55rem; min-block-size: 2.75rem; }
+    .check input { accent-color: var(--accent); inline-size: 1.1rem; block-size: 1.1rem; }
+    .check label { margin: 0; }
+    .editor-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+    #formDirty { min-block-size: 1.5rem; color: #ffdb9c; }
+    #formError { color: var(--danger); white-space: pre-wrap; }
+    [aria-invalid="true"] { border-color: var(--danger) !important; }
+    .list-panel { margin-block-start: 1rem; }
+    .segment-list { list-style: none; margin: 0; padding: .7rem; display: grid; gap: .5rem; max-block-size: 32rem; overflow: auto; }
+    .segment-item { inline-size: 100%; text-align: start; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .2rem .7rem; padding: .7rem; }
+    .segment-item[aria-pressed="true"] { border-color: #b0e9d9; background: #254139; }
+    .segment-title, .segment-detail { overflow-wrap: anywhere; min-inline-size: 0; white-space: pre-wrap; }
+    .segment-detail { color: var(--muted); font-size: .8rem; grid-column: 1 / -1; white-space: pre-wrap; }
+    .badge { font-size: .75rem; padding: .15rem .45rem; border: 1px solid #5b7486; border-radius: .3rem; white-space: nowrap; align-self: start; }
+    .export-panel { padding: 1rem; margin-block-start: 1rem; }
+    .draft { padding: .8rem 1rem; border-block-start: 1px solid var(--line); }
+    .draft .toolbar { margin-block-start: .5rem; }
+    details { margin-block-start: .7rem; }
+    summary { cursor: pointer; min-block-size: 2.75rem; padding-block: .5rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .75rem; max-block-size: 15rem; overflow: auto; }
+    footer { border-block-start: 1px solid var(--line); padding: .8rem 1.5rem 1.3rem; }
+    #status { margin: 0; padding: .8rem 1.5rem; border-block-end: 1px solid var(--line); min-block-size: 3.2rem; background: #1a2d35; overflow-wrap: anywhere; }
+    #status.error { color: #ffe0dc; background: #432e34; }
+    kbd { font: .8em ui-monospace, monospace; background: #243542; border: 1px solid #5a6d7d; border-radius: .2rem; padding: .1rem .3rem; }
+    @media (max-width: 64rem) { .workspace { grid-template-columns: minmax(0, 1fr); } video { max-block-size: 60vh; } }
+    @media (max-width: 40rem) { header, .workspace, footer, #status { padding-inline: .8rem; } .times { grid-template-columns: 1fr; } .segment-item { grid-template-columns: minmax(0, 1fr); } }
+    @media (pointer: coarse) { button, .file-label, input, select { min-block-size: 3rem; } .clip { min-block-size: 0; } .lane { min-block-size: 3rem; } }
+    @media (forced-colors: active) { .clip[aria-pressed="true"], .segment-item[aria-pressed="true"] { outline: 2px solid Highlight; } }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">跳到标注工作区</a>
+  <header>
+    <div><p class="eyebrow">TRACEANNOTATE / LOCAL WORKSPACE</p><h1>通用视频片段标注</h1><p class="hint">自由标签 · 重叠片段 · 多轨道 · 人工复核</p></div>
+    <div class="toolbar">
+      <input class="file-input" type="file" id="videoInput" name="video" accept="video/*"><label class="file-label" for="videoInput">打开本地视频</label>
+      <input class="file-input" type="file" id="jsonInput" name="annotation" accept=".json,application/json" disabled><label class="file-label" for="jsonInput">导入 JSON</label>
+      <button type="button" id="exportJSON" disabled class="primary">导出 JSON 主文件</button>
+      <button type="button" id="newProject" disabled>清空标注</button>
+    </div>
+  </header>
+  <p id="status" role="status" aria-live="polite" aria-atomic="true">请打开本地视频。视频与标注均在浏览器本地处理，不发送到服务器。</p>
+  <main id="main" class="workspace" tabindex="-1">
+    <div>
+      <section class="panel">
+        <div class="panel-head"><h2>视频预览</h2><span class="small" id="projectState">尚未加载</span></div>
+        <div class="video-wrap"><video id="videoPlayer" controls preload="metadata" playsinline aria-label="本地视频预览" aria-describedby="mediaHelp"></video></div>
+        <p id="mediaHelp" class="video-note">手动标注视频时间片段。浏览器不能直接播放时，可用 video-open 兼容入口准备并打开副本，保留原片与逐帧时间映射。直接加载只检查时长与首帧；兼容入口另作全片解码与时间核验。目标框、跟踪和自动识别尚未实现。</p>
+        <p id="fileInfo" class="video-note">尚未选择视频</p>
+        <p id="mediaIdentity" class="video-note">媒体内容身份尚未校验。</p>
+        <div id="mediaLoad" class="media-load" hidden><label for="hashProgress">新视频完整内容校验</label><progress id="hashProgress" max="1" value="0"></progress><p id="hashStatus" class="hint">等待读取</p><button id="cancelMediaLoad" type="button">取消加载新视频</button></div>
+        <div class="player-tools">
+          <div class="toolbar"><button id="backward" type="button" data-media disabled>−0.1 秒</button><button id="togglePlay" type="button" data-media disabled>播放 / 暂停</button><button id="forward" type="button" data-media disabled>+0.1 秒</button></div>
+          <output class="time" id="timeDisplay" for="seek">00:00:00.000 / 00:00:00.000</output>
+        </div>
+        <p id="frameInfo" class="video-note">当前为秒级时间定位，尚未取得呈现帧时间戳。</p>
+        <div class="draft"><p class="hint" id="draftStatus">浏览器草稿是辅助恢复机制。请定期导出 JSON 主文件。</p><div class="toolbar"><button id="restoreDraft" type="button" hidden>恢复此视频的草稿</button><button id="ignoreDraft" type="button" hidden>用当前标注替换旧草稿</button></div></div>
+      </section>
+      <section class="panel timeline-section">
+        <div class="seek-label"><h2>多轨时间线</h2><span class="small" id="segmentCount">0 个片段</span></div>
+        <label for="seek" class="hint">播放位置（秒）</label><input id="seek" name="seek" type="range" min="0" max="1" step="0.001" value="0" disabled>
+        <p class="hint">同一轨道的重叠片段分行显示。空白时段保持空白；不会自动生成 Idle。</p>
+        <div id="timelineTracks" class="timeline-tracks"><p class="empty">加载视频后，设置起止时间并保存第一个片段。</p></div>
+      </section>
+      <section class="panel list-panel">
+        <div class="panel-head"><h2>片段清单</h2><div class="toolbar"><button id="undo" type="button" disabled>撤销</button><button id="redo" type="button" disabled>重做</button></div></div>
+        <ol id="segmentList" class="segment-list" aria-label="按起始时间排序的片段"></ol>
+      </section>
+    </div>
+    <aside>
+      <section class="panel editor">
+        <form id="segmentForm" novalidate autocomplete="off">
+          <fieldset id="editorFields" disabled>
+            <legend id="editorTitle">新建片段</legend>
+            <p class="hint" id="segmentId">保存时生成唯一 ID</p>
+            <div class="toolbar"><button type="button" id="markStart">[ 记起点</button><button type="button" id="markEnd">记终点 ]</button><button type="button" id="newSegment">新建片段</button></div>
+            <div class="times" style="margin-block-start:.8rem">
+              <div class="field"><label for="startInput">起点（秒，必填）</label><input id="startInput" name="start" type="number" step="any" min="0" required inputmode="decimal" aria-describedby="timeHelp formError"></div>
+              <div class="field"><label for="endInput">终点（秒，必填）</label><input id="endInput" name="end" type="number" step="any" min="0" required inputmode="decimal" aria-describedby="timeHelp formError"></div>
+            </div>
+            <p class="hint" id="timeHelp">0 ≤ 起点 &lt; 终点 ≤ 视频时长。内部保留原始秒数，不按帧率假设取整。</p>
+            <div class="field"><label for="labelInput">片段类别 / 标签（必填，可自由填写）</label><textarea id="labelInput" name="label" rows="2" class="compact" required aria-describedby="formError" placeholder="例如：采访、人物入场、产品演示"></textarea></div>
+            <div class="field"><label for="textInput">文字描述 / 字幕（可空）</label><textarea id="textInput" name="text" rows="3" aria-describedby="formError"></textarea></div>
+            <div class="field"><label for="trackInput">轨道名称（必填）</label><textarea id="trackInput" name="track" rows="2" class="compact" required aria-describedby="formError">主轨</textarea><label for="trackNames" class="hint">或选择已有轨道</label><select id="trackNames"><option value="">请选择轨道</option></select></div>
+            <div class="field"><label for="tagsInput">标签集合（JSON 数组，可空数组）</label><p class="hint" id="tagsHelp">例如：["人物", "室内"]。每项必须是非空字符串。</p><textarea id="tagsInput" name="tags" rows="2" spellcheck="false" aria-describedby="tagsHelp formError">[]</textarea></div>
+            <div class="check"><input id="reviewInput" name="reviewed" type="checkbox" aria-describedby="reviewHelp"><label for="reviewInput">此片段已由我人工复核</label></div>
+            <p class="hint" id="reviewHelp">修改时间、标签、描述或轨道后，需重新复核并勾选。</p>
+            <p id="formDirty" class="hint">表单尚未修改</p><p id="formError" role="alert" aria-atomic="true"></p>
+            <div class="editor-actions"><button id="saveSegment" type="submit" class="primary">保存片段</button><button id="discardForm" type="button">放弃表单修改</button><button id="deleteSegment" type="button" class="danger" disabled>删除片段</button></div>
+          </fieldset>
+        </form>
+      </section>
+      <section class="panel export-panel">
+        <h2>交换格式</h2><p class="hint">JSON 是无损主文件，保留 ID、复核状态与 metadata。CSV / 字幕仅用于交换，会丢失部分项目结构。</p>
+        <div class="toolbar" style="margin-block:.7rem"><button id="exportCSV" type="button" disabled>导出 CSV</button></div>
+        <label for="subtitleTrack">字幕导出轨道（必须显式选择）</label><select id="subtitleTrack" name="subtitle_track" disabled><option value="">请选择轨道</option></select>
+        <div class="toolbar" style="margin-block-start:.7rem"><button id="exportSRT" type="button" disabled>导出 SRT</button><button id="exportVTT" type="button" disabled>导出 WebVTT</button></div>
+        <p class="hint">字幕优先使用文字描述，描述为空时使用片段标签。时间按十进制四舍五入到毫秒，与命令行一致；亚毫秒区间、空白行和箭头分隔符会明确报错。SRT 另拒绝样式 / 转义标记；WebVTT 将文字转义。字幕不保留标签集合、ID 或复核状态。</p>
+        <p class="hint">CSV 默认在可能被电子表格识别为公式的文本前添加单引号。需要原文时使用 JSON。</p>
+        <details><summary>项目扩展信息（只读保留）</summary><pre id="metadataPreview">未提供 metadata</pre></details>
+      </section>
+    </aside>
+  </main>
+  <footer><p class="hint">快捷键：<kbd>[</kbd> 起点 · <kbd>]</kbd> 终点 · <kbd>Space</kbd> 播放 · <kbd>←</kbd> / <kbd>→</kbd> 移动 0.1 秒 · <kbd>Ctrl / ⌘ Z</kbd> 撤销。输入、原生视频控件与中文输入法不会被这些快捷键接管。</p><p class="hint">片段需点击“保存片段”才进入主文件。新文档绑定完整媒体 SHA-256；旧 v1 文档需确认迁移并重新复核。此页单个 JSON 导入上限 20 MiB；字幕导入请使用命令行工具。</p></footer>
+  <script src="media-hash.js"></script>
+  <script>
+    'use strict';
+    const $ = id => document.getElementById(id);
+    const video = $('videoPlayer');
+    const TOP_KEYS = new Set(['kind', 'schema_version', 'clip', 'duration', 'media_size', 'media_sha256', 'segments', 'metadata']);
+    const SEGMENT_KEYS = new Set(['id', 'start', 'end', 'label', 'text', 'tags', 'track', 'review_status']);
+    const MAX_JSON_BYTES = 20 * 1024 * 1024;
+    const FORM_IDS = ['startInput', 'endInput', 'labelInput', 'textInput', 'trackInput', 'tagsInput', 'reviewInput'];
+    let annotation = null;
+    let media = null;
+    let videoReady = false;
+    let selectedId = null;
+    let formBaseline = '';
+    let reviewAcknowledgedFor = null;
+    let formDirty = false;
+    let lastExported = '';
+    let revision = 0;
+    let loadToken = 0;
+    let importToken = 0;
+    let pendingProbe = null;
+    let pendingLoad = null;
+    let undoStack = [];
+    let redoStack = [];
+    let draftTimer = null;
+    let pendingDraft = false;
+    let pendingDraftKey = null;
+    let frameCallback = null;
+    let frameEpoch = 0;
+    let frameObservation = null;
+
+    function isObject(value) {
+      return value !== null && typeof value === 'object' && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+    }
+    // Match Python str.strip() whitespace for shared schema and export rules.
+    function stripLeadingWhitespace(value) { return value.replace(/^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/, ''); }
+    function nonblank(value) { return typeof value === 'string' && stripLeadingWhitespace(value).length > 0; }
+    function isTime(value) { return typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER; }
+    function hasUnpairedSurrogate(value) {
+      for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index);
+        if (code >= 0xD800 && code <= 0xDBFF) {
+          const next = value.charCodeAt(++index);
+          if (!(next >= 0xDC00 && next <= 0xDFFF)) return true;
+        } else if (code >= 0xDC00 && code <= 0xDFFF) return true;
+      }
+      return false;
+    }
+    function clone(value) { return JSON.parse(JSON.stringify(value)); }
+    function sameProjectValue(left, right) {
+      if (left === right) return true;
+      if (Array.isArray(left) || Array.isArray(right)) return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((item, index) => sameProjectValue(item, right[index]));
+      if (!isObject(left) || !isObject(right)) return false;
+      const keys = Object.keys(left);
+      return keys.length === Object.keys(right).length && keys.every(key => Object.hasOwn(right, key) && sameProjectValue(left[key], right[key]));
+    }
+    function validateJSONValue(value, path, errors, seen = new Set(), depth = 0) {
+      if (depth > 128) { errors.push(path + '：嵌套超过 128 层。'); return; }
+      if (typeof value === 'string') { if (hasUnpairedSurrogate(value)) errors.push(path + '：不能包含孤立 UTF-16 代理字符。'); return; }
+      if (value === null || typeof value === 'boolean') return;
+      if (typeof value === 'number') { if (!isTime(value)) errors.push(path + '：数字必须有限且绝对值不超过 9007199254740991。'); return; }
+      if (!Array.isArray(value) && !isObject(value)) { errors.push(path + '：必须是 JSON 值。'); return; }
+      if (seen.has(value)) { errors.push(path + '：不能循环引用。'); return; }
+      seen.add(value);
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) validateJSONValue(value[i], path + '[' + i + ']', errors, seen, depth + 1);
+      } else {
+        for (const [key, child] of Object.entries(value)) {
+          if (hasUnpairedSurrogate(key)) errors.push(path + '：字段名不能包含孤立 UTF-16 代理字符。');
+          validateJSONValue(child, path + '.' + key, errors, seen, depth + 1);
+        }
+      }
+      seen.delete(value);
+    }
+    function validateDocument(doc) {
+      const errors = [];
+      if (!isObject(doc)) return ['主文件必须是 JSON 对象。'];
+      validateJSONValue(doc, '主文件', errors);
+      for (const key of Object.keys(doc)) if (!TOP_KEYS.has(key)) errors.push('主文件包含未知字段：' + key);
+      if (doc.kind !== 'temporal') errors.push('kind 必须为 temporal。');
+      if (![1, 2].includes(doc.schema_version)) errors.push('schema_version 必须为整数 1 或 2。');
+      if (!nonblank(doc.clip) || /[\\/\x00-\x1f:]/.test(doc.clip) || doc.clip === '.' || doc.clip === '..') errors.push('clip 必须是非空文件名，不能包含路径、冒号或控制字符。');
+      if (!isTime(doc.duration) || doc.duration <= 0) errors.push('duration 必须是有限正数。');
+      if (Object.hasOwn(doc, 'media_size') && (!Number.isSafeInteger(doc.media_size) || doc.media_size < 0)) errors.push('media_size 必须是 0 到 9007199254740991 的整数。');
+      if (doc.schema_version === 1 && Object.hasOwn(doc, 'media_sha256')) errors.push('v1 不支持 media_sha256，请显式迁移到 v2。');
+      if (doc.schema_version === 2 && (!Object.hasOwn(doc, 'media_size') || typeof doc.media_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(doc.media_sha256))) errors.push('v2 必须包含 media_size 和 64 位小写十六进制 media_sha256。');
+      if (Object.hasOwn(doc, 'metadata')) {
+        if (!isObject(doc.metadata)) errors.push('metadata 必须是 JSON 对象。');
+      }
+      if (!Array.isArray(doc.segments)) { errors.push('segments 必须是数组。'); return errors; }
+      const ids = new Set();
+      doc.segments.forEach((segment, index) => {
+        const prefix = '片段 ' + (index + 1) + '：';
+        if (!isObject(segment)) { errors.push(prefix + '必须是对象。'); return; }
+        for (const key of Object.keys(segment)) if (!SEGMENT_KEYS.has(key)) errors.push(prefix + '未知字段 ' + key);
+        if (!nonblank(segment.id)) errors.push(prefix + 'id 必须是非空字符串。');
+        else if (ids.has(segment.id)) errors.push(prefix + 'id 重复：' + segment.id);
+        else ids.add(segment.id);
+        if (!isTime(segment.start) || !isTime(segment.end) || segment.start < 0 || segment.start >= segment.end || (isTime(doc.duration) && segment.end > doc.duration)) errors.push(prefix + '须满足 0 ≤ start < end ≤ duration，且时间必须是实际数字。');
+        if (!nonblank(segment.label)) errors.push(prefix + 'label 必须是非空字符串。');
+        if (typeof segment.text !== 'string') errors.push(prefix + 'text 必须是字符串（可空）。');
+        if (!Array.isArray(segment.tags) || segment.tags.some(tag => !nonblank(tag))) errors.push(prefix + 'tags 必须是非空字符串组成的数组（可空数组）。');
+        if (!nonblank(segment.track)) errors.push(prefix + 'track 必须是非空字符串。');
+        if (!['unreviewed', 'reviewed'].includes(segment.review_status)) errors.push(prefix + 'review_status 必须为 unreviewed 或 reviewed。');
+      });
+      return errors;
+    }
+    // Scan JSON structure before parsing so duplicate object keys cannot disappear silently.
+    function parseStrictJSON(source) {
+      if (typeof source !== 'string') throw new Error('JSON 输入必须是文本。');
+      let i = 0;
+      const ws = () => { while (/[\x20\t\r\n]/.test(source[i] || '\0')) i++; };
+      const fail = message => { throw new Error(message + '（字符位置 ' + (i + 1) + '）'); };
+      function string() {
+        const start = i++;
+        while (i < source.length) {
+          if (source[i] === '\\') { i += 2; continue; }
+          if (source[i++] === '"') return JSON.parse(source.slice(start, i));
+        }
+        fail('字符串未结束');
+      }
+      function value(depth, rootKey = null) {
+        if (depth > 128) fail('JSON 嵌套超过 128 层');
+        ws();
+        if (source[i] === '{') {
+          i++; ws(); const keys = new Set();
+          if (source[i] === '}') { i++; return; }
+          while (i < source.length) {
+            if (source[i] !== '"') fail('对象字段名必须是字符串');
+            const key = string();
+            if (keys.has(key)) fail('JSON 字段重复：' + key);
+            keys.add(key); ws();
+            if (source[i++] !== ':') fail('对象字段缺少冒号');
+            value(depth + 1, depth === 0 ? key : null); ws();
+            if (source[i] === '}') { i++; return; }
+            if (source[i++] !== ',') fail('对象字段之间缺少逗号');
+            ws();
+          }
+          fail('对象未结束');
+        } else if (source[i] === '[') {
+          i++; ws();
+          if (source[i] === ']') { i++; return; }
+          while (i < source.length) {
+            value(depth + 1); ws();
+            if (source[i] === ']') { i++; return; }
+            if (source[i++] !== ',') fail('数组元素之间缺少逗号');
+          }
+          fail('数组未结束');
+        } else if (source[i] === '"') { string(); }
+        else {
+          const token = source.slice(i).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/);
+          if (!token) fail('JSON 值无效');
+          if (['schema_version', 'media_size'].includes(rootKey) && !/^-?\d+$/.test(token[0])) fail(rootKey + ' 必须使用整数 JSON 词法，不能是小数或指数形式');
+          if (/^-?\d/.test(token[0]) && !numberWithinSafeRange(token[0])) fail('数字超出浏览器的安全范围，请将大整数标识符存为字符串或使用命令行处理');
+          i += token[0].length;
+        }
+      }
+      // A UTF-8 BOM is a transport marker, rather than a document field.
+      if (source[0] === '\uFEFF') i++;
+      value(0); ws();
+      if (i !== source.length) fail('JSON 后存在多余内容');
+      return JSON.parse(source.replace(/^\uFEFF/, ''));
+    }
+    function numberWithinSafeRange(token) {
+      const [mantissa, exponentText = '0'] = token.replace(/^-/, '').split(/[eE]/);
+      const [whole, fraction = ''] = mantissa.split('.');
+      const digits = (whole + fraction).replace(/^0+/, '') || '0';
+      if (digits === '0') return true;
+      const integerLength = digits.length - fraction.length + Number(exponentText);
+      if (integerLength < 16) return true;
+      if (integerLength > 16) return false;
+      const integerPart = digits.slice(0, 16).padEnd(16, '0');
+      return integerPart < '9007199254740991' || (integerPart === '9007199254740991' && !/[1-9]/.test(digits.slice(16)));
+    }
+    window.validateDocument = validateDocument;
+    window.parseStrictJSON = parseStrictJSON;
+
+    function setStatus(message, error = false) { $('status').textContent = message; $('status').classList.toggle('error', error); }
+    function fingerprint() { return annotation ? JSON.stringify(annotation) : ''; }
+    function hasProjectData() { return !!annotation && (annotation.segments.length > 0 || Object.hasOwn(annotation, 'metadata') || formDirty); }
+    function isUnsaved() { return formDirty || (!!annotation && fingerprint() !== lastExported); }
+    function requireMedia() {
+      if (videoReady && annotation && media) return true;
+      setStatus('请先打开视频并等待有效时长加载完成。现有标注不会因视频解码失败而被删除。', true); return false;
+    }
+    function confirmForm() { return !formDirty || window.confirm('表单修改尚未保存到片段。放弃这些表单修改并继续？'); }
+    function confirmReplace(action) { return !hasProjectData() || window.confirm(action + '会替换当前标注与未保存表单。请先导出 JSON；确认继续？'); }
+    function blankDocument(file, duration, sha256 = file.sha256) {
+      const doc = { kind: 'temporal', schema_version: 2, clip: file.name, duration, media_size: file.size, media_sha256: sha256, segments: [] };
+      if (file.preparedMetadata) doc.metadata = { prepared_media: clone(file.preparedMetadata) };
+      return doc;
+    }
+    function updateControls() {
+      document.querySelectorAll('[data-media]').forEach(control => { control.disabled = !videoReady; });
+      $('editorFields').disabled = !videoReady;
+      $('seek').disabled = !videoReady;
+      $('jsonInput').disabled = !videoReady;
+      $('exportJSON').disabled = !annotation;
+      $('newProject').disabled = !videoReady;
+      $('exportCSV').disabled = !annotation;
+      $('subtitleTrack').disabled = !annotation;
+      $('exportSRT').disabled = !annotation;
+      $('exportVTT').disabled = !annotation;
+      $('deleteSegment').disabled = !videoReady || selectedId === null;
+      $('undo').disabled = !videoReady || undoStack.length === 0;
+      $('redo').disabled = !videoReady || redoStack.length === 0;
+      $('projectState').textContent = !annotation ? '尚未加载' : isUnsaved() ? '有尚未导出的修改' : '当前内容已请求 JSON 下载或尚为空白';
+    }
+    function formatTime(seconds) {
+      if (!isTime(seconds) || seconds < 0) return '--:--:--.---';
+      const ms = Math.round(seconds * 1000);
+      return String(Math.floor(ms / 3600000)).padStart(2, '0') + ':' + String(Math.floor(ms / 60000) % 60).padStart(2, '0') + ':' + String(Math.floor(ms / 1000) % 60).padStart(2, '0') + '.' + String(ms % 1000).padStart(3, '0');
+    }
+    function updateTime() {
+      const current = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+      $('timeDisplay').textContent = formatTime(current) + ' / ' + formatTime(annotation?.duration || 0);
+      $('seek').value = String(current);
+      $('seek').setAttribute('aria-valuetext', formatTime(current));
+      if (annotation) document.querySelectorAll('.track-cursor').forEach(cursor => { cursor.style.left = Math.min(100, Math.max(0, current / annotation.duration * 100)) + '%'; });
+    }
+    function stopFrameObservation() {
+      if (frameCallback !== null && typeof video.cancelVideoFrameCallback === 'function') video.cancelVideoFrameCallback(frameCallback);
+      frameCallback = null;
+      frameEpoch++; frameObservation = null;
+      $('frameInfo').textContent = '当前为秒级时间定位，尚未取得呈现帧时间戳。';
+    }
+    function renderFrameObservation() {
+      if (video.seeking) return;
+      if (!frameObservation || frameObservation.epoch !== frameEpoch) {
+        $('frameInfo').textContent = '秒级定位已完成，等待本次呈现帧回调；尚不能确认帧时间戳。'; return;
+      }
+      $('frameInfo').textContent = '播放位置 ' + video.currentTime.toFixed(6) + ' 秒 · 最近呈现帧 PTS ' + frameObservation.mediaTime.toFixed(6) + ' 秒。此反馈不保证逐帧定位，记起止点仍使用秒级位置。';
+    }
+    function observeFrames() {
+      stopFrameObservation();
+      if (typeof video.requestVideoFrameCallback !== 'function') { $('frameInfo').textContent = '浏览器未提供呈现帧时间戳；继续使用秒级定位。'; return; }
+      const source = media?.url;
+      function presented(now, info) {
+        frameCallback = null;
+        if (media?.url !== source) return;
+        // A decoder may present its final frame before firing seeked. Keep the
+        // observed PTS for this seek instead of waiting for another callback.
+        frameObservation = { epoch: frameEpoch, mediaTime: info.mediaTime };
+        renderFrameObservation();
+        frameCallback = video.requestVideoFrameCallback(presented);
+      }
+      frameCallback = video.requestVideoFrameCallback(presented);
+    }
+    function formValues() {
+      return Object.fromEntries(FORM_IDS.map(id => [id, id === 'reviewInput' ? $(id).checked : $(id).value]));
+    }
+    function contentFingerprint(values = formValues()) {
+      return JSON.stringify(FORM_IDS.filter(id => id !== 'reviewInput').map(id => values[id]));
+    }
+    function contentChanged() {
+      if (reviewAcknowledgedFor !== contentFingerprint()) {
+        const wasReviewed = $('reviewInput').checked;
+        $('reviewInput').checked = false; reviewAcknowledgedFor = null;
+        if (wasReviewed) $('reviewHelp').textContent = '内容已改变，旧复核已失效。请核对当前内容后重新勾选。';
+      }
+      revision++; clearErrors(); updateFormDirty(); scheduleDraft();
+    }
+    function clearErrors() {
+      $('formError').textContent = '';
+      FORM_IDS.forEach(id => $(id).removeAttribute('aria-invalid'));
+    }
+    function updateFormDirty() {
+      formDirty = JSON.stringify(formValues()) !== formBaseline;
+      $('formDirty').textContent = formDirty ? '表单有未保存修改，请点击“保存片段”。' : '表单尚未修改';
+      updateControls();
+    }
+    function loadEditor() {
+      clearErrors();
+      const segment = annotation?.segments.find(item => item.id === selectedId);
+      if (!segment) selectedId = null;
+      $('editorTitle').textContent = segment ? '编辑片段' : '新建片段';
+      $('segmentId').textContent = segment ? 'ID：' + segment.id : '保存时生成唯一 ID';
+      const duration = annotation?.duration || 0;
+      const current = videoReady ? Math.min(duration, Math.max(0, video.currentTime || 0)) : 0;
+      const start = segment?.start ?? Math.min(current, Math.max(0, duration - 1));
+      $('startInput').value = String(start);
+      $('endInput').value = String(segment?.end ?? Math.min(duration, start + 1));
+      $('labelInput').value = segment?.label ?? '';
+      $('textInput').value = segment?.text ?? '';
+      $('trackInput').value = segment?.track ?? '主轨';
+      $('tagsInput').value = JSON.stringify(segment?.tags ?? []);
+      $('reviewInput').checked = segment?.review_status === 'reviewed';
+      formBaseline = JSON.stringify(formValues());
+      reviewAcknowledgedFor = $('reviewInput').checked ? contentFingerprint() : null;
+      $('reviewHelp').textContent = '修改时间、标签、描述或轨道后，需重新复核并勾选。';
+      $('trackNames').value = '';
+      updateFormDirty();
+    }
+    function pushHistory() {
+      undoStack.push({ document: clone(annotation), selectedId });
+      if (undoStack.length > 100) undoStack.shift();
+      redoStack = [];
+    }
+    function modified(message) { revision++; render(); scheduleDraft(); setStatus(message); }
+    function selectSegment(id) {
+      if (!videoReady || !confirmForm()) return;
+      selectedId = id; revision++; loadEditor(); render();
+      const segment = annotation.segments.find(item => item.id === id);
+      if (segment) video.currentTime = segment.start;
+      scheduleDraft();
+    }
+    function render() {
+      const tracks = $('timelineTracks');
+      const list = $('segmentList');
+      const names = $('trackNames');
+      const subtitles = $('subtitleTrack');
+      const previousTrack = subtitles.value;
+      tracks.replaceChildren(); list.replaceChildren(); names.replaceChildren(); subtitles.replaceChildren();
+      const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '请选择轨道'; subtitles.append(placeholder);
+      names.append(placeholder.cloneNode(true));
+      const segments = annotation ? [...annotation.segments].sort((a, b) => a.start - b.start || a.end - b.end || a.id.localeCompare(b.id)) : [];
+      const reviewed = segments.filter(item => item.review_status === 'reviewed').length;
+      $('segmentCount').textContent = segments.length + ' 个片段 · 已复核 ' + reviewed;
+      const groups = new Map();
+      segments.forEach(segment => {
+        if (!groups.has(segment.track)) groups.set(segment.track, []);
+        groups.get(segment.track).push(segment);
+        const li = document.createElement('li');
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'segment-item'; button.setAttribute('aria-pressed', String(segment.id === selectedId)); button.disabled = !videoReady;
+        const title = document.createElement('span'); title.className = 'segment-title'; title.textContent = segment.label;
+        const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = segment.review_status === 'reviewed' ? '已复核' : '待复核';
+        const detail = document.createElement('span'); detail.className = 'segment-detail'; detail.textContent = segment.track + ' · ' + formatTime(segment.start) + ' → ' + formatTime(segment.end) + '\n' + (segment.text || '无描述') + '\nID：' + segment.id;
+        button.append(title, badge, detail); button.addEventListener('click', () => selectSegment(segment.id)); li.append(button); list.append(li);
+      });
+      groups.forEach((members, track) => {
+        const option = document.createElement('option'); option.value = track; option.textContent = track; subtitles.append(option);
+        const suggestion = document.createElement('option'); suggestion.value = track; suggestion.textContent = JSON.stringify(track); names.append(suggestion);
+        const section = document.createElement('div');
+        const label = document.createElement('p'); label.className = 'track-label'; label.textContent = track + ' · ' + members.length + ' 个片段'; section.append(label);
+        const lanes = [];
+        const ends = [];
+        members.forEach(segment => {
+          let laneIndex = ends.findIndex(end => end <= segment.start);
+          if (laneIndex === -1) {
+            laneIndex = ends.length;
+            const lane = document.createElement('div'); lane.className = 'lane'; section.append(lane); lanes.push(lane); ends.push(0);
+          }
+          ends[laneIndex] = segment.end;
+          const button = document.createElement('button'); button.type = 'button'; button.className = 'clip' + (segment.review_status === 'reviewed' ? ' reviewed' : '');
+          button.style.left = segment.start / annotation.duration * 100 + '%'; button.style.width = (segment.end - segment.start) / annotation.duration * 100 + '%';
+          button.textContent = segment.label; button.title = segment.label + ' · ' + formatTime(segment.start) + ' → ' + formatTime(segment.end); button.setAttribute('aria-label', track + '：' + button.title); button.setAttribute('aria-pressed', String(segment.id === selectedId)); button.disabled = !videoReady;
+          button.addEventListener('click', () => selectSegment(segment.id)); lanes[laneIndex].append(button);
+        });
+        lanes.forEach(lane => { const cursor = document.createElement('div'); cursor.className = 'track-cursor'; cursor.setAttribute('aria-hidden', 'true'); lane.append(cursor); });
+        tracks.append(section);
+      });
+      if (groups.has(previousTrack)) subtitles.value = previousTrack;
+      if (!segments.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = '尚无片段。设置起点、终点和标签后，点击“保存片段”。'; tracks.append(empty); }
+      $('metadataPreview').textContent = annotation && Object.hasOwn(annotation, 'metadata') ? JSON.stringify(annotation.metadata, null, 2) : '未提供 metadata';
+      updateControls(); updateTime();
+    }
+    function newId() {
+      let id;
+      do { id = 'seg-' + (typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)); } while (annotation.segments.some(segment => segment.id === id));
+      return id;
+    }
+    function saveSegment(event) {
+      event.preventDefault();
+      if (!requireMedia()) return;
+      clearErrors();
+      let tags;
+      try { tags = parseStrictJSON($('tagsInput').value); }
+      catch (error) { $('tagsInput').setAttribute('aria-invalid', 'true'); $('formError').textContent = '标签集合无效：' + error.message; $('tagsInput').focus(); return; }
+      const original = annotation.segments.find(item => item.id === selectedId);
+      const baseline = JSON.parse(formBaseline);
+      const values = formValues();
+      // Native strings are authoritative. Form controls may normalize line endings;
+      // only fields actually changed since selection replace the original values.
+      const preserve = (control, key, value) => original && values[control] === baseline[control] ? original[key] : value;
+      const segment = {
+        id: original?.id || newId(),
+        start: preserve('startInput', 'start', values.startInput.trim() ? Number(values.startInput) : NaN),
+        end: preserve('endInput', 'end', values.endInput.trim() ? Number(values.endInput) : NaN),
+        label: preserve('labelInput', 'label', values.labelInput), text: preserve('textInput', 'text', values.textInput),
+        tags: preserve('tagsInput', 'tags', tags), track: preserve('trackInput', 'track', values.trackInput),
+        review_status: values.reviewInput && reviewAcknowledgedFor === contentFingerprint(values) ? 'reviewed' : 'unreviewed'
+      };
+      const candidate = clone(annotation);
+      const index = candidate.segments.findIndex(item => item.id === selectedId);
+      if (index === -1) candidate.segments.push(segment); else candidate.segments[index] = segment;
+      const errors = validateDocument(candidate);
+      if (isTime(segment.end) && segment.end > media.duration) errors.push('片段终点不能超出视频实际时长。');
+      if (errors.length) {
+        $('formError').textContent = errors.join('\n');
+        const invalidId = !isTime(segment.start) || segment.start < 0 ? 'startInput' : !isTime(segment.end) || segment.start >= segment.end || segment.end > annotation.duration ? 'endInput' : !nonblank(segment.label) ? 'labelInput' : !nonblank(segment.track) ? 'trackInput' : 'tagsInput';
+        $(invalidId).setAttribute('aria-invalid', 'true'); $(invalidId).focus(); return;
+      }
+      if (JSON.stringify(candidate) === fingerprint()) { loadEditor(); render(); scheduleDraft(); setStatus('片段内容未变更，原始文字与复核状态已保留。'); return; }
+      pushHistory(); annotation = candidate; selectedId = segment.id; loadEditor(); modified(index === -1 ? '已保存新片段；复核状态以你的勾选为准。' : '已保存片段修改。');
+    }
+    function applyHistory(from, to, label) {
+      if (!requireMedia() || !from.length || !confirmForm()) return;
+      const previous = from.pop(); to.push({ document: clone(annotation), selectedId });
+      annotation = previous.document; selectedId = previous.selectedId; loadEditor(); modified(label + '完成。');
+    }
+    function mark(which) {
+      if (!requireMedia()) return;
+      $(which === 'start' ? 'startInput' : 'endInput').value = String(Math.min(annotation.duration, Math.max(0, video.currentTime)));
+      contentChanged(); setStatus('已记录' + (which === 'start' ? '起点' : '终点') + '，填写属性后点击“保存片段”。');
+    }
+    function step(delta) { if (requireMedia()) { video.pause(); video.currentTime = Math.min(annotation.duration, Math.max(0, video.currentTime + delta)); } }
+    function togglePlay() { if (requireMedia()) { if (video.paused) video.play().catch(() => setStatus('无法播放视频，请检查本地文件与浏览器解码支持。', true)); else video.pause(); } }
+    function checkMediaMatch(doc) {
+      if (!media || !annotation || !videoReady) throw new Error('请先加载视频。');
+      if (doc.schema_version === 1 && doc.clip !== media.name) throw new Error('旧文档 clip 与已加载视频文件名不一致，无法用弱信息重定位。');
+      if (doc.schema_version === 2 && doc.media_sha256 !== media.sha256) throw new Error('media_sha256 与视频完整内容不一致；即使文件名、大小和时长相同也不能接续。');
+      if (Math.abs(doc.duration - media.duration) > 0.001) throw new Error('duration 与视频实际时长相差超过 1 毫秒。');
+      if (Object.hasOwn(doc, 'media_size') && doc.media_size !== media.size) throw new Error('media_size 与已加载视频大小不一致。');
+      if (doc.segments.some(segment => segment.end > media.duration)) throw new Error('片段终点超出视频实际时长；不会自动裁剪或容忍越界。');
+      if (media.preparedMetadata && !sameProjectValue(doc.metadata?.prepared_media, media.preparedMetadata)) throw new Error('兼容项目必须保留一致的原片溯源和时间映射；不能删除或替换 prepared_media。请使用此项目导出的完整 JSON。');
+    }
+    function bindMediaDocument(doc, action) {
+      checkMediaMatch(doc);
+      const candidate = clone(doc);
+      if (doc.schema_version === 1) {
+        if (!window.confirm(action + '：这是未绑定内容哈希的旧 v1 文档。文件名、大小和时长不能证明视频内容相同。确认已人工核对当前视频后，迁移为 v2 并绑定完整 SHA-256？所有片段将变为待复核，旧源文件保留。')) return null;
+        candidate.schema_version = 2; candidate.media_size = media.size; candidate.media_sha256 = media.sha256;
+        candidate.segments.forEach(segment => { segment.review_status = 'unreviewed'; });
+      } else if (doc.clip !== media.name) {
+        if (!window.confirm(action + '：完整 SHA-256 一致，视频文件名由 ' + JSON.stringify(doc.clip) + ' 变为 ' + JSON.stringify(media.name) + '。更新文档文件名并保留标注与复核状态？')) return null;
+        candidate.clip = media.name;
+      }
+      return candidate;
+    }
+    function probeVideo(file, token, sourceURL = null) {
+      return new Promise((resolve, reject) => {
+        const candidate = document.createElement('video');
+        const url = sourceURL || URL.createObjectURL(file);
+        let finished = false;
+        const timer = setTimeout(() => finish(new Error('视频元数据或首帧解码超时。请重试或选择浏览器支持的视频。')), 30000);
+        function finish(error) {
+          if (finished) return; finished = true; clearTimeout(timer);
+          candidate.onloadedmetadata = null; candidate.onloadeddata = null; candidate.onerror = null; candidate.removeAttribute('src'); candidate.load();
+          if (pendingProbe?.token === token) pendingProbe = null;
+          if (error) { if (!sourceURL) URL.revokeObjectURL(url); reject(error); } else resolve({ url, duration: candidateDuration });
+        }
+        let candidateDuration = null;
+        pendingProbe = { token, cancel: () => finish(new Error('已取消前一个视频读取请求。')) };
+        candidate.preload = 'auto'; candidate.muted = true; candidate.playsInline = true;
+        candidate.onloadedmetadata = () => {
+          candidateDuration = candidate.duration;
+          if (!isTime(candidateDuration) || candidateDuration <= 0) finish(new Error('视频没有有限正数时长，无法进行片段标注。'));
+        };
+        // A playable audio track can make loadedmetadata succeed even when the
+        // video codec is unsupported. Require a decoded image before replacement.
+        candidate.onloadeddata = () => {
+          candidateDuration = candidate.duration;
+          if (!isTime(candidateDuration) || candidateDuration <= 0) finish(new Error('视频没有有限正数时长，无法进行片段标注。'));
+          else if (candidate.videoWidth <= 0 || candidate.videoHeight <= 0) finish(new Error('文件没有可解码的视频画面。可能是纯音频，或浏览器只支持其中的音轨；请使用兼容的视频编码。'));
+          else if (!isTime(candidate.currentTime) || Math.abs(candidate.currentTime) > .001 || (candidate.seekable.length && candidate.seekable.start(0) > .001)) finish(new Error('视频时间线未从零开始，当前编辑器无法可靠关联片段时间。请保留原片并另行准备时间线归零的兼容副本；副本需重新绑定和复核标注。'));
+          else if (candidate.readyState >= 2) finish(null);
+        };
+        candidate.onerror = () => finish(new Error('视频元数据或首帧解码失败。请检查格式、文件完整性与浏览器解码器。'));
+        candidate.src = url; candidate.load();
+      });
+    }
+    function activateMedia(file, result, document = null, source = null) {
+      clearTimeout(draftTimer); writeDraft(); video.pause();
+      const oldURL = media?.url;
+      stopFrameObservation();
+      videoReady = false;
+      media = { name: file.name, size: file.size, duration: result.duration, sha256: result.sha256, url: result.url,
+                preparedMetadata: document?.metadata?.prepared_media || null };
+      annotation = document || blankDocument(file, result.duration, result.sha256);
+      selectedId = null; undoStack = []; redoStack = []; lastExported = fingerprint(); pendingDraft = false; pendingDraftKey = null; revision++; importToken++;
+      video.onloadeddata = () => {
+        if (media?.url !== result.url || video.currentSrc !== result.url) return;
+        if (!isTime(video.duration) || video.duration <= 0 || Math.abs(video.duration - media.duration) > .001) { videoReady = false; updateControls(); setStatus('播放器时长与已读取元数据不一致，标注已暂停；现有标注仍可导出。', true); return; }
+        if (video.videoWidth <= 0 || video.videoHeight <= 0 || video.readyState < 2) { videoReady = false; updateControls(); setStatus('播放器未能解码视频画面，标注已暂停；现有标注仍可导出。', true); return; }
+        if (videoReady) return;
+        videoReady = true; $('seek').max = String(media.duration); $('startInput').max = String(media.duration); $('endInput').max = String(media.duration);
+        observeFrames(); loadEditor(); render(); findDraft();
+        setStatus(source ? '已打开兼容项目：' + source.name + '。片段使用副本时间；原片内容身份和时间映射随 JSON 保留，请导出 JSON 保存编辑。' : '已加载 ' + file.name + '。设置起止时间并填写自由标签即可开始。');
+      };
+      video.onerror = () => {
+        if (media?.url !== result.url || (video.currentSrc && video.currentSrc !== result.url)) return;
+        videoReady = false; updateControls(); setStatus('视频解码失败。当前标注已保留，可导出 JSON；请检查本机项目服务或重新加载兼容的视频。', true);
+      };
+      video.src = result.url; video.load();
+      if (oldURL?.startsWith('blob:')) URL.revokeObjectURL(oldURL);
+      $('fileInfo').textContent = (source ? '原片：' + source.name + ' → 兼容副本：' : '') + file.name + ' · ' + formatTime(media.duration) + ' · ' + file.size.toLocaleString() + ' 字节';
+      $('mediaIdentity').textContent = (source ? '本机服务已核对兼容副本完整内容 · SHA-256 ' : '已核对完整媒体内容 · SHA-256 ') + media.sha256;
+      loadEditor(); render();
+    }
+    async function loadVideo(event) {
+      const file = event.target.files?.[0]; event.target.value = '';
+      if (!file) return;
+      if (!nonblank(file.name) || /[\\/\x00-\x1f:]/.test(file.name) || hasUnpairedSurrogate(file.name) || ['.', '..'].includes(file.name)) { setStatus('视频文件名不合法。请使用不含路径、冒号、控制字符或孤立代理字符的文件名。', true); return; }
+      const token = ++loadToken; pendingLoad?.controller.abort(); pendingProbe?.cancel();
+      const job = { token, controller: new AbortController() }; pendingLoad = job;
+      $('mediaLoad').hidden = false; $('hashProgress').max = Math.max(1, file.size); $('hashProgress').value = 0;
+      $('hashStatus').textContent = '正在检查视频时长与首帧；通过检查与完整哈希校验前不会替换当前项目。';
+      setStatus('正在检查新视频时长与首帧；当前标注会保留到确认替换为止。');
+      let result;
+      let committed = false;
+      try {
+        result = await probeVideo(file, token);
+        if (token !== loadToken) return;
+        if (!window.TraceMediaHash) throw new Error('媒体哈希组件缺失，请重新安装完整软件包。');
+        $('hashStatus').textContent = '正在分块计算完整 SHA-256，可以取消；当前标注仍可编辑。';
+        result.sha256 = await TraceMediaHash.hashFile(file, { signal: job.controller.signal, onProgress: ({loaded, total}) => {
+          if (token !== loadToken) return;
+          $('hashProgress').value = loaded;
+          $('hashStatus').textContent = '完整 SHA-256：' + (total ? Math.floor(100 * loaded / total) : 100) + '% · ' + loaded.toLocaleString() + ' / ' + total.toLocaleString() + ' 字节';
+        } });
+        if (token !== loadToken) return;
+        if (!confirmReplace('切换视频')) { setStatus('已取消切换视频，当前标注保持不变。'); return; }
+        activateMedia(file, result); committed = true;
+      } catch (error) { if (token === loadToken) setStatus('加载失败：' + error.message + ' 当前标注未变更。', true); }
+      finally {
+        if (result && !committed) URL.revokeObjectURL(result.url);
+        if (pendingLoad?.token === token) { pendingLoad = null; $('mediaLoad').hidden = true; }
+      }
+    }
+    async function readProjectJSON(name, limit, signal) {
+      const response = await fetch(new URL(name, location.href), { signal, cache: 'no-store', credentials: 'same-origin', redirect: 'error' });
+      if (!response.ok) throw new Error(name + ' 读取失败（HTTP ' + response.status + '）。请检查本机项目服务。');
+      if (Number(response.headers.get('content-length')) > limit) throw new Error(name + ' 超过允许大小。');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      let total = 0, text = '';
+      try {
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          total += part.value.byteLength;
+          if (total > limit) throw new Error(name + ' 超过允许大小。');
+          text += decoder.decode(part.value, { stream: true });
+        }
+        text += decoder.decode(); return parseStrictJSON(text);
+      } finally { await reader.cancel(); }
+    }
+    async function loadPreparedProject() {
+      // Only the CLI's loopback server provides this route. The standalone
+      // file editor never fetches a project or arbitrary remote video.
+      if (location.protocol !== 'http:' || location.hostname !== '127.0.0.1' || !location.pathname.endsWith('/editor.html')) return;
+      const token = ++loadToken; pendingLoad?.controller.abort(); pendingProbe?.cancel();
+      const job = { token, controller: new AbortController() }; pendingLoad = job;
+      $('mediaLoad').hidden = false; $('hashStatus').textContent = '正在读取本机已核验的兼容项目。';
+      setStatus('正在打开兼容项目；等待副本首帧与标注文件核对。');
+      try {
+        const manifest = await readProjectJSON('project.json', 1024 * 1024, job.controller.signal);
+        if (token !== loadToken) return;
+        if (manifest.kind !== 'traceannotate.prepared-media' || manifest.version !== 1 || manifest.video?.file !== 'playback.mp4' || manifest.annotation_file !== 'annotations.json') throw new Error('兼容项目类型或文件布局不受支持。');
+        const doc = await readProjectJSON('annotations.json', MAX_JSON_BYTES, job.controller.signal);
+        if (token !== loadToken) return;
+        const errors = validateDocument(doc); if (errors.length) throw new Error(errors.join('\n'));
+        if (doc.schema_version !== 2 || doc.clip !== manifest.video.file || doc.media_size !== manifest.video.size || doc.media_sha256 !== manifest.video.sha256 || Math.abs(doc.duration - manifest.video.duration) > .001) throw new Error('兼容副本与标注内容身份不一致。');
+        if (!isObject(manifest.source) || !nonblank(manifest.source.name) || !isObject(doc.metadata?.prepared_media) || !sameProjectValue(doc.metadata.prepared_media.source, manifest.source) || !sameProjectValue(doc.metadata.prepared_media.timeline, manifest.timeline)) throw new Error('兼容项目缺少一致的原片溯源与时间映射。');
+        if (doc.metadata.prepared_media.project_file !== 'project.json' || manifest.mapping_file !== 'frame-map.jsonl' || doc.metadata.prepared_media.mapping_file !== manifest.mapping_file) throw new Error('兼容项目的原片时间映射引用不一致。');
+        const result = await probeVideo(null, token, new URL('playback.mp4', location.href).href);
+        if (token !== loadToken) return;
+        if (Math.abs(result.duration - doc.duration) > .001) throw new Error('播放器时长与兼容项目不一致。');
+        if (!confirmReplace('打开兼容项目')) { setStatus('已取消打开兼容项目。'); return; }
+        result.sha256 = doc.media_sha256;
+        activateMedia({ name: doc.clip, size: doc.media_size }, result, doc, manifest.source);
+      } catch (error) { if (token === loadToken) setStatus('兼容项目加载失败：' + error.message + '。现有标注保持不变。', true); }
+      finally { if (pendingLoad?.token === token) { pendingLoad = null; $('mediaLoad').hidden = true; } }
+    }
+    async function importJSON(event) {
+      const file = event.target.files?.[0]; event.target.value = '';
+      if (!file || !requireMedia()) return;
+      if (file.size > MAX_JSON_BYTES) { setStatus('JSON 超过此页 20 MiB 导入上限，请使用命令行处理。当前标注未变更。', true); return; }
+      const token = ++importToken; const atRevision = revision;
+      try {
+        const source = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer());
+        let candidate = parseStrictJSON(source);
+        if (token !== importToken || atRevision !== revision) throw new Error('读取文件期间项目或表单已变化，请重新选择 JSON。');
+        const errors = validateDocument(candidate);
+        if (errors.length) throw new Error(errors.join('\n'));
+        candidate = bindMediaDocument(candidate, '导入 JSON');
+        if (!candidate) { setStatus('已取消导入，当前标注保持不变。'); return; }
+        if (!confirmReplace('导入 JSON')) { setStatus('已取消导入，当前标注保持不变。'); return; }
+        pushHistory(); annotation = candidate; selectedId = null; loadEditor(); modified('已无损导入 JSON；ID、metadata 与原始秒数均已保留。');
+      } catch (error) { if (token === importToken) setStatus('导入失败：' + error.message + ' 当前标注未变更。', true); }
+    }
+    function draftKey() { return media ? 'traceannotate.temporal.v2:sha256:' + media.sha256 : null; }
+    function legacyDraftKey() { return media ? 'traceannotate.temporal.v1:' + encodeURIComponent(media.name) + ':' + media.size : null; }
+    function findDraft() {
+      $('restoreDraft').hidden = true; $('ignoreDraft').hidden = true;
+      try {
+        pendingDraftKey = localStorage.getItem(draftKey()) !== null ? draftKey() : localStorage.getItem(legacyDraftKey()) !== null ? legacyDraftKey() : null;
+        pendingDraft = pendingDraftKey !== null;
+        $('restoreDraft').hidden = !pendingDraft; $('ignoreDraft').hidden = !pendingDraft;
+        $('draftStatus').textContent = pendingDraft ? (pendingDraftKey === draftKey() ? '发现与完整 SHA-256 绑定的草稿。请恢复或明确替换；选择之前不会覆盖。' : '发现旧版按文件名和大小保存的草稿，内容身份未验证。恢复需确认迁移并重新复核，旧草稿保留。') : '浏览器草稿按完整 SHA-256 区分媒体；同内容改名后可重定位。请定期导出 JSON。';
+      } catch (error) { pendingDraft = false; $('draftStatus').textContent = '浏览器草稿不可用：' + error.message + '。请使用 JSON 保存。'; }
+    }
+    function scheduleDraft() { clearTimeout(draftTimer); draftTimer = setTimeout(writeDraft, 350); }
+    function writeDraft() {
+      if (!annotation || !media || pendingDraft) return;
+      try {
+        const envelope = { draft_format: 2, updated_at: new Date().toISOString(), document: annotation, selected_id: selectedId, editor: formValues(), editor_baseline: JSON.parse(formBaseline), review_acknowledged_for: reviewAcknowledgedFor };
+        localStorage.setItem(draftKey(), JSON.stringify(envelope));
+        $('draftStatus').textContent = '本地草稿已更新 ' + new Date().toLocaleTimeString() + '（含未保存表单，绑定完整 SHA-256）。浏览器清理或配额可能影响恢复；JSON 是主文件。';
+      } catch (error) { $('draftStatus').textContent = '本地草稿写入失败：' + error.message + '。请立即导出 JSON；表单修改请先保存片段。'; }
+    }
+    function restoreDraft() {
+      if (!requireMedia()) return;
+      try {
+        const raw = localStorage.getItem(pendingDraftKey || draftKey()); if (!raw) throw new Error('未找到草稿。');
+        const envelope = parseStrictJSON(raw);
+        if (!isObject(envelope) || ![1, 2].includes(envelope.draft_format) || !isObject(envelope.editor)) throw new Error('草稿格式不受支持。');
+        const errors = validateDocument(envelope.document); if (errors.length) throw new Error(errors.join('\n'));
+        const legacy = envelope.document.schema_version === 1;
+        if (FORM_IDS.some(id => typeof envelope.editor[id] !== (id === 'reviewInput' ? 'boolean' : 'string'))) throw new Error('草稿表单字段不完整。');
+        if (envelope.draft_format === 2 && (!isObject(envelope.editor_baseline) || FORM_IDS.some(id => typeof envelope.editor_baseline[id] !== (id === 'reviewInput' ? 'boolean' : 'string')) || (envelope.review_acknowledged_for !== null && typeof envelope.review_acknowledged_for !== 'string'))) throw new Error('草稿编辑基线或复核记录不完整。');
+        const document = bindMediaDocument(envelope.document, '恢复草稿');
+        if (!document) { setStatus('已取消草稿恢复，旧草稿与当前标注保持不变。'); return; }
+        if (!confirmReplace('恢复草稿')) return;
+        pushHistory(); annotation = document; selectedId = typeof envelope.selected_id === 'string' && annotation.segments.some(item => item.id === envelope.selected_id) ? envelope.selected_id : null;
+        loadEditor();
+        const baseline = JSON.parse(formBaseline);
+        const editor = clone(envelope.editor);
+        if (legacy) editor.reviewInput = false;
+        if (envelope.draft_format === 1) {
+          // Older single-line inputs removed CR/LF. Map unchanged old display
+          // values back to the current display without changing native strings.
+          const legacy = { ...baseline, labelInput: baseline.labelInput.replace(/[\r\n]/g, ''), trackInput: baseline.trackInput.replace(/[\r\n]/g, '') };
+          for (const id of ['labelInput', 'trackInput']) if (editor[id] === legacy[id]) editor[id] = baseline[id];
+          if (contentFingerprint(editor) !== contentFingerprint(baseline)) editor.reviewInput = false;
+        } else if (selectedId === null) formBaseline = JSON.stringify(envelope.editor_baseline);
+        FORM_IDS.forEach(id => { if (id === 'reviewInput') $(id).checked = editor[id]; else $(id).value = editor[id]; });
+        reviewAcknowledgedFor = $('reviewInput').checked && (envelope.draft_format === 1 || envelope.review_acknowledged_for === contentFingerprint()) ? contentFingerprint() : null;
+        if (reviewAcknowledgedFor === null) $('reviewInput').checked = false;
+        updateFormDirty();
+        pendingDraft = false; pendingDraftKey = null; $('restoreDraft').hidden = true; $('ignoreDraft').hidden = true; modified('已恢复本地草稿。表单中尚未保存的内容仍需点击“保存片段”。' + (legacy ? '旧文档已迁移到 v2，所有片段需重新复核。' : ''));
+      } catch (error) { setStatus('恢复失败：' + error.message + ' 当前标注与旧草稿未变更。', true); }
+    }
+    function exportableDocument(savedOnly = false) {
+      if (!annotation) throw new Error('请先打开视频。');
+      if (formDirty && !savedOnly) throw new Error('表单有未保存修改。请保存片段或放弃表单修改后再导出。');
+      const errors = validateDocument(annotation); if (errors.length) throw new Error(errors.join('\n'));
+      return annotation;
+    }
+    function download(text, suffix, mime) {
+      const url = URL.createObjectURL(new Blob([text], { type: mime }));
+      const link = document.createElement('a'); link.href = url; link.download = annotation.clip.replace(/\.[^.]+$/, '') + '.temporal.' + suffix; link.hidden = true; document.body.append(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+    function csvCell(value) {
+      let text = String(value);
+      const stripped = stripLeadingWhitespace(text);
+      if (/[\t\r\n]/.test(text.slice(0, text.length - stripped.length)) || /^[=+\-@]/.test(stripped)) text = "'" + text;
+      return '"' + text.replace(/"/g, '""') + '"';
+    }
+    function toCSV(doc) {
+      const columns = ['id', 'start', 'end', 'label', 'text', 'tags', 'track', 'review_status'];
+      return '\uFEFF' + [columns.map(csvCell).join(','), ...doc.segments.map(segment => columns.map(key => csvCell(key === 'tags' ? JSON.stringify(segment.tags) : segment[key])).join(','))].join('\r\n') + '\r\n';
+    }
+    function subtitleMilliseconds(seconds) {
+      if (!isTime(seconds) || seconds < 0) throw new Error('字幕时间必须是安全范围内的非负有限秒数。');
+      // Match Decimal(str(seconds)) half-up, including 0.5005 and large times.
+      const match = String(seconds).match(/^(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i);
+      const fraction = match[2] || '';
+      const numerator = BigInt(match[1] + fraction);
+      const power = Number(match[3] || 0) - fraction.length + 3;
+      if (power >= 0) return numerator * (10n ** BigInt(power));
+      const denominator = 10n ** BigInt(-power);
+      return numerator / denominator + (numerator % denominator * 2n >= denominator ? 1n : 0n);
+    }
+    function subtitleTimestamp(seconds, separator) {
+      const ms = subtitleMilliseconds(seconds);
+      return String(ms / 3600000n).padStart(2, '0') + ':' + String(ms / 60000n % 60n).padStart(2, '0') + ':' + String(ms / 1000n % 60n).padStart(2, '0') + separator + String(ms % 1000n).padStart(3, '0');
+    }
+    function toSubtitles(doc, track, format) {
+      if (!track) throw new Error('请显式选择一条字幕轨道。多轨道不会自动合并。');
+      const segments = doc.segments.filter(segment => segment.track === track).sort((a, b) => a.start - b.start || a.end - b.end || a.id.localeCompare(b.id));
+      if (!segments.length) throw new Error('所选轨道没有片段。');
+      const cues = segments.map((segment, index) => {
+        let text = (segment.text.length ? segment.text : segment.label).replace(/\r\n?/g, '\n');
+        if (!nonblank(text) || text.split('\n').some(line => !nonblank(line))) throw new Error('片段 ' + segment.id + ' 含空白字幕行，请编辑后重试。');
+        if (text.includes('-->') || /[\x00-\x09\x0b-\x1f\x7f]/.test(text)) throw new Error('片段 ' + segment.id + ' 含 --> 分隔符或不支持的控制字符。');
+        if (format === 'srt' && (/[<>]/.test(text) || text.includes('{\\') || /\\[Nnh]/.test(text))) throw new Error('片段 ' + segment.id + ' 含 SRT / ASS 样式或转义标记，请使用 WebVTT 或 JSON 保留字面文本。');
+        if (subtitleMilliseconds(segment.end) <= subtitleMilliseconds(segment.start)) throw new Error('片段 ' + segment.id + ' 四舍五入到毫秒后为空区间，无法导出字幕。');
+        if (format === 'vtt') text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const separator = format === 'srt' ? ',' : '.';
+        return (format === 'srt' ? (index + 1) + '\n' : '') + subtitleTimestamp(segment.start, separator) + ' --> ' + subtitleTimestamp(segment.end, separator) + '\n' + text;
+      });
+      return (format === 'vtt' ? 'WEBVTT\n\n' : '') + cues.join('\n\n') + '\n';
+    }
+    function exportFile(format) {
+      try {
+        const savedOnly = format === 'json' && formDirty && !videoReady;
+        if (savedOnly && !window.confirm('视频已无法解码，表单仍有未保存修改。是否仅备份已保存的片段？此 JSON 不含表单修改；原表单与浏览器草稿继续保留。')) return;
+        const doc = exportableDocument(savedOnly);
+        if (format === 'json') { download(JSON.stringify(doc, null, 2) + '\n', 'json', 'application/json;charset=utf-8'); lastExported = fingerprint(); updateControls(); }
+        else {
+          const track = $('subtitleTrack').value;
+          const text = format === 'csv' ? toCSV(doc) : toSubtitles(doc, track, format);
+          const selected = format === 'csv' ? doc.segments : doc.segments.filter(segment => segment.track === track);
+          const unreviewed = selected.filter(segment => segment.review_status === 'unreviewed').length;
+          const loss = format === 'csv' ? 'CSV 不包含媒体时长、文件大小和 metadata；防公式处理可能改变文本。' : '仅导出所选轨道 ' + JSON.stringify(track) + '。描述非空时使用描述，类别标签不单独保留；字幕不保留片段 ID、标签集合、复核状态或 metadata，时间取整到毫秒；重叠片段不合并。';
+          if (!window.confirm(format.toUpperCase() + ' 导出预检\n视频：' + doc.clip + '\n导出 ' + selected.length + ' 个片段，其中待复核 ' + unreviewed + ' 个。\n' + loss + '\n请另存 JSON 主文件。继续下载？')) { setStatus('已取消交换格式下载，标注保持不变。'); return; }
+          download(text, format, format === 'csv' ? 'text/csv;charset=utf-8' : format === 'srt' ? 'application/x-subrip;charset=utf-8' : 'text/vtt;charset=utf-8');
+        }
+        setStatus('已请求下载 ' + format.toUpperCase() + '。请在浏览器下载记录中确认文件；' + (savedOnly ? '此次 JSON 仅备份已保存片段，未保存表单未包含，仍留在页面和可用的草稿中。' : format === 'json' ? 'JSON 保留完整标注。' : '交换格式有损，请同时保留 JSON 主文件。'));
+      } catch (error) { setStatus('导出失败：' + error.message, true); }
+    }
+
+    $('videoInput').addEventListener('change', loadVideo);
+    $('cancelMediaLoad').addEventListener('click', () => {
+      if (!pendingLoad) return;
+      ++loadToken; pendingLoad.controller.abort(); pendingProbe?.cancel(); pendingLoad = null;
+      $('mediaLoad').hidden = true; setStatus('已取消新视频校验与加载，当前标注和未保存表单保持不变。'); $('videoInput').focus();
+    });
+    $('jsonInput').addEventListener('change', importJSON);
+    $('segmentForm').addEventListener('submit', saveSegment);
+    $('segmentForm').addEventListener('keydown', event => { if (event.isComposing && event.key === 'Enter') event.preventDefault(); });
+    FORM_IDS.forEach(id => $(id).addEventListener('input', () => {
+      if (id !== 'reviewInput') contentChanged();
+      else { reviewAcknowledgedFor = $(id).checked ? contentFingerprint() : null; revision++; clearErrors(); updateFormDirty(); scheduleDraft(); }
+    }));
+    $('trackNames').addEventListener('change', () => { if ($('trackNames').value) { $('trackInput').value = $('trackNames').value; contentChanged(); } });
+    $('newSegment').addEventListener('click', () => { if (requireMedia() && confirmForm()) { selectedId = null; revision++; loadEditor(); render(); scheduleDraft(); $('labelInput').focus(); } });
+    $('discardForm').addEventListener('click', () => { if (confirmForm()) { revision++; loadEditor(); scheduleDraft(); setStatus('已放弃表单修改，已保存片段保持不变。'); } });
+    $('deleteSegment').addEventListener('click', () => {
+      if (!requireMedia() || selectedId === null || !confirmForm() || !window.confirm('删除当前片段？删除后可以撤销。')) return;
+      pushHistory(); annotation.segments = annotation.segments.filter(segment => segment.id !== selectedId); selectedId = null; loadEditor(); modified('已删除片段，可使用撤销恢复。');
+    });
+    $('newProject').addEventListener('click', () => {
+      if (!requireMedia() || !confirmReplace('清空标注')) return;
+      pushHistory(); annotation = blankDocument(media, media.duration); selectedId = null; loadEditor(); modified(media.preparedMetadata ? '已清空片段和自定义 metadata；原片溯源与时间映射保留，可撤销恢复。' : '已清空当前视频的标注与 metadata，可撤销恢复。视频保持加载。');
+    });
+    $('undo').addEventListener('click', () => applyHistory(undoStack, redoStack, '撤销'));
+    $('redo').addEventListener('click', () => applyHistory(redoStack, undoStack, '重做'));
+    $('markStart').addEventListener('click', () => mark('start'));
+    $('markEnd').addEventListener('click', () => mark('end'));
+    $('togglePlay').addEventListener('click', togglePlay);
+    $('backward').addEventListener('click', () => step(-.1));
+    $('forward').addEventListener('click', () => step(.1));
+    $('seek').addEventListener('input', () => { if (requireMedia()) { video.currentTime = Number($('seek').value); updateTime(); } });
+    video.addEventListener('timeupdate', updateTime);
+    video.addEventListener('durationchange', () => {
+      if (!videoReady || !media || video.currentSrc !== media.url) return;
+      if (!isTime(video.duration) || Math.abs(video.duration - media.duration) > .001) {
+        video.pause(); videoReady = false; updateControls();
+        setStatus('播放期间视频时长发生变化，时间线不再可靠，已暂停标注。已保存片段和未保存表单仍保留；可备份 JSON，请先核实原片。', true);
+      }
+    });
+    video.addEventListener('seeking', () => { frameEpoch++; frameObservation = null; updateTime(); $('frameInfo').textContent = '正在定位；呈现帧时间戳待确认。记起止点使用秒级位置。'; });
+    video.addEventListener('seeked', renderFrameObservation);
+    $('restoreDraft').addEventListener('click', restoreDraft);
+    $('ignoreDraft').addEventListener('click', () => {
+      if (!requireMedia() || !window.confirm('用当前标注和表单替换此视频的旧浏览器草稿？此操作不会导出文件。')) return;
+      pendingDraft = false; pendingDraftKey = null; $('restoreDraft').hidden = true; $('ignoreDraft').hidden = true; writeDraft();
+    });
+    ['JSON', 'CSV', 'SRT', 'VTT'].forEach(format => $('export' + format).addEventListener('click', () => exportFile(format.toLowerCase())));
+    window.addEventListener('keydown', event => {
+      if (event.isComposing || event.keyCode === 229 || event.target.closest('input, textarea, select, button, a, summary, video, [contenteditable]')) return;
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'z') { event.preventDefault(); if (event.shiftKey) applyHistory(redoStack, undoStack, '重做'); else applyHistory(undoStack, redoStack, '撤销'); return; }
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.code === 'Space') { event.preventDefault(); togglePlay(); }
+      else if (event.code === 'ArrowLeft') { event.preventDefault(); step(-.1); }
+      else if (event.code === 'ArrowRight') { event.preventDefault(); step(.1); }
+      else if (event.key === '[') { event.preventDefault(); mark('start'); }
+      else if (event.key === ']') { event.preventDefault(); mark('end'); }
+    });
+    window.addEventListener('beforeunload', event => { if (isUnsaved()) { writeDraft(); event.preventDefault(); event.returnValue = ''; } });
+    window.addEventListener('pagehide', event => { clearTimeout(draftTimer); writeDraft(); if (!event.persisted) { pendingLoad?.controller.abort(); pendingProbe?.cancel(); stopFrameObservation(); if (media?.url) URL.revokeObjectURL(media.url); } });
+    loadEditor(); render(); loadPreparedProject();
+  </script>
+</body>
+</html>

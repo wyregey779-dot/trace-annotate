@@ -21,6 +21,32 @@ The next work focuses on filesystem behavior, annotation interchange and optiona
 | Optional integrations | Distinguish useful predictions from missing or failed extractors | Explicit statuses, dependency/weight instructions and failure-path tests |
 | Performance | Publish measurements that others can reproduce | Defined workload, hardware, repeated measurements and correctness checks |
 
+## General and spatial video annotation
+
+The `1.1.0.dev0` development line adds general temporal segments, custom labels/text/tags, overlapping tracks, review status, native JSON recovery and CSV/SRT/WebVTT projections. [The guide](GENERAL_VIDEO_ANNOTATION.md) defines what is retained or rejected. This is manual annotation, with no automatic recognition or transcription claim.
+
+The media-identity part of gate 1 is implemented in the development line: full streaming SHA-256, v2 media binding, explicit v1 migration, cancellation and verified rename recovery. Presented-frame PTS is visible, but a complete frame index, verified adjacent-frame navigation and VFR precision remain open. Gates 2–6 are not completed by this work.
+
+The next spatial stage needs a separate object/track schema: stable object IDs, frame/PTS time basis, rectangles and polygons, keyframes, outside/occluded state, interpolation provenance, human correction, and per-format exports. Its acceptance must include real videos, coordinate scaling, variable-frame-rate media, occlusion and re-entry, cancellation/recovery and round-trip checks against a named consumer. Temporal intervals and whole-frame rectangles must not be presented as completed object tracking.
+
+### Delivery order
+
+Each row is a separate delivery gate. The status above distinguishes the current implementation from planned work; a design entry alone is not a completed feature.
+
+| Order | Scope and prerequisite | Acceptance gate |
+| --- | --- | --- |
+| 0. Data integrity | Native JSON is authoritative; browser form values replace only changed fields; review follows current content; CLI output publishes a complete new file | Actual browser downloads retain untouched multiline/CRLF text; edits invalidate old review; undo and dirty-form recovery preserve data; interrupted writes and concurrent destinations cannot replace existing output. Run both browser checks and output fault tests. |
+| 1. Media identity and timing | After gate 0, add a versioned media manifest, streaming full-content hash and a PTS-based presented-frame index | Different content with identical filename/size/duration cannot silently resume reviewed annotations. CFR, VFR, rotation and codec fixtures retain boundaries on reopen. Adjacent-frame navigation uses actual indexed presentation timestamps, rather than nominal FPS arithmetic. |
+| 2. Projects and recovery | Use the media identity contract; design explicit schema migration before adding project records | At least 20 permitted videos across two interleaved projects survive switching, rename/relink, missing-media recovery and restart without segment/draft leakage. Old native documents remain importable; failed imports leave the current project intact. |
+| 3. Quality workflow | Build on project persistence; define labels, event boundaries, overlap rules and review revisions | Reproducible sample queues return to the exact media and interval. Injected omissions, wrong labels, boundary disagreements and stale review records are found and resolved. Report review coverage and agreement separately from measured accuracy. |
+| 4. Objects and tracks | Require verified media timing/coordinates and recovery; start with manual rectangle keyframes | Stable object IDs survive motion, occlusion, exit and re-entry. Rotation, display scaling and VFR do not change exported coordinates. Interpolated values retain provenance and can be overridden or removed. Add polygons and assisted tracking only after manual keyframes pass. |
+| 5. Interchange and assistance | Freeze one named consumer/version and task schema at a time | Actually import, edit and re-export in Label Studio/CVAT; compare retained/lost times, IDs, coordinates and states. Then evaluate one licensed model per task, recording weights/parameters/failures. Candidates require explicit human acceptance and cannot auto-promote themselves to reviewed. |
+| 6. Installation and release | Applies throughout; close before a stable release | Install the built artifact in a clean supported Windows environment and complete real-video create/save/close/reopen/export/readback. Tie version, source commit, package hashes and CI evidence together; publish codec/filesystem limitations, security handling and licenses. |
+
+For timing work, keep requested seek time, actual presented-frame PTS and saved boundary distinct. Proxy media require an explicit original-to-proxy mapping and validation. For spatial work, freeze rotation/crop transforms and coordinate conventions before implementing drawing tools; CSS display dimensions are not annotation coordinates.
+
+Performance gates need repeated short/10-minute/1-hour and 1080p/4K workloads, with 100/1,000/10,000 segments where feasible. Record hardware, codecs, peak memory, UI latency, open/save/export times, dropped frames and failures. A successful short clip does not establish long-video or bulk-task reliability. Public fixtures need redistribution permission; private footage and local paths stay outside published evidence.
+
 ## CLIP inference
 
 Status: **planned; not implemented**. Installing the `clip` extra does not enable a complete inference path.

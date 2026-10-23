@@ -1,0 +1,13 @@
+{
+  "kind": "temporal",
+  "schema_version": 1,
+  "clip": "general-demo.mp4",
+  "duration": 12.0,
+  "metadata": {"fixture": "synthetic", "description": "Illustrative event and subtitle tracks, not model predictions."},
+  "segments": [
+    {"id": "event-1", "start": 1.0, "end": 5.0, "label": "人物进入画面", "text": "人物从左侧进入。", "tags": ["室内", "人物"], "track": "事件", "review_status": "unreviewed"},
+    {"id": "event-2", "start": 3.0, "end": 7.0, "label": "镜头移动", "text": "镜头向右平移，与人物动作同时发生。", "tags": ["镜头"], "track": "事件", "review_status": "unreviewed"},
+    {"id": "subtitle-1", "start": 2.0, "end": 4.0, "label": "字幕", "text": "第一句示例字幕。", "tags": [], "track": "字幕", "review_status": "unreviewed"},
+    {"id": "subtitle-2", "start": 6.0, "end": 9.0, "label": "字幕", "text": "第二句示例字幕。\n允许连续多行文字。", "tags": [], "track": "字幕", "review_status": "unreviewed"}
+  ]
+}

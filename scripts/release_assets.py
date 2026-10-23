@@ -60,7 +60,7 @@ def validate_assets(dist: Path, expected_tag: str | None = None) -> list[Path]:
         source_files = {
             file.relative_to(root).as_posix(): file.read_bytes()
             for file in (root / "trace_annotate").rglob("*")
-            if file.is_file() and file.suffix in {".py", ".json", ".xml", ".html"}
+            if file.is_file() and file.suffix in {".py", ".json", ".xml", ".html", ".js", ".txt"}
         }
         wheel_files = {name for name in archive.namelist() if name.startswith("trace_annotate/")}
         if wheel_files != source_files.keys():
@@ -79,9 +79,15 @@ def validate_assets(dist: Path, expected_tag: str | None = None) -> list[Path]:
             member = archive.extractfile(prefix + name)
             if member is None or member.read() != content:
                 raise ValueError(f"Source distribution contains missing/stale content: {name}")
-        for name in ("LICENSE", "README.md", "README_CN.md", "CHANGELOG.md",
+        for name in ("LICENSE", "README.md", "README_CN.md", "CHANGELOG.md", "CONTRIBUTING.md",
                      "docs/QUICKSTART.md", "docs/RELEASING.md",
+                     "docs/GENERAL_VIDEO_ANNOTATION.md",
+                     "docs/MEDIA_COMPATIBILITY.md",
                      "examples/run_quickstart.py", "examples/annotations/assembly.json",
+                     "examples/annotations/general-video.json", "scripts/check_general_editor.py",
+                     "scripts/check_editor_integrity.py",
+                     "scripts/check_media_identity.py",
+                     "scripts/check_media_admission.py", "scripts/check_prepared_editor.py",
                      "scripts/check_installed_package.py", "scripts/release_assets.py"):
             member = archive.extractfile(prefix + name)
             if member is None or member.read() != (root / name).read_bytes():

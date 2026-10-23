@@ -55,3 +55,51 @@ jobs:
           python examples/demo_asset_pipeline.py
           python examples/demo_embodied_pipeline.py
           python examples/run_quickstart.py --output output/quickstart-ci
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install synthetic media and browser test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install ".[dev,browser-test]"
+          python -m playwright install --with-deps chromium
+
+      - name: Validate the general editor in isolated headless Chromium
+        run: python scripts/check_general_editor.py --output output/browser-ci
+
+      - name: Check edit integrity, review invalidation and recovery
+        run: python scripts/check_editor_integrity.py --output output/editor-integrity-ci
+
+      - name: Check full media identity, migration and cancelled loads
+        run: python scripts/check_media_identity.py --output output/media-identity-ci
+
+      - name: Reject audio-only and undecodable video without losing edits
+        run: python scripts/check_media_admission.py --output output/media-admission-ci
+
+      - name: Prepare incompatible media and verify the actual project editor
+        run: python scripts/check_prepared_editor.py --output output/prepared-editor-ci
+
+      - name: Upload browser acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: general-editor-browser-evidence
+          path: |
+            output/browser-ci
+            output/editor-integrity-ci
+            output/media-identity-ci
+            output/media-admission-ci
+            output/prepared-editor-ci
+          if-no-files-found: warn

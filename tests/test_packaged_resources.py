@@ -15,3 +15,9 @@ def test_runtime_resources_are_readable():
     assert ET.fromstring(xml).tag == "View"
     assert "<video" in ui
     assert "TraceAnnotate" in ui
+    general_ui = package.joinpath("temporal/ui/annotator.html").read_text(encoding="utf-8")
+    assert "<video" in general_ui and "TraceAnnotate" in general_ui
+    hasher = package.joinpath("temporal/ui/media-hash.js").read_text(encoding="utf-8")
+    notice = package.joinpath("temporal/ui/MEDIA_HASH_LICENSE.txt").read_text(encoding="utf-8")
+    assert "TraceMediaHash" in hasher and "media-hash.js" in general_ui
+    assert "js-sha256" in notice and "MIT" in notice

@@ -11,12 +11,17 @@ TraceAnnotate provides local Python modules, command-line tools and a browser ed
 | `heuristics` | Rules that turn available measurements and path hints into review candidates |
 | `audit` | Contact sheets, a prioritized review queue and recorded human overrides |
 | `embodied` | Annotation structure checks, idle intervals, expected-step comparison and agreement calculations |
+| `temporal` | Versioned general video segments, free labels/text/tags, overlapping tracks, review state, strict validation and subtitle/table interchange |
 | `exporters` | SRT, frame labels and a CVAT-style XML export |
 | `ui` | A packaged HTML editor for loading local video, marking intervals and downloading annotations |
 
 These modules can be used separately. The example scripts show how to compose selected operations; they are not a complete automatic labeling pipeline. External annotation formats require compatibility checks against the destination tool.
 
-A typical temporal annotation workflow is:
+The general `temporal` document is independent from embodied working/idle records. General events may overlap on the same track. `video-*` commands never infer procedure steps, correctness or idle time. Native JSON retains the whole supported document, while CSV and subtitles are explicit projections. The general editor is packaged under `temporal/ui`; it does not load or overwrite the embodied editor's records. See [general annotation](GENERAL_VIDEO_ANNOTATION.md) for the schema and format boundaries.
+
+Temporal schema v2 requires full media SHA-256 and byte size. A local Blob Worker reads one 1 MiB chunk at a time, using a pinned incremental hashing dependency bundled with its MIT license. Hashing must succeed before the current project is replaced. Native drafts are keyed by content hash; legacy v1 records migrate only after explicit confirmation and lose inherited review status. The Python binding API uses the same matching rules; it checks caller-declared duration without decoding the media. Presented-frame PTS feedback is separate from the current seconds-based seek/mark behavior.
+
+A typical embodied annotation workflow is:
 
 ```text
 Local video → browser editor → annotation JSON

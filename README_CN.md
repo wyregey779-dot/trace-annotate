@@ -7,7 +7,24 @@
 
 [English](README.md) · [中文说明](README_CN.md) · [快速上手](docs/QUICKSTART.md) · [版本发布](https://github.com/wyregey779-dot/trace-annotate/releases)
 
-TraceAnnotate 用于任务视频标注的准备与复核：在本地浏览器中划分 working 区间，计算 idle 间隔，检查步骤顺序，再将记录导出用于进一步复核。Python 库还提供媒体分批暂存、字段来源记录与资产复核辅助功能。
+TraceAnnotate 提供本地媒体复核与视频时序标注。开发版新增通用片段模式，支持自由事件标签、文字描述、标签词、多轨道与重叠事件；具身流程继续提供 working/idle、步骤检查与对错判定。Python 库还提供媒体分批暂存、字段来源记录与资产复核辅助功能。
+
+## 普通视频片段标注（开发版）
+
+新功能位于 `1.1.0.dev0`，下文已发布的 `v1.0.2` 尚不包含。请在当前源码目录安装 `python -m pip install -e ".[dev]"`，然后运行：
+
+```bash
+trace-annotate video-ui
+trace-annotate video-open input.mov -o new-annotation-project
+trace-annotate video-validate examples/annotations/general-video.json
+trace-annotate video-export examples/annotations/general-video.json --format srt --track "字幕" -o output-subtitles.srt
+```
+
+选择本地视频后，可以创建片段、修改时间和标签、按轨道组织事件，并下载 JSON 供下次继续编辑。多个事件可以同时发生，不会被自动解释为工作段或判定对错。JSON 是完整主文件；CSV、SRT 和 WebVTT 是表格或字幕投影，不能完整保留所有字段。新命令拒绝覆盖已有输出。详见[通用视频标注指南](docs/GENERAL_VIDEO_ANNOTATION.md)，包含字幕导入、草稿恢复、格式限制与后续框选/跟踪计划。
+
+新页面使用 v2 文档，把标注和草稿绑定到完整媒体 SHA-256；后台 Worker 本地分块计算，可以取消。同名、同大小、同时长但内容不同的视频会被拒绝。旧 v1 文档需确认迁移并重新复核；同内容改名后可重新关联。命令行提供 `video-hash` 与 `video-bind`。页面分别显示呈现帧时间戳和秒级播放位置，准确逐帧导航仍待实现。
+
+浏览器不能直接播放 ProRes、AVI、TS 或其他本地格式时，使用 `video-open 原片 -o 新项目目录`。它调用本机 FFmpeg/ffprobe 准备 H.264/AAC 兼容副本，逐帧核对时间对应、保留原片身份与音轨偏移，再自动打开编辑器。继续编辑使用 `video-ui --project 项目目录` 并导入上次下载的 JSON。HDR 预览需显式添加 `--tone-map-hdr`；损坏、加密或无法可靠解码的文件会明确失败。详见[跨格式兼容指南](docs/MEDIA_COMPATIBILITY.md)。
 
 ## 从一个完整示例开始
 
@@ -45,7 +62,8 @@ Verified: 2 working segments, 3 idle intervals, 5 subtitle entries.
 | 媒体准备 | 分批暂存、源/暂存目录边界检查、使用中锁定、文件大小与前 1 MiB MD5 校验 | 本地文件系统操作，有回归测试 |
 | 资产复核 | 亮度/清晰度指标、dHash 聚类、可配置规则与拼图 | 辅助复核；标签仍需人工判断 |
 | 来源记录 | 字段级 `fill` 来源、人工覆写、修订历史与回滚 | Python 库 |
-| 时序标注 | 浏览器编辑器、working/idle 补集、步骤对账、区间校验与采样一致性评估 | 命令行与 Python 库 |
+| 通用片段 | 自由标签、文字、标签词、重叠多轨、复核状态、本地编辑器与 JSON/CSV/SRT/WebVTT | 开发版；尚无目标框和跟踪编辑界面 |
+| 具身标注 | 浏览器编辑器、working/idle 补集、步骤对账、区间校验与采样一致性评估 | 独立命令与数据规则 |
 | 报告与交换 | HTML 质检、SRT、Label Studio 配置/解析、CVAT 风格 XML、动作标签文本 | 有本地格式测试；外部软件及版本兼容性仍需往返验证 |
 | 可选视觉/OCR | 运动、人脸、OCR 和场景辅助接口 | 需要相应运行时、可执行文件或本地模型 |
 | CLIP 推理 | 规划中；适配器返回 `not_run` | 尚未实现完整图像/文本推理 |

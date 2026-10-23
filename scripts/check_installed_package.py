@@ -32,6 +32,10 @@ for name in ("schema_v2.json", "default_vocab.json"):
 assert ET.fromstring(package.joinpath("templates", "label_studio_embodied_v2.1.xml").read_text(encoding="utf-8")).tag == "View"
 ui = package.joinpath("embodied", "ui", "annotator.html").read_text(encoding="utf-8")
 assert "<video" in ui and "TraceAnnotate" in ui
+general_ui = package.joinpath("temporal", "ui", "annotator.html").read_text(encoding="utf-8")
+assert "<video" in general_ui and "TraceAnnotate" in general_ui
+assert "TraceMediaHash" in package.joinpath("temporal", "ui", "media-hash.js").read_text(encoding="utf-8")
+assert "js-sha256" in package.joinpath("temporal", "ui", "MEDIA_HASH_LICENSE.txt").read_text(encoding="utf-8")
 cli = Path(sysconfig.get_path("scripts")) / ("trace-annotate.exe" if os.name == "nt" else "trace-annotate")
 assert cli.is_file(), f"Console entry point is missing from the active Python environment: {cli}"
 cli_env = os.environ.copy()
@@ -39,11 +43,35 @@ cli_env.pop("PYTHONPATH", None)
 cli_env.pop("PYTHONHOME", None)
 result = subprocess.run([cli, "--help"], check=True, capture_output=True, text=True, env=cli_env)
 assert "embodied-ui" in result.stdout
+assert "video-ui" in result.stdout and "video-import" in result.stdout
+assert "video-hash" in result.stdout and "video-bind" in result.stdout
+assert "video-prepare" in result.stdout and "video-open" in result.stdout
+from trace_annotate.temporal.preparation import prepare_media
+from trace_annotate.temporal.project_server import make_project_server
+assert callable(prepare_media) and callable(make_project_server)
+editor = subprocess.run([cli, "video-ui", "--print-path"], check=True, capture_output=True,
+                        text=True, encoding="utf-8", env=cli_env)
+assert Path(editor.stdout.strip()).is_file()
+general = Path("general.json")
+general.write_text(json.dumps({"kind": "temporal", "schema_version": 1, "clip": "test.mp4",
+    "duration": 5, "segments": [{"id": "a", "start": 1, "end": 3, "label": "event",
+    "text": "A test cue", "tags": [], "track": "events", "review_status": "unreviewed"}]}), encoding="utf-8")
+subprocess.run([cli, "video-validate", str(general)], check=True, env=cli_env)
+subprocess.run([cli, "video-export", str(general), "--format", "srt", "-o", "test.srt"], check=True, env=cli_env)
+assert "A test cue" in Path("test.srt").read_text(encoding="utf-8")
+media_path = Path("test.mp4")
+media_path.write_bytes(b"synthetic bytes for installed CLI hashing; not a decodable video")
+subprocess.run([cli, "video-bind", str(general), "--media", str(media_path), "--duration", "5", "-o", "bound.json"], check=True, env=cli_env)
+bound = json.loads(Path("bound.json").read_text(encoding="utf-8"))
+assert bound["schema_version"] == 2
+assert bound["media_sha256"] == __import__("hashlib").sha256(media_path.read_bytes()).hexdigest()
+assert bound["media_size"] == media_path.stat().st_size
+subprocess.run([cli, "video-validate", "bound.json"], check=True, env=cli_env)
 xml_path = Path("label-studio.xml")
 subprocess.run([cli, "embodied-xml", "-o", str(xml_path)], check=True, env=cli_env)
 assert ET.parse(xml_path).getroot().tag == "View"
 print(f"Installed package smoke check passed: version={trace_annotate.__version__}, package={installed_path}")
-print("JSON/XML templates, HTML annotator, CLI help and XML export verified outside checkout.")
+print("Templates, both HTML editors, general segment export and embodied XML verified outside checkout.")
 '''
 
 
