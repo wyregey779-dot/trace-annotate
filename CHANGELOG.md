@@ -2,6 +2,7 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Distinguish unavailable final-frame duration metadata from ambiguous PTS mapping. Keep old-probe rejection explicit with a toolchain upgrade path; CI uses a fixed, SHA-256-verified FFmpeg build to execute the full media regressions without estimating timing.
 - Verify explicit demux-packet durations when older FFprobe versions omit the decoded final-frame duration. Require a unique packet/frame PTS mapping, record the duration source and retain rejection of ambiguous endpoints.
 - Require FFmpeg/ffprobe in every CI test environment so media regressions execute. Synchronize the browser seek-control test with completed segment selection before issuing Home/End inputs.
 - Add a dark embodied editor with task descriptions, independently declared step counts, segment labels, explicit pending verdicts, seconds-based seeking and a bottom segment list. Retain incomplete drafts and preserve current annotations when media replacement is cancelled or rejected.

@@ -82,6 +82,20 @@ def test_zero_frame_duration_can_use_its_explicit_packet_duration(tmp_path):
     assert result["duration"] == Fraction(7, 1000)
 
 
+def test_matched_packets_without_final_duration_give_actionable_error_not_a_guessed_hold(tmp_path):
+    frames = rows(tmp_path / "frames", ["pts=100", "pts=140"])
+    packets = rows(tmp_path / "packets", ["pts=140", "pts=100|duration=40"])
+    with pytest.raises(prep.MediaPreparationError, match="FINAL_FRAME_DURATION_UNAVAILABLE.*newer FFmpeg/ffprobe.*No FPS"):
+        prep._video_summary(frames, Fraction(1, 1000), None, packets=packets)
+
+
+def test_missing_packet_mapping_is_distinct_from_unavailable_duration(tmp_path):
+    frames = rows(tmp_path / "frames", ["pts=100", "pts=140"])
+    packets = rows(tmp_path / "packets", ["pts=100|duration=40", "pts=130|duration=7"])
+    with pytest.raises(prep.MediaPreparationError, match="PTS mapping is ambiguous"):
+        prep._video_summary(frames, Fraction(1, 1000), None, packets=packets)
+
+
 def test_missing_decoded_duration_reads_real_packets_without_guessing_fps(tmp_path, monkeypatch):
     frames = rows(tmp_path / "frames", ["pts=100", "pts=140"])
     packets = rows(tmp_path / "packets", ["pts=140|duration=7", "pts=100|duration=40"])

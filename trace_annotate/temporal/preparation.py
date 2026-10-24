@@ -202,8 +202,13 @@ def _video_summary(path: Path, base: Fraction,
             packet_pts.add(pts)
             if pts == previous:
                 last_duration = row.get("duration", 0)
-        if packet_pts != frame_pts or not last_duration or last_duration <= 0:
-            raise MediaPreparationError("Final video frame duration is missing or packet-to-frame PTS mapping is ambiguous")
+        if packet_pts != frame_pts:
+            raise MediaPreparationError("Packet-to-frame PTS mapping is ambiguous; the final hold cannot be verified")
+        if not last_duration or last_duration <= 0:
+            raise MediaPreparationError(
+                "FINAL_FRAME_DURATION_UNAVAILABLE: decoded frames and matching packets expose no explicit final duration. "
+                "Use a matching newer FFmpeg/ffprobe toolchain (9.0.1 is locally verified) and retry; "
+                "if it still lacks timing metadata, obtain a source with reliable timing. No FPS or container-duration estimate is used.")
         duration_basis = "explicit_demux_packet_duration_with_one_to_one_decoded_pts"
     end = (previous - first + last_duration) * base
     if end <= 0 or not math.isfinite(float(end)):
