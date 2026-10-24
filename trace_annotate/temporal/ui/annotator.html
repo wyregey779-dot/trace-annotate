@@ -465,7 +465,7 @@
       if (!videoReady || !confirmForm()) return;
       selectedId = id; revision++; loadEditor(); render();
       const segment = annotation.segments.find(item => item.id === id);
-      if (segment) video.currentTime = segment.start;
+      if (segment) { video.currentTime = segment.start; updateTime(); }
       scheduleDraft();
     }
     function render() {

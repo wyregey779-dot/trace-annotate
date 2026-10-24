@@ -53,6 +53,78 @@ def test_video_summary_fails_closed_on_ambiguous_timeline(tmp_path, values, mess
         prep._video_summary(rows(tmp_path / "frames", values), Fraction(1, 1000), None)
 
 
+def test_explicit_packet_tail_requires_matching_pts_even_when_packets_are_reordered(tmp_path):
+    frames = rows(tmp_path / "frames", ["pts=100|duration=10", "pts=110|duration=0", "pts=140"])
+    packets = rows(tmp_path / "packets", ["pts=100|duration=10", "pts=140|duration=7", "pts=110|duration=30"])
+    result = prep._video_summary(frames, Fraction(1, 1000), None, packets=packets)
+    assert result["count"] == 3 and result["last_duration"] == 7
+    assert result["duration"] == Fraction(47, 1000)
+    assert result["last_duration_basis"] == "explicit_demux_packet_duration_with_one_to_one_decoded_pts"
+
+
+@pytest.mark.parametrize("packets", [
+    ["pts=100|duration=10", "pts=110|duration=30"],
+    ["pts=100|duration=10", "pts=140|duration=0", "pts=110|duration=30"],
+    ["pts=100|duration=10", "pts=140|duration=7", "pts=140|duration=7"],
+    ["pts=100|duration=10", "pts=140|duration=7", "pts=120|duration=30"],
+    ["pts=100|duration=10", "pts=140|duration=7", "pts=110|duration=30", "pts=160|duration=9"],
+    ["pts=100|duration=10", "pts=140|duration=7", "duration=30"],
+])
+def test_missing_ambiguous_or_incomplete_packet_tail_cannot_replace_missing_frame_duration(tmp_path, packets):
+    frames = rows(tmp_path / "frames", ["pts=100|duration=10", "pts=110|duration=0", "pts=140"])
+    with pytest.raises(prep.MediaPreparationError):
+        prep._video_summary(frames, Fraction(1, 1000), None, packets=rows(tmp_path / "packets", packets))
+
+
+def test_zero_frame_duration_can_use_its_explicit_packet_duration(tmp_path):
+    frames = rows(tmp_path / "frames", ["pts=100|duration=0|pkt_duration=7"])
+    result = prep._video_summary(frames, Fraction(1, 1000), None)
+    assert result["duration"] == Fraction(7, 1000)
+
+
+def test_missing_decoded_duration_reads_real_packets_without_guessing_fps(tmp_path, monkeypatch):
+    frames = rows(tmp_path / "frames", ["pts=100", "pts=140"])
+    packets = rows(tmp_path / "packets", ["pts=140|duration=7", "pts=100|duration=40"])
+    calls = []
+    def explicit_packets(*args):
+        calls.append(args)
+        return packets
+    monkeypatch.setattr(prep, "_packets", explicit_packets)
+    result = prep._verified_video_summary("ffprobe", tmp_path / "video.mp4", 2, frames,
+                                          Fraction(1, 1000), tmp_path, "source-packets", None)
+    assert len(calls) == 1 and calls[0][2] == 2
+    assert result["last_duration"] == 7 and result["duration"] == Fraction(47, 1000)
+
+
+@pytest.mark.parametrize("tail", ["pts=140|duration=-1", "pts=140|pkt_duration=-1",
+                                   "pts=140|duration=-1|pkt_duration=7", "pts=140|duration=6|pkt_duration=7"])
+def test_invalid_frame_duration_cannot_be_hidden_by_positive_packet_metadata(tmp_path, tail):
+    frames = rows(tmp_path / "frames", ["pts=100|duration=40", tail])
+    packets = rows(tmp_path / "packets", ["pts=100|duration=40", "pts=140|duration=7"])
+    with pytest.raises(prep.MediaPreparationError, match="negative|conflict"):
+        prep._video_summary(frames, Fraction(1, 1000), None, packets=packets)
+
+
+def test_packet_tail_verification_honors_cancellation(tmp_path):
+    frames = rows(tmp_path / "frames", ["pts=100", "pts=140"])
+    packets = rows(tmp_path / "packets", ["pts=100|duration=40", "pts=140|duration=7"])
+    calls = 0
+    def cancel():
+        nonlocal calls
+        calls += 1
+        return calls > 2
+    with pytest.raises(InterruptedError, match="cancelled"):
+        prep._video_summary(frames, Fraction(1, 1000), cancel, packets=packets)
+
+
+def test_packet_tail_verification_refuses_its_resource_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(prep, "_MAX_PACKET_VERIFICATION_FRAMES", 1)
+    frames = rows(tmp_path / "frames", ["pts=100", "pts=140"])
+    packets = rows(tmp_path / "packets", ["pts=100|duration=40", "pts=140|duration=7"])
+    with pytest.raises(prep.MediaPreparationError, match="resource limit"):
+        prep._video_summary(frames, Fraction(1, 1000), None, packets=packets)
+
+
 def test_audio_allows_one_container_tick_but_rejects_real_gap(tmp_path):
     normal = rows(tmp_path / "normal", ["pts=0|nb_samples=648", "pts=14|nb_samples=960", "pts=34|nb_samples=960"])
     actual = prep._audio_summary(normal, Fraction(1, 1000), 48000, None)
@@ -197,6 +269,43 @@ def test_real_vfr_preserves_all_frame_pts_and_explicit_tail(tmp_path, real_tools
     proxy_base = Fraction(manifest["timeline"]["proxy_time_base"])
     origin = Fraction(manifest["timeline"]["origin_time_fraction"])
     assert all(abs(row["source_pts"] * source_base - origin - row["proxy_pts"] * proxy_base) <= proxy_base for row in mapping)
+
+
+def test_real_packet_tail_is_verified_when_decoder_duration_fields_are_unavailable(tmp_path, real_tools, monkeypatch):
+    """Exercise FFmpeg 6's absent-frame-duration shape using real packet data.
+
+    Only the decoded-summary view omits duration fields. Original media,
+    demuxer packets, full decoding and mapping checks remain real and unchanged.
+    """
+    original_summary = prep._video_summary
+    calls = []
+    def without_decoded_durations(path, base, cancelled, *, packets=None):
+        view = path.with_name(path.name + ".no-decoded-duration")
+        view.write_text("\n".join("|".join(part for part in line.split("|")
+                                          if part.partition("=")[0] not in {"duration", "pkt_duration"})
+                                  for line in path.read_text(encoding="utf-8").splitlines()) + "\n", encoding="utf-8")
+        result = original_summary(view, base, cancelled, packets=packets)
+        calls.append(result["last_duration_basis"])
+        return result
+    monkeypatch.setattr(prep, "_video_summary", without_decoded_durations)
+    source = generate(real_tools, tmp_path / "vfr-with-audio.mp4", "-f", "lavfi", "-i",
+                      "testsrc2=size=160x90:rate=10:duration=0.8", "-f", "lavfi", "-i",
+                      "sine=frequency=440:sample_rate=48000:duration=0.8",
+                      "-vf", "settb=1/30000,setpts=if(lt(N\\,4)\\,N/(10*TB)\\,(0.4+(N-4)/30)/TB)",
+                      "-c:v", "libx264", "-fps_mode", "passthrough", "-enc_time_base", "1/30000", "-c:a", "aac")
+    before = stream_sha256(source)
+    target = tmp_path / "project"
+    manifest = prep.prepare_media(source, target)
+    assert manifest["timeline"]["frame_count"] == 8
+    assert manifest["timeline"]["variable_frame_rate"] is True
+    assert manifest["timeline"]["audio"]["stream_count"] == 1
+    assert calls == ["explicit_demux_packet_duration_with_one_to_one_decoded_pts"] * 2
+    assert manifest["timeline"]["last_frame_duration"]["source_basis"] == calls[0]
+    assert manifest["timeline"]["last_frame_duration"]["playback_basis"] == calls[1]
+    assert manifest["source"]["sha256"] == before == stream_sha256(source)
+    log = json.loads((target / "preparation-log.json").read_text(encoding="utf-8"))
+    assert {entry["name"] for entry in log["commands"]} >= {"source-video-packets", "playback-video-packets", "playback-full-decode"}
+    assert all(entry["exit_code"] == 0 for entry in log["commands"])
 
 
 def test_real_audio_leading_video_is_preserved_on_common_zero_based_timeline(tmp_path, real_tools):

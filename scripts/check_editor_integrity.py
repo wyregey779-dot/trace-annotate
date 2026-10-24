@@ -331,10 +331,17 @@ def case_export_preflight(case):
 def case_nontext_controls(case):
     case.select()
     seek = case.page.locator("#seek")
+    # Selecting a segment requests its start time after render() has displayed
+    # the previous player position. Home on an already-zero, not-yet-updated
+    # range is a native no-op: it emits no input event, then the selection's
+    # outstanding seek completes at 1s. Wait for the actual selection operation
+    # (player AND range) before issuing a second keyboard operation.
+    wait_media_position(case, case.fixture["segments"][0]["start"],
+                        "Selected segment seek completed before keyboard navigation")
     seek.focus()
     seek.press("Home")
     case.expect(seek).to_have_value("0")
-    case.page.wait_for_function("() => document.querySelector('video').currentTime === 0 && !document.querySelector('video').seeking")
+    wait_media_position(case, 0, "Home moved the actual player and range to zero")
     case.page.locator("#markStart").click()
     case.reviewed(False, "Recording a changed start through the mark button invalidates review")
     case.save()
@@ -345,7 +352,7 @@ def case_nontext_controls(case):
     seek.focus()
     seek.press("End")
     case.expect(seek).to_have_value("12")
-    case.page.wait_for_function("() => document.querySelector('video').currentTime === 12 && !document.querySelector('video').seeking")
+    wait_media_position(case, 12, "End moved the actual player and range to the endpoint")
     case.page.locator("#markEnd").click()
     case.reviewed(False, "Recording a changed end through the mark button invalidates review")
     case.save()
@@ -360,6 +367,59 @@ def case_nontext_controls(case):
                "Existing-track selection changes only the intended track and review status")
 
 
+def wait_media_position(case, seconds, description):
+    """Wait for a completed operation, preserving exact endpoint assertions.
+
+    This does not synthesize events or set player/range values. Failure retains
+    the real playback state so a decoder failure differs from a stale control.
+    """
+    try:
+        case.page.wait_for_function("""seconds => {
+            const video=document.querySelector('video');
+            const range=document.querySelector('#seek');
+            return video.currentTime === seconds && !video.seeking &&
+                video.readyState >= 2 && Number(range.value) === seconds;
+        }""", arg=seconds)
+    except Exception:
+        case.record.setdefault("media_position_failures", []).append({
+            "description": description, "expected_seconds": seconds,
+            "actual": case.page.evaluate("""() => {
+                const video=document.querySelector('video');
+                return {currentTime:video.currentTime,seeking:video.seeking,
+                    readyState:video.readyState,range:document.querySelector('#seek').value,
+                    error:video.error?{code:video.error.code,message:video.error.message}:null};
+            }""")})
+        raise
+    case.equal(case.page.locator("video").evaluate("video=>video.currentTime"), seconds,
+               description)
+
+
+def case_selection_seek_synchronization(case):
+    # Run the genuine DOM click handler and inspect its synchronous result in
+    # the same browser task, before queued seeking/timeupdate events can hide a
+    # stale range. This is a dispatch-order regression, not a trusted-input or
+    # completed-decoding claim. No application/browser functions are replaced.
+    observed = case.page.locator("#segmentList button").first.evaluate("""button => {
+        const video=document.querySelector('video'),range=document.querySelector('#seek');
+        const before={currentTime:video.currentTime,range:Number(range.value)};
+        button.click();
+        return {before,after:{currentTime:video.currentTime,range:Number(range.value),
+            seeking:video.seeking,readyState:video.readyState}};
+    }""")
+    write_json(case.output / "synchronous-selection-observation.json", observed)
+    case.record["dispatch_scope"] = "Native DOM button.click handler in one browser task; no application function or media API replacement"
+    case.equal(observed["before"], {"currentTime": 0, "range": 0},
+               "Newly imported fixture starts with the player and range at zero")
+    expected = case.fixture["segments"][0]["start"]
+    case.equal({key: observed["after"][key] for key in ("currentTime", "range")},
+               {"currentTime": expected, "range": expected},
+               "Selection synchronizes the requested player and range positions before queued media events")
+    wait_media_position(case, expected,
+                        "The separately observed real seek completes after synchronous range feedback")
+    case.equal(case.export("after-synchronous-selection"), case.fixture,
+               "Selection feedback and completed seeking preserve exact annotations and reviewed state")
+
+
 CASES = [
     ("01-time-only", case_time_only),
     ("02-label-only", case_label_only),
@@ -371,6 +431,7 @@ CASES = [
     ("08-legacy-format1-draft", case_legacy_draft),
     ("09-export-preflight", case_export_preflight),
     ("10-mark-and-track-controls", case_nontext_controls),
+    ("11-selection-seek-synchronization", case_selection_seek_synchronization),
 ]
 
 

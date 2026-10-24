@@ -20,9 +20,14 @@ from typing import Any, Callable, Dict, Iterator, Optional
 from .media import stream_sha256
 from .schema import require_valid_document
 
+_MAX_PACKET_VERIFICATION_FRAMES = 2_000_000
 
 class MediaPreparationError(ValueError):
     """The source cannot be prepared without breaking the declared contract."""
+
+
+class _MissingFinalFrameDuration(MediaPreparationError):
+    """Decoded frame metadata may need an explicit demux-packet duration."""
 
 
 def _cancel(cancelled: Optional[Callable[[], bool]]) -> None:
@@ -111,6 +116,14 @@ def _frames(ffprobe: str, media: Path, index: int, work: Path, name: str,
                  "-of", "compact=p=0:nk=0", str(media)], work, name, cancelled)
 
 
+def _packets(ffprobe: str, media: Path, index: int, work: Path, name: str,
+             cancelled: Optional[Callable[[], bool]]) -> Path:
+    return _run([ffprobe, "-v", "error", "-protocol_whitelist", "file,pipe",
+                 "-select_streams", str(index), "-show_packets", "-show_entries",
+                 "packet=pts,duration", "-of", "compact=p=0:nk=0", str(media)],
+                work, name, cancelled)
+
+
 def _frame_rows(path: Path, *, allow_missing_pts: bool = False) -> Iterator[Dict[str, int]]:
     with path.open(encoding="utf-8") as stream:
         for line in stream:
@@ -132,10 +145,12 @@ def _frame_rows(path: Path, *, allow_missing_pts: bool = False) -> Iterator[Dict
 
 
 def _video_summary(path: Path, base: Fraction,
-                   cancelled: Optional[Callable[[], bool]]) -> Dict[str, Any]:
+                   cancelled: Optional[Callable[[], bool]], *,
+                   packets: Optional[Path] = None) -> Dict[str, Any]:
     count = 0
     first = previous = last_duration = first_delta = None
     variable = False
+    frame_pts = set() if packets is not None else None
     for row in _frame_rows(path):
         _cancel(cancelled)
         pts = row["pts"]
@@ -150,19 +165,62 @@ def _video_summary(path: Path, base: Fraction,
         else:
             first = pts
         previous = pts
-        last_duration = row.get("duration", row.get("pkt_duration", 0))
+        durations = [row.get(key, 0) for key in ("duration", "pkt_duration")]
+        if any(value < 0 for value in durations):
+            raise MediaPreparationError("Decoded video frame duration cannot be negative")
+        if all(value > 0 for value in durations) and durations[0] != durations[1]:
+            raise MediaPreparationError("Decoded frame and attached packet duration metadata conflict")
+        # A present zero duration is not usable, but older ffprobe versions
+        # may still expose the positive packet duration on the decoded frame.
+        last_duration = row.get("duration", 0) or row.get("pkt_duration", 0)
+        duration_basis = ("explicit_decoded_frame_duration" if row.get("duration", 0) > 0
+                          else "explicit_decoded_frame_attached_packet_duration")
+        if frame_pts is not None:
+            if count >= _MAX_PACKET_VERIFICATION_FRAMES:
+                raise MediaPreparationError("Packet duration verification exceeds the 2000000-frame resource limit")
+            frame_pts.add(pts)
         count += 1
     if count == 0:
         raise MediaPreparationError("No decodable video frames were found")
     if last_duration is None or last_duration <= 0:
-        # A last-frame hold cannot be inferred from average FPS or the prior
-        # frame interval, particularly for VFR. Reject ambiguous endpoints.
-        raise MediaPreparationError("Final video frame duration is missing; an exact playable endpoint cannot be established")
+        if packets is None:
+            # A last-frame hold cannot be inferred from average FPS or the
+            # prior frame interval, particularly for VFR.
+            raise _MissingFinalFrameDuration("Final video frame duration is missing; an exact playable endpoint cannot be established")
+        # FFmpeg 6 may omit a decoded H.264 tail duration even though the
+        # demuxer reports it explicitly. Accept it only after proving a unique
+        # one-packet-per-displayed-frame PTS mapping for the selected stream.
+        # Reordered packet DTS is irrelevant; no FPS/container estimate is used.
+        packet_pts = set()
+        for row in _frame_rows(packets):
+            _cancel(cancelled)
+            pts = row["pts"]
+            if row.get("duration", 0) < 0:
+                raise MediaPreparationError("Demux packet duration cannot be negative")
+            if pts in packet_pts or len(packet_pts) >= count:
+                raise MediaPreparationError("Explicit packet duration requires one unique packet PTS per decoded frame")
+            packet_pts.add(pts)
+            if pts == previous:
+                last_duration = row.get("duration", 0)
+        if packet_pts != frame_pts or not last_duration or last_duration <= 0:
+            raise MediaPreparationError("Final video frame duration is missing or packet-to-frame PTS mapping is ambiguous")
+        duration_basis = "explicit_demux_packet_duration_with_one_to_one_decoded_pts"
     end = (previous - first + last_duration) * base
     if end <= 0 or not math.isfinite(float(end)):
         raise MediaPreparationError("Video timeline is empty or invalid")
     return {"count": count, "first": first, "last": previous,
-            "last_duration": last_duration, "duration": end, "variable": variable}
+            "last_duration": last_duration, "duration": end, "variable": variable,
+            "last_duration_basis": duration_basis}
+
+
+def _verified_video_summary(ffprobe: str, media: Path, index: int, frames: Path,
+                            base: Fraction, work: Path, name: str,
+                            cancelled: Optional[Callable[[], bool]]) -> Dict[str, Any]:
+    try:
+        return _video_summary(frames, base, cancelled)
+    except _MissingFinalFrameDuration:
+        packets = _packets(ffprobe, media, index, work, name, cancelled)
+        return _video_summary(frames, base, cancelled, packets=packets)
 
 
 def _audio_summary(path: Path, base: Fraction, sample_rate: int,
@@ -344,7 +402,8 @@ def prepare_media(source: os.PathLike, output_dir: os.PathLike,
             hdr_filter = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv420p,sidedata=mode=delete"
         base = _time_base(video)
         source_frames = _frames(ffprobe, source, video["index"], work, "source-video-frames", cancelled)
-        source_summary = _video_summary(source_frames, base, cancelled)
+        source_summary = _verified_video_summary(ffprobe, source, video["index"], source_frames,
+                                                 base, work, "source-video-packets", cancelled)
         first = source_summary["first"]
         first_time = first * base
         audio = [item for item in info["streams"] if item.get("codec_type") == "audio"]
@@ -428,7 +487,8 @@ def prepare_media(source: os.PathLike, output_dir: os.PathLike,
             raise MediaPreparationError("HDR conversion did not produce the declared BT.709 SDR metadata")
         proxy_base = _time_base(proxy_video)
         proxy_frames = _frames(ffprobe, playback, proxy_video["index"], work, "playback-video-frames", cancelled)
-        proxy_summary = _video_summary(proxy_frames, proxy_base, cancelled)
+        proxy_summary = _verified_video_summary(ffprobe, playback, proxy_video["index"], proxy_frames,
+                                                proxy_base, work, "playback-video-packets", cancelled)
         expected_first = first_time - origin
         if abs(proxy_summary["first"] * proxy_base - expected_first) > proxy_base:
             raise MediaPreparationError("Playback video start does not preserve its offset from the common timeline origin")
@@ -474,6 +534,10 @@ def prepare_media(source: os.PathLike, output_dir: os.PathLike,
                     "source_time_base": str(base), "proxy_time_base": str(proxy_base),
                     "mapping": "proxy_time = source_time - origin_time",
                     "video_duration": float(proxy_summary["duration"]), "duration": duration,
+                    "last_frame_duration": {"source_ticks": source_summary["last_duration"],
+                                            "source_basis": source_summary["last_duration_basis"],
+                                            "playback_ticks": proxy_summary["last_duration"],
+                                            "playback_basis": proxy_summary["last_duration_basis"]},
                     "variable_frame_rate": source_summary["variable"],
                     "preservation": "decoded_frame_order_and_timestamps_verified",
                     "audio": {"policy": "all_audio_streams_aac", "stream_count": len(audio),

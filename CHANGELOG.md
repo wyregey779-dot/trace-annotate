@@ -2,6 +2,8 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Verify explicit demux-packet durations when older FFprobe versions omit the decoded final-frame duration. Require a unique packet/frame PTS mapping, record the duration source and retain rejection of ambiguous endpoints.
+- Require FFmpeg/ffprobe in every CI test environment so media regressions execute. Synchronize the browser seek-control test with completed segment selection before issuing Home/End inputs.
 - Add a dark embodied editor with task descriptions, independently declared step counts, segment labels, explicit pending verdicts, seconds-based seeking and a bottom segment list. Retain incomplete drafts and preserve current annotations when media replacement is cancelled or rejected.
 - Render actual QC totals in a dark, responsive report, keeping structural errors and pending review distinct. Add a reproducible synthetic-media browser recording, screenshots and regression workflow.
 - Quote CSV fields consistently across supported Python versions, including bare carriage returns and multiline values.
