@@ -87,3 +87,5 @@ python scripts/check_prepared_editor.py --output output/prepared-editor-check
 ```
 
 输出目录须为新目录。浏览器脚本在隔离浏览器中生成 ProRes+AAC 和真实变帧率素材，实际转换、HTTP Range 播放、划段、下载、草稿恢复、重新导入与干净上下文重开。标签为操作测试夹具，不是自动识别预测。CI 保存对应工件；原生文件选择器、所有浏览器、所有素材与模型语义准确率仍需各自验证。
+
+跨 FFmpeg 版本排查可运行 `python scripts/diagnose_media_timing.py --output output/timing-new`；使用 `--ffmpeg-dir` 指向独立工具目录可隔离比较版本。脚本只生成合成素材，保留原始流、帧、数据包、命令日志及失败现场，不绕过准备门禁、不读取用户素材。CI 测试失败时也会保存该诊断工件。

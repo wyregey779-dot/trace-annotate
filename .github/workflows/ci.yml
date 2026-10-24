@@ -66,6 +66,18 @@ jobs:
         run: |
           python -m pytest tests -v -rs
 
+      - name: Retain reproducible timing diagnostics after a failure
+        if: failure()
+        run: python scripts/diagnose_media_timing.py --output output/media-timing-diagnostics
+
+      - name: Upload media timing failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: media-timing-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: output/media-timing-diagnostics
+          if-no-files-found: warn
+
       - name: Run documented examples
         run: |
           python examples/demo_asset_pipeline.py
