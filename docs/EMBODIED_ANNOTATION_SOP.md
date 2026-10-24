@@ -22,7 +22,7 @@ Inspect the overall clip before drawing intervals. If non-normal, stop immediate
 | **正常 (Normal)** | Wrist/hand perspective visible, content relevant to task | Proceed to Step 2 |
 | **佩戴问题 (Wear Issue)** | Hands not visible: occluded, upside down, black screen, selfie | Do not segment. Fill Quick ID + description in report. |
 | **描述不符-整段无关** | Footage completely unrelated to text prompt | Do not segment. Report. |
-| **描述不符-仅部分工作** | Only a sub-part of task performed | Record a report and leave working empty. Split out relevant footage and annotate it as a separate normal clip if needed. |
+| **描述不符-仅部分工作** | Only a sub-part of task performed | Preserve the relevant annotations and record a report. This policy conflicts in the local historical specification; current QC marks it `REVIEW_REQUIRED` for human adjudication. |
 | **这里没有 (Empty)** | No work performed (empty background, insects) | Do not segment. Record a report. |
 
 ---
@@ -60,9 +60,9 @@ Every working segment must be assigned a `step_number` corresponding to $S = [1.
 | **顺序错误 (Out of Order)** | Steps performed out of chronological order | `"t=22s 第4步出现在第3步之前"` |
 | **重复/多做 (Duplicate/Extra)** | Repeated step or extraneous task | `"第2步固定螺母重复执行了两遍"` |
 | **用错物体 (Wrong Object)** | Used incorrect tool or material | `"t=14s 用了十字改锥，规定应为一字改锥"` |
-| **操作方式错误 (Wrong Method)** | Correct object, incorrect posture/technique | `"t=18s 旋拧手法方向相反"` |
+| **操作方式错误 (Wrong Method)** | Correct object, incorrect posture/technique | `"t=18s 旋拧方式与规定相反，规定应为顺时针"` |
 | **意外事故 (Accident)** | Dropping, slipping, spilling items | `"t=30s 零件从工作台滑落"` |
-| **其他 (Other)** | Complex multi-error or edge case | Detailed description |
+| **其他 (Other)** | Complex multi-error or edge case | Supply a time/step locator and a concrete explanation |
 
 ---
 
@@ -71,3 +71,5 @@ Every working segment must be assigned a `step_number` corresponding to $S = [1.
 - The agreement command samples working/idle states at $2\text{Hz}$ by default. This is not a measurement of semantic label accuracy or per-step temporal IoU.
 - The report includes reference flags for $\kappa \ge 0.80$ and $\kappa \ge 0.70$. These are project defaults, not validated production acceptance criteria.
 - Choose acceptance criteria for your own dataset, sampling rate and review process. Inspect disagreements and class balance alongside any aggregate score.
+
+For the current development pipeline, incomplete file coverage, unmatched segments, supplied semantic conflicts, uncertain labels and single-class degeneracy prevent automatic acceptance even when temporal overlap is high. Missing steps or unexpected order can be correctly recorded execution errors; they request adjudication rather than prove that an annotation is wrong. See [the quality pipeline guide](QUALITY_PIPELINE.md).

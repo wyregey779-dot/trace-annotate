@@ -2,6 +2,11 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Unify embodied QC, idle repair, procedure comparison and agreement behind the packaged quality pipeline and CLI. Reject invalid or incomplete batches and propagate failed/review gates through exit codes and newly created reports.
+- Validate working/idle/mid intervals and category-specific evidence; retain precise interval boundaries instead of rounding gaps into empty segments. Require declared media duration and independent expected-step coverage for complete pipeline checks.
+- Report incomplete comparison coverage, semantic conflicts and undefined single-class Kappa explicitly. Separate sampled time agreement from human independence and video-content truth.
+- Protect original inputs, escape report content, refuse existing report outputs, and retain a backup for explicitly requested atomic in-place idle repair. Add Windows launchers with fresh report paths and real exit-code propagation.
+
 - Add `video-prepare`, `video-open` and prepared-project `video-ui --project` for verified H.264/AAC compatibility copies. Preserve original content identity, decoded frame order/PTS correspondence, final-frame hold and relative audio-track timing; record conversion commands and limitations.
 - Serve prepared projects through a tokenized, read-only loopback server with bounded JSON reads and streamed HTTP Range playback. Automatically load prepared media in the editor, retain provenance through edits/clear/undo, and reject conflicting imports or drafts.
 - Add explicit HDR-to-SDR preview conversion, compatibility workflow documentation and actual browser preparation/edit/recovery acceptance in CI. This expands media formats without adding automatic semantic annotation.

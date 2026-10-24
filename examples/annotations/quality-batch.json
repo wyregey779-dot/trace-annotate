@@ -1,0 +1,13 @@
+{
+  "clip": "synthetic-two-step.mp4",
+  "duration": 12,
+  "text_description": "合成格式测试：先取出工件，再将工件放到托盘。这不是对真实视频的标注答案。",
+  "clip_status": "正常",
+  "expected_step_count": 2,
+  "working": [
+    {"start": 1, "end": 3, "step_number": 1, "verdict": "对", "mid_segments": [], "correction_events": []},
+    {"start": 5, "end": 9, "step_number": 2, "verdict": "对", "mid_segments": [], "correction_events": []}
+  ],
+  "idle": [{"start": 0, "end": 1}, {"start": 3, "end": 5}, {"start": 9, "end": 12}],
+  "report": null
+}

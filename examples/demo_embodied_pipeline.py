@@ -26,7 +26,7 @@ def run_demo():
     print("=== TraceAnnotate: Embodied AI Temporal Annotation Demo ===")
 
     # 1. Create a structured embodied annotation document
-    print("\n[Step 1] Constructing compliant EmbodiedAnnotationDoc (Specification v2.1)...")
+    print("\n[Step 1] Constructing a synthetic annotation-format example (no video ground truth)...")
     doc = EmbodiedAnnotationDoc(
         clip="assembly_task_wrist_001.mp4",
         text_description="1. 拾取左侧底板; 2. 安装支撑轴; 3. 拧紧固定螺母",
@@ -81,14 +81,17 @@ def run_demo():
     # 4. Validate document compliance
     print("\n[Step 4] Validating document compliance against Specification v2.1...")
     doc_dict = doc.to_dict()
-    violations = validate_embodied_doc(doc_dict)
+    doc_dict["duration"] = total_clip_duration
+    doc_dict["idle"] = idle_intervals
+    violations = validate_embodied_doc(doc_dict, require_duration=True,
+                                      require_description=True, require_idle_coverage=True)
     if not violations:
-        print("  [OK] Document is 100% compliant with Specification v2.1 rules!")
+        print("  [OK] Supplied fields pass structural checks; actions and evidence truth are not verified.")
     else:
-        print(f"  [!] Violations found: {violations}")
+        raise RuntimeError(f"Synthetic example has unexpected structural violations: {violations}")
 
     # 5. Inter-annotator agreement (Cohen's Kappa)
-    print("\n[Step 5] Simulating two independent annotators and evaluating Kappa agreement...")
+    print("\n[Step 5] Comparing two synthetic time-only fixtures (not independent human annotations)...")
     annotator_a = {
         "clip_001": {
             "working": [{"start": 5.0, "end": 20.0}, {"start": 30.0, "end": 45.0}]
@@ -105,14 +108,16 @@ def run_demo():
     print(f"  Expected Chance (pe):    {kappa_res['expected_chance_pe']:.3f}")
     print(f"  Cohen's Kappa:           {kappa_res['kappa']:.3f}")
     print(f"  Meets Pilot Bar (>=0.80):    {kappa_res['meets_trial_bar']}")
-    print(f"  Meets Minimum Bar (>=0.70):  {kappa_res['meets_baseline_bar']}")
+    print(f"  Meets Minimum Bar (>0.70):   {kappa_res['meets_baseline_bar']}")
+    print(f"  Production gate eligible:   {kappa_res['gate_eligible']}")
+    print("  Missing duration/labels keep these time-only scores diagnostic; video truth and annotator independence are not verified.")
 
     # 6. Label Studio XML template
     print("\n[Step 6] Generating Label Studio v2.1 XML configuration...")
     xml_str = generate_label_studio_xml()
     print(f"  Generated XML ({len(xml_str)} characters, begins with '<View>')")
 
-    print("\n[OK] Embodied AI annotation pipeline demo completed successfully!")
+    print("\n[OK] Synthetic software demonstration finished. The step-order difference requires adjudication; no production batch was certified.")
 
 
 if __name__ == "__main__":

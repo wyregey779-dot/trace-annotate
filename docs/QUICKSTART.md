@@ -6,11 +6,11 @@ For the Chinese overview and runnable commands, see [中文说明](../README_CN.
 
 ## 1. Install from a source checkout
 
-Use Python 3.9 or newer and Git:
+Use Python 3.9 or newer and a checkout containing this guide and `embodied-pipeline`.
+These commands describe the current development implementation; older release
+tags may have different quality checks. From that checkout:
 
 ```bash
-git clone --branch v1.0.2 --depth 1 https://github.com/wyregey779-dot/trace-annotate.git
-cd trace-annotate
 python -m venv .venv
 ```
 
@@ -28,7 +28,7 @@ python -m pip install .
 trace-annotate --version
 ```
 
-The version command should report `trace-annotate 1.0.2`. If PowerShell policy blocks activation, use `.venv\Scripts\python.exe -m pip install .`. Run the example through `.venv\Scripts\python.exe`, or invoke CLI commands through `.venv\Scripts\trace-annotate.exe`; changing the machine's execution policy is not required.
+The version command should match `project.version` in this checkout's `pyproject.toml` (currently `1.1.0.dev0`). If PowerShell policy blocks activation, use `.venv\Scripts\python.exe -m pip install .`. Run the example through `.venv\Scripts\python.exe`, or invoke CLI commands through `.venv\Scripts\trace-annotate.exe`; changing the machine's execution policy is not required.
 
 ## 2. Run the workflow
 
@@ -44,15 +44,15 @@ The last output should include:
 
 ```text
 Verified: 2 working segments, 3 idle intervals, 5 subtitle entries.
+Machine scope: PASS_SCOPED. Synthetic format example; video truth and independent human annotation are not verified.
 ```
 
 | Output | Purpose |
 | --- | --- |
 | `output/quickstart/assembly.json` | Annotation document with calculated idle intervals |
+| `output/quickstart/assembly.json.before-idle-*.bak` | Original copied fixture bytes retained by explicit in-place repair |
 | `output/quickstart/qc-report.html` | Local review report; open in a browser |
 | `output/quickstart/assembly.srt` | Timed subtitles for inspection or review with a matching video |
-
-![QC report from the quickstart fixture](images/quickstart-qc.jpg)
 
 ## 3. Inspect the example data
 
@@ -63,7 +63,7 @@ The fixture contains two working segments:
 | 2–5 seconds | 1 | `对` (correct) |
 | 7–10 seconds | 2 | `对` (correct) |
 
-The document duration is 12 seconds. Its labels are synthetic examples, not observations of a recorded participant or model predictions. The `clip` field identifies an example video; a matching video is not needed for these data-processing commands.
+The document duration is 12 seconds. Its independently declared example procedure has `expected_step_count: 2`; the tool does not infer this count from observed steps. Its labels are synthetic examples, not observations of a recorded participant or model predictions. The `clip` field identifies an example video; a matching video is not needed for these data-processing commands. Correct working segments have null error evidence; the synthetic-data explanation is document metadata.
 
 After idle calculation, the document contains:
 
@@ -75,7 +75,7 @@ After idle calculation, the document contains:
 ]
 ```
 
-Validation reports one checked record and `Violations: 0`. Step comparison returns empty `missing` and `out_of_order` lists. The SRT file contains five chronological entries: three idle intervals and two working intervals. Its second entry is:
+Validation emits JSON with `"passed": true`, `"records_checked": 1` and `"violations": []`. The quality command emits `"status": "PASS_SCOPED"` and `"exit_code": 0`. Step comparison returns empty `missing` and `out_of_order` lists. The HTML report separates structure checks from procedure reconciliation. A procedure difference requires adjudication and may faithfully describe an execution error; it does not by itself establish an incorrect annotation. The SRT file contains five chronological entries: three idle intervals and two working intervals. Its second entry is:
 
 ```text
 2
@@ -103,9 +103,9 @@ trace-annotate embodied-qc output/manual-example/assembly.json -o output/manual-
 trace-annotate embodied-export output/manual-example/assembly.json --format srt -o output/manual-example/assembly.srt
 ```
 
-`--inplace` updates only the copied annotation file here. Omit it to print generated JSON instead. With your own records, preserve the document's actual duration or pass it using `--duration`; otherwise the final idle interval may be missing.
+`--inplace` atomically updates only the copied annotation file here and creates a new backup of its original bytes. Omit it to print generated JSON instead, or use `--output` for a new copy. Existing report/export destinations are refused. With your own records, supply the actual duration in the document or using `--duration`; a missing or invalid duration is rejected. Supply an independently defined `expected_step_count` or `--nsteps` for the procedure gate. No original input is modified by the quality pipeline.
 
-The exact verdict values are `对`, `错` and `无法判断`. Use `无法判断` for unreviewed work. A segment marked `错` needs a supported `error_type` and non-empty evidence. Label conventions are described in the [annotation SOP](EMBODIED_ANNOTATION_SOP.md).
+The exact verdict values are `对`, `错` and `无法判断`. Use `无法判断` when the video information is insufficient; it remains pending review and cannot pass the quality gate. A segment marked `错` needs a supported `error_type` and template-based evidence with a valid time or step locator as appropriate. A valid wrong-execution label is not a structural failure. Label conventions are described in the [annotation SOP](EMBODIED_ANNOTATION_SOP.md) and the [quality pipeline guide](QUALITY_PIPELINE.md).
 
 ## 5. Use your own video
 

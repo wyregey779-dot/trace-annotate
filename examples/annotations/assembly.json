@@ -3,6 +3,8 @@
   "text_description": "Synthetic example: 1. position a component; 2. fasten it. No recorded participant or model prediction is represented.",
   "clip_status": "正常",
   "duration": 12.0,
+  "expected_step_count": 2,
+  "annotation_note": "Synthetic intervals demonstrate the annotation format; no video or independent human annotation is represented.",
   "working": [
     {
       "start": 2.0,
@@ -10,7 +12,7 @@
       "step_number": 1,
       "verdict": "对",
       "error_type": null,
-      "evidence": "Synthetic interval for demonstrating the annotation format."
+      "evidence": null
     },
     {
       "start": 7.0,
@@ -18,7 +20,7 @@
       "step_number": 2,
       "verdict": "对",
       "error_type": null,
-      "evidence": "Synthetic interval for demonstrating the annotation format."
+      "evidence": null
     }
   ],
   "idle": []

@@ -99,6 +99,8 @@ trace-annotate embodied-qc clip.json -o qc-report.html
 trace-annotate embodied-export clip.json --format srt -o clip.srt
 ```
 
+开发版增加统一质检入口：`trace-annotate embodied-pipeline clip.json --nsteps 5 --report output/new-run/report.html`。它会联动结构校验、预期步骤检查与可选双人比较，并通过退出码阻止未通过或待复核的批次自动放行。请提供真实媒体时长、独立确定的预期步骤数，并为每次报告选择新路径。[质检流水线指南](docs/QUALITY_PIPELINE.md)说明退出码、安全补齐、人工仲裁边界与 Windows 批处理。
+
 需要重新计算 idle 时，执行 `trace-annotate embodied-idle clip.json --duration 60`，把时长改成视频真实秒数。默认打印生成的 JSON；只有准备覆盖文件时才添加 `--inplace`。保留真实总时长才能包含末尾空闲区间。
 
 字段与标签约定见[标注 SOP](docs/EMBODIED_ANNOTATION_SOP.md)。`examples/` 内另外两个脚本分别用合成数据演示资产处理与时间轴一致性。资产示例使用模拟人脸/CLIP 字段，并会创建、删除 `examples/_demo_scratch`。

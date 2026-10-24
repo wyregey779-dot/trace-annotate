@@ -39,9 +39,13 @@ def main() -> None:
         return result.stdout
 
     cli("embodied-idle", str(annotation), "--inplace")
-    cli("embodied-validate", str(annotation))
+    validation = json.loads(cli("embodied-validate", str(annotation)))
+    if not validation["passed"] or validation["records_checked"] != 1 or validation["violations"]:
+        raise RuntimeError("Strict annotation structure check did not pass")
     difference = json.loads(cli("embodied-diff", str(annotation), "--nsteps", "2"))
-    cli("embodied-qc", str(annotation), "-o", str(destination / "qc-report.html"))
+    quality = json.loads(cli("embodied-qc", str(annotation), "-o", str(destination / "qc-report.html")))
+    if not quality["passed"] or quality["status"] != "PASS_SCOPED" or quality["exit_code"] != 0:
+        raise RuntimeError("Declared annotation machine-check scope did not pass")
     cli("embodied-export", str(annotation), "--format", "srt", "-o", str(destination / "assembly.srt"))
 
     document = json.loads(annotation.read_text(encoding="utf-8"))
@@ -54,6 +58,7 @@ def main() -> None:
     if subtitles.count(" --> ") != 5 or "00:00:10,000 --> 00:00:12,000" not in subtitles:
         raise RuntimeError("SRT export did not preserve all five timeline segments")
     print(f"Verified: 2 working segments, 3 idle intervals, 5 subtitle entries.\nOutputs: {destination}")
+    print("Machine scope: PASS_SCOPED. Synthetic format example; video truth and independent human annotation are not verified.")
 
 
 if __name__ == "__main__":

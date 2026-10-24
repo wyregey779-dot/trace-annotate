@@ -24,7 +24,10 @@ def test_documented_workflow_produces_outputs_without_changing_fixture(tmp_path)
     destination = tmp_path / "example"
     result = run_example(destination)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Violations: 0" in result.stdout
+    assert '"records_checked": 1' in result.stdout
+    assert '"violations": []' in result.stdout
+    assert "Machine scope: PASS_SCOPED" in result.stdout
+    assert "video truth and independent human annotation are not verified" in result.stdout
     assert "5 subtitle entries" in result.stdout
     assert (destination / "qc-report.html").is_file()
     assert fixture.read_bytes() == original

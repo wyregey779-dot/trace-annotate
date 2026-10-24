@@ -1,7 +1,7 @@
 include CHANGELOG.md CONTRIBUTING.md SECURITY.md README_CN.md
 recursive-include docs *.md *.jpg *.png
 recursive-include examples *.py *.json
-recursive-include scripts *.py
+recursive-include scripts *.py *.cmd
 recursive-include tests *.py
 prune .local-review
 prune 交接

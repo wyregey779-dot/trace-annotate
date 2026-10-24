@@ -5,15 +5,16 @@ Allows instant video review in standard desktop media players (VLC, PotPlayer, Q
 """
 from __future__ import annotations
 from typing import Dict, Any, List
+from trace_annotate.embodied._intervals import finite_number
+from trace_annotate.temporal.formats import _milliseconds, _timestamp, _plain_text
 
 
 def format_srt_time(seconds: float) -> str:
-    """Format seconds into SRT timestamp: HH:MM:SS,mmm"""
-    ms = int(round((seconds - int(seconds)) * 1000))
-    s = int(seconds) % 60
-    m = (int(seconds) // 60) % 60
-    h = int(seconds) // 3600
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    """Use the general-video millisecond formatter, including carry at boundaries."""
+    value = finite_number(seconds, "subtitle timestamp")
+    if value < 0:
+        raise ValueError("subtitle timestamp cannot be negative")
+    return _timestamp(_milliseconds(value), "srt")
 
 
 def export_to_srt(doc: Dict[str, Any], include_idle: bool = True) -> str:
@@ -77,6 +78,9 @@ def export_to_srt(doc: Dict[str, Any], include_idle: bool = True) -> str:
     for idx, e in enumerate(sorted_entries, 1):
         t_start = format_srt_time(e["start"])
         t_end = format_srt_time(e["end"])
-        srt_lines.append(f"{idx}\n{t_start} --> {t_end}\n{e['text']}\n")
+        if _milliseconds(e["end"]) <= _milliseconds(e["start"]):
+            raise ValueError("segment interval collapses at millisecond subtitle precision")
+        plain_text = _plain_text(e["text"], "srt", f"subtitle {idx}")
+        srt_lines.append(f"{idx}\n{t_start} --> {t_end}\n{plain_text}\n")
 
     return "\n".join(srt_lines)

@@ -26,6 +26,14 @@ from trace_annotate.embodied.exporters.action_dataset import export_to_action_se
 from trace_annotate.embodied.qc_report import generate_qc_report
 from trace_annotate.embodied.motion import extract_motion_energy, propose_idle_pauses
 from trace_annotate.temporal.commands import register_video_commands
+from trace_annotate.embodied.quality_pipeline import (
+    add_pipeline_arguments, guarded, idle_command, diff_command, kappa_command,
+    validate_command, pipeline_command,
+)
+from trace_annotate.embodied.quality_io import (
+    QualityInputError, QualityViolation, load_docs_from_file, require_new_output, write_new_text,
+)
+from trace_annotate.embodied.validator import validate_embodied_doc
 
 
 def cmd_asset_verify(args: argparse.Namespace) -> None:
@@ -103,102 +111,21 @@ def _duration_argument(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def cmd_embodied_idle(args: argparse.Namespace) -> None:
-    """Compute idle complement for an embodied annotation doc."""
-    with open(args.file, "r", encoding="utf-8") as stream:
-        doc = json.load(stream)
-    if not isinstance(doc, dict) or not isinstance(doc.get("working"), list):
-        raise ValueError("annotation must be a JSON object with a working array")
-    working = doc["working"]
-    working_end = 0.0
-    for index, segment in enumerate(working):
-        try:
-            if not isinstance(segment, dict):
-                raise ValueError
-            if isinstance(segment.get("start"), bool) or isinstance(segment.get("end"), bool):
-                raise ValueError
-            start, end = float(segment["start"]), float(segment["end"])
-            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
-                raise ValueError
-        except (KeyError, TypeError, ValueError):
-            raise ValueError(f"working[{index}] requires finite timestamps with 0 <= start < end") from None
-        working_end = max(working_end, end)
-    if args.duration is not None:
-        total_dur = args.duration
-    elif doc.get("duration") is not None:
-        total_dur = doc["duration"]
-    else:
-        total_dur = max(
-            [float(w["end"]) for w in working]
-            + [float(i["end"]) for i in doc.get("idle", [])]
-            + [0.0]
-        )
-    total_dur = _duration_seconds(total_dur)
-    if total_dur < working_end:
-        raise ValueError("duration must be at least the maximum working end timestamp")
+def cmd_embodied_idle(args: argparse.Namespace) -> int:
+    """Validated idle repair; stdout/new copy by default, explicit backed-up inplace."""
+    return idle_command(args)
 
-    idle = compute_idle_complement(working, total_dur)
-    doc["duration"] = total_dur
-    doc["idle"] = idle
+def cmd_embodied_diff(args: argparse.Namespace) -> int:
+    """Strict procedure coverage and temporal-order gate."""
+    return diff_command(args)
 
-    if args.inplace:
-        with open(args.file, "w", encoding="utf-8") as f:
-            json.dump(doc, f, ensure_ascii=False, indent=2)
-        print(f"[OK] Updated {args.file} in-place: {len(working)} working, {len(idle)} idle segments.")
-    else:
-        print(json.dumps(doc, ensure_ascii=False, indent=2))
+def cmd_embodied_kappa(args: argparse.Namespace) -> int:
+    """Full-file coverage, semantic and non-degenerate temporal agreement gate."""
+    return kappa_command(args)
 
-
-def cmd_embodied_diff(args: argparse.Namespace) -> None:
-    """Diff working segments step numbers against expected procedure."""
-    doc = json.load(open(args.file, "r", encoding="utf-8"))
-    working = doc.get("working", [])
-    result = diff_expected_steps(working, expected_step_count=args.nsteps)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-
-
-def cmd_embodied_kappa(args: argparse.Namespace) -> None:
-    """Compute temporal Cohen's Kappa between two annotator files."""
-    def load_jsonl(path: str):
-        data = {}
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    item = json.loads(line)
-                    clip_id = item.get("clip")
-                    if clip_id:
-                        data[clip_id] = item
-        return data
-
-    annotator_a = load_jsonl(args.annotator_a)
-    annotator_b = load_jsonl(args.annotator_b)
-
-    metrics = calculate_temporal_kappa(annotator_a, annotator_b, sample_rate_hz=args.fps)
-    print("=== Inter-Annotator Agreement Evaluation ===")
-    print(f"Common Clips: {metrics.get('common_clips')}")
-    print(f"Observed Agreement (p0): {metrics.get('observed_agreement_p0')}")
-    print(f"Expected Chance (pe):    {metrics.get('expected_chance_pe')}")
-    print(f"Cohen's Kappa:           {metrics.get('kappa')}")
-    print(f"Meets Trial Bar (>=0.80):    {metrics.get('meets_trial_bar')}")
-    print(f"Meets Baseline Bar (>=0.70): {metrics.get('meets_baseline_bar')}")
-
-
-def cmd_embodied_validate(args: argparse.Namespace) -> None:
-    """Validate export compliance against Specification v2.1."""
-    report = validate_embodied_export(args.target)
-    print(f"Checked: {report['records_checked']} records across {report['files_checked']} files")
-    print(f"Violations: {report['violations_count']}")
-    if report["violations"]:
-        print("\nViolations List:")
-        for v in report["violations"][:20]:
-            print(f"  - {v}")
-        if len(report["violations"]) > 20:
-            print(f"  ... and {len(report['violations']) - 20} more.")
-        sys.exit(1)
-    else:
-        print("[OK] No violations found by the annotation validator.")
-
+def cmd_embodied_validate(args: argparse.Namespace) -> int:
+    """Strict JSON/JSONL, fields, duration and timeline coverage validation."""
+    return validate_command(args)
 
 def cmd_embodied_xml(args: argparse.Namespace) -> None:
     """Print or export Label Studio XML configuration."""
@@ -213,63 +140,50 @@ def cmd_embodied_xml(args: argparse.Namespace) -> None:
 
 def cmd_embodied_export(args: argparse.Namespace) -> None:
     """Export annotation document to SRT subtitles or CVAT XML."""
-    doc = json.load(open(args.file, "r", encoding="utf-8"))
+    docs = load_docs_from_file(args.file)
     fmt = args.format.lower()
+    if fmt in {"srt", "cvat"} and len(docs) != 1:
+        raise QualityInputError("SRT/CVAT export requires exactly one clip; choose individual files")
+    violations = [f"record {index}: {error}" for index, doc in enumerate(docs, 1)
+                  for error in validate_embodied_doc(doc) if not error.startswith("REVIEW_REQUIRED:")]
+    if violations:
+        raise QualityViolation("; ".join(violations))
+    doc = docs[0]
 
     if fmt == "srt":
         srt_content = export_to_srt(doc)
         out = args.output or os.path.splitext(args.file)[0] + ".srt"
-        with open(out, "w", encoding="utf-8") as f:
-            f.write(srt_content)
+        write_new_text(out, srt_content, [args.file])
         print(f"[OK] Exported SRT subtitles to {out} (can be loaded in VLC/PotPlayer)")
 
     elif fmt == "cvat":
         xml_content = export_to_cvat_xml(doc)
         out = args.output or os.path.splitext(args.file)[0] + "_cvat.xml"
-        with open(out, "w", encoding="utf-8") as f:
-            f.write(xml_content)
+        write_new_text(out, xml_content, [args.file])
         print(f"[OK] Exported CVAT Track XML to {out}")
 
     elif fmt == "action":
         out_dir = args.output or "./action_dataset"
-        m_file, gts = export_to_action_segmentation([doc], out_dir)
+        # The library supports explicit incremental datasets. The end-user CLI
+        # always creates a new destination, so it cannot overwrite prior labels.
+        destination = require_new_output(out_dir, [args.file])
+        destination.mkdir(parents=True, exist_ok=False)
+        m_file, gts = export_to_action_segmentation(docs, str(destination))
         print(f"[OK] Exported Action Segmentation dataset to {out_dir}:")
         print(f"  Mapping: {m_file}")
         print(f"  Ground truth files: {len(gts)}")
 
 
-def cmd_embodied_qc(args: argparse.Namespace) -> None:
-    """Generate visual HTML quality control report."""
-    docs = []
-    if os.path.isdir(args.input):
-        for root, _, files in os.walk(args.input):
-            for f in files:
-                if f.endswith((".json", ".jsonl")):
-                    p = os.path.join(root, f)
-                    with open(p, "r", encoding="utf-8") as fh:
-                        for line in fh:
-                            line = line.strip()
-                            if line:
-                                try:
-                                    data = json.loads(line)
-                                    if isinstance(data, list):
-                                        docs.extend(data)
-                                    else:
-                                        docs.append(data)
-                                except Exception:
-                                    pass
-    else:
-        with open(args.input, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-            if isinstance(data, list):
-                docs = data
-            else:
-                docs = [data]
+def cmd_embodied_qc(args: argparse.Namespace) -> int:
+    """Generate the same strict pipeline report used by the batch CLI."""
+    args.target = args.input
+    args.report = args.output
+    return pipeline_command(args)
 
-    out = args.output or "qc_report.html"
-    generate_qc_report(docs, out)
-    print(f"[OK] HTML QC inspection report generated at: {os.path.abspath(out)}")
 
+def cmd_embodied_pipeline(args: argparse.Namespace) -> int:
+    """Run all requested embodied machine gates and write a new report."""
+    return pipeline_command(args)
 
 def cmd_embodied_ui(args: argparse.Namespace) -> None:
     """Open interactive Web video timeline annotator in browser."""
@@ -321,7 +235,8 @@ def main() -> None:
     p_idle = subparsers.add_parser("embodied-idle", help="Generate timeline idle complement intervals")
     p_idle.add_argument("file", help="Path to embodied annotation JSON file")
     p_idle.add_argument("--duration", type=_duration_argument, help="Finite positive total clip duration in seconds")
-    p_idle.add_argument("--inplace", action="store_true", help="Modify file in-place")
+    p_idle.add_argument("--inplace", action="store_true", help="Explicit validated atomic replacement with original backup")
+    p_idle.add_argument("--output", "-o", help="New corrected copy; existing files are never overwritten")
     p_idle.set_defaults(func=cmd_embodied_idle)
 
     # Embodied Diff
@@ -335,6 +250,7 @@ def main() -> None:
     p_kappa.add_argument("annotator_a", help="Path to Annotator A JSONL")
     p_kappa.add_argument("annotator_b", help="Path to Annotator B JSONL")
     p_kappa.add_argument("--fps", type=float, default=2.0, help="Timeline sampling rate Hz (default 2.0)")
+    p_kappa.add_argument("--min-kappa", type=float, default=0.80)
     p_kappa.set_defaults(func=cmd_embodied_kappa)
 
     # Embodied Validate
@@ -358,7 +274,16 @@ def main() -> None:
     p_qc = subparsers.add_parser("embodied-qc", help="Generate interactive HTML quality control report")
     p_qc.add_argument("input", help="Path to annotation JSON/JSONL file or folder")
     p_qc.add_argument("-o", "--output", default="qc_report.html", help="Output HTML file path")
+    p_qc.add_argument("--nsteps", "-n", type=int)
+    p_qc.add_argument("--compare", "-c")
+    p_qc.add_argument("--auto-idle", action="store_true")
+    p_qc.add_argument("--fps", type=float, default=2.0)
+    p_qc.add_argument("--min-kappa", type=float, default=0.80)
     p_qc.set_defaults(func=cmd_embodied_qc)
+
+    p_pipeline = subparsers.add_parser("embodied-pipeline", help="Strict batch quality gates; new report, no source mutation")
+    add_pipeline_arguments(p_pipeline)
+    p_pipeline.set_defaults(func=cmd_embodied_pipeline)
 
     # Embodied UI
     p_ui = subparsers.add_parser("embodied-ui", help="Launch interactive browser timeline annotator")
@@ -373,6 +298,8 @@ def main() -> None:
 
     args = parser.parse_args()
     if hasattr(args, "func"):
+        if args.command in {"embodied-idle", "embodied-diff", "embodied-kappa", "embodied-validate", "embodied-qc", "embodied-pipeline", "embodied-export"}:
+            raise SystemExit(guarded(args.func, args))
         args.func(args)
     else:
         parser.print_help()

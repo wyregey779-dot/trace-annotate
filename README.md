@@ -99,6 +99,8 @@ trace-annotate embodied-qc clip.json -o qc-report.html
 trace-annotate embodied-export clip.json --format srt -o clip.srt
 ```
 
+The development version also provides `trace-annotate embodied-pipeline clip.json --nsteps 5 --report output/new-run/report.html`. This combines structural validation, declared procedure checks and optional comparison in one fail-closed run. Use a new report path and the actual media duration. [The quality pipeline guide](docs/QUALITY_PIPELINE.md) explains exit codes, review gates, safe idle repair and Windows launchers.
+
 To recalculate idle intervals, run `trace-annotate embodied-idle clip.json --duration 60` with the actual video duration. It prints JSON by default; add `--inplace` only when you intend to update that file. Preserve the duration so the final idle interval is included.
 
 See the [annotation SOP](docs/EMBODIED_ANNOTATION_SOP.md) for fields and label conventions. The two additional scripts in `examples/` demonstrate the asset pipeline and temporal agreement with synthetic data; the asset example uses simulated face/CLIP fields and creates/removes `examples/_demo_scratch`.

@@ -43,6 +43,7 @@ cli_env.pop("PYTHONPATH", None)
 cli_env.pop("PYTHONHOME", None)
 result = subprocess.run([cli, "--help"], check=True, capture_output=True, text=True, env=cli_env)
 assert "embodied-ui" in result.stdout
+assert "embodied-pipeline" in result.stdout
 assert "video-ui" in result.stdout and "video-import" in result.stdout
 assert "video-hash" in result.stdout and "video-bind" in result.stdout
 assert "video-prepare" in result.stdout and "video-open" in result.stdout
@@ -70,8 +71,32 @@ subprocess.run([cli, "video-validate", "bound.json"], check=True, env=cli_env)
 xml_path = Path("label-studio.xml")
 subprocess.run([cli, "embodied-xml", "-o", str(xml_path)], check=True, env=cli_env)
 assert ET.parse(xml_path).getroot().tag == "View"
+
+# Exercise the installed quality implementation, not code imported from checkout.
+annotation = {"clip": "synthetic-quality.mp4", "duration": 10,
+    "text_description": "Synthetic installed-package format test", "clip_status": "正常",
+    "expected_step_count": 1,
+    "working": [{"start": 1, "end": 3, "step_number": 1, "verdict": "对"}],
+    "idle": [{"start": 0, "end": 1}, {"start": 3, "end": 10}]}
+quality_source = Path("quality.json")
+quality_source.write_text(json.dumps(annotation, ensure_ascii=False), encoding="utf-8")
+original_quality = quality_source.read_bytes()
+subprocess.run([cli, "embodied-pipeline", str(quality_source), "--report", "quality-report.html"], check=True, env=cli_env)
+assert "PASS_SCOPED" in Path("quality-report.html").read_text(encoding="utf-8")
+assert quality_source.read_bytes() == original_quality
+old_report = Path("quality-report.html").read_bytes()
+repeated = subprocess.run([cli, "embodied-pipeline", str(quality_source), "--report", "quality-report.html"], env=cli_env)
+assert repeated.returncode == 2
+assert Path("quality-report.html").read_bytes() == old_report
+alias = subprocess.run([cli, "embodied-export", str(quality_source), "--format", "srt", "-o", str(quality_source)], env=cli_env)
+assert alias.returncode != 0 and quality_source.read_bytes() == original_quality
+annotation["working"][0]["start"] = -1
+Path("invalid-quality.json").write_text(json.dumps(annotation, ensure_ascii=False), encoding="utf-8")
+invalid = subprocess.run([cli, "embodied-pipeline", "invalid-quality.json", "--report", "invalid-quality-report.html"], env=cli_env)
+assert invalid.returncode == 1
+assert "INVALID_TIME" in Path("invalid-quality-report.html").read_text(encoding="utf-8")
 print(f"Installed package smoke check passed: version={trace_annotate.__version__}, package={installed_path}")
-print("Templates, both HTML editors, general segment export and embodied XML verified outside checkout.")
+print("Templates, both HTML editors, general segment export, embodied XML and quality failure gates verified outside checkout.")
 '''
 
 
