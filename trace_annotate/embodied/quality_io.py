@@ -57,6 +57,15 @@ def _unique_pairs(pairs):
     return result
 
 
+def _require_unicode_scalars(value: str, location: str) -> None:
+    # json.loads merges a valid escaped surrogate pair into one Unicode scalar.
+    # Any remaining surrogate cannot be encoded in the UTF-8 reports/exports.
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{location}: unpaired Unicode surrogate is not allowed") from None
+
+
 def _decode_json(text: str):
     value = json.loads(text, parse_constant=_constant, object_pairs_hook=_unique_pairs)
     pending = [("$", value, 0)]
@@ -68,8 +77,12 @@ def _decode_json(text: str):
             raise ValueError(f"{location}: non-finite JSON constant {item.token} is not allowed")
         if isinstance(item, float) and not math.isfinite(item):
             raise ValueError(f"{location}: non-finite JSON number is not allowed")
+        if isinstance(item, str):
+            _require_unicode_scalars(item, location)
         if isinstance(item, dict):
-            pending.extend((f"{location}.{key}", entry, depth + 1) for key, entry in item.items())
+            for key, entry in item.items():
+                _require_unicode_scalars(key, f"{location}: object key")
+                pending.append((f"{location}.{key}", entry, depth + 1))
         elif isinstance(item, list):
             pending.extend((f"{location}[{index}]", entry, depth + 1) for index, entry in enumerate(item))
     return value
@@ -189,14 +202,24 @@ def require_new_output(path: str, input_paths=()) -> Path:
 def write_new_text(path: str, text: str, input_paths=()) -> str:
     """Exclusive creation: never truncate an old report or an annotation input."""
     target = require_new_output(path, input_paths)
+    # Fail before creating a file or parent directories. TextIOWrapper would
+    # create an empty report before noticing an unencodable character.
+    encoded = _encode_output_text(text)
     target.parent.mkdir(parents=True, exist_ok=True)
     _reject_link_parents(target)
     # 'x' also catches a new file/symlink introduced after the preflight check.
-    with target.open("x", encoding="utf-8", newline="\n") as stream:
-        stream.write(text)
+    with target.open("xb") as stream:
+        stream.write(encoded)
         stream.flush()
         os.fsync(stream.fileno())
     return str(target)
+
+
+def _encode_output_text(text: str) -> bytes:
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise QualityInputError("Output contains an unpaired Unicode surrogate; no output created") from None
 
 
 def replace_annotation_explicitly(path: str, original: bytes, text: str) -> str:
@@ -209,6 +232,7 @@ def replace_annotation_explicitly(path: str, original: bytes, text: str) -> str:
     _reject_link_parents(source)
     if source.read_bytes() != original:
         raise QualityInputError("Input changed during idle preparation; no replacement made")
+    encoded = _encode_output_text(text)
     backup = source.with_name(source.name + f".before-idle-{uuid.uuid4().hex}.bak")
     with backup.open("xb") as stream:
         stream.write(original)
@@ -216,8 +240,8 @@ def replace_annotation_explicitly(path: str, original: bytes, text: str) -> str:
         os.fsync(stream.fileno())
     descriptor, temporary = tempfile.mkstemp(prefix=f".{source.name}.idle-", suffix=".tmp", dir=source.parent)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
         _reject_link_parents(source)

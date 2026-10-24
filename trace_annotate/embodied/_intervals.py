@@ -65,4 +65,3 @@ def validated_intervals(segments: Any, label: str, duration: Optional[float] = N
     if errors:
         raise ValueError("; ".join(errors))
     return sorted(result)
-

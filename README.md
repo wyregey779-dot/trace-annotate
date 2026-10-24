@@ -9,6 +9,10 @@ Local media review and temporal video annotation tools for Python.
 
 TraceAnnotate supports local media review and temporal annotation. The development version adds general video segments with custom event labels, descriptions, tags and overlapping tracks. The embodied workflow keeps its working/idle intervals, step checks and verdicts. The Python library also provides batched media staging, field-level provenance and asset review helpers.
 
+![Actual embodied editor, using a synthetic operation fixture](docs/media/embodied-editor.png)
+
+[Actual editor/QC screenshots and a 12-second browser recording](docs/DEMO_MEDIA.md) show the development workflow. The recording uses synthetic media and explicit scripted labels; it does not establish video semantic accuracy.
+
 ## General video annotation (development version)
 
 The new workflow is in `1.1.0.dev0`; the published `v1.0.2` release below does not include it. Install the current checkout with `python -m pip install -e ".[dev]"`, then run:

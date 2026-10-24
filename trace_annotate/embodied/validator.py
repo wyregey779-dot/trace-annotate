@@ -145,6 +145,8 @@ def validate_embodied_doc(doc: Dict[str, Any], *, require_duration: bool = False
         step = segment.get("step_number")
         if isinstance(step, bool) or not isinstance(step, int) or step < 1:
             errors.append(f"{prefix}: step_number must be a positive integer (got {type(step).__name__}: {step})")
+        if "label" in segment and not isinstance(segment["label"], str):
+            errors.append(f"{prefix}: optional label must be a string")
         verdict = segment.get("verdict")
         if not isinstance(verdict, str) or verdict not in ALLOWED_VERDICTS:
             errors.append(f"{prefix}: Invalid verdict '{verdict}' (expected one of {sorted(ALLOWED_VERDICTS)})")

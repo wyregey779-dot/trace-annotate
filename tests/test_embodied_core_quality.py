@@ -358,4 +358,3 @@ def test_reports_need_a_locator_and_an_actual_explanation():
     for report in ("黑屏", "Quick ID: C001"):
         doc = document(clip_status="佩戴问题", working=[], idle=[], report=report)
         assert any("REPORT" in error for error in strict(doc))
-

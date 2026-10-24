@@ -228,6 +228,9 @@ def calculate_temporal_kappa(annotator_a_records: Any, annotator_b_records: Any,
                 semantic_complete = False
             if sa.get("mid_segments", []) != sb.get("mid_segments", []):
                 conflict(clip, "mid_segments_mismatch", sa.get("mid_segments", []), sb.get("mid_segments", []), pair)
+            if "label" in sa or "label" in sb:
+                if sa.get("label") != sb.get("label"):
+                    conflict(clip, "label_mismatch", sa.get("label"), sb.get("label"), pair)
             if sa.get("correction_events", []) != sb.get("correction_events", []):
                 conflict(clip, "correction_events_review", sa.get("correction_events", []), sb.get("correction_events", []), pair)
         if total_boundary_offset > 3.0:
@@ -253,6 +256,7 @@ def calculate_temporal_kappa(annotator_a_records: Any, annotator_b_records: Any,
                     and not degenerate and kappa is not None)
     return {
         "common_clips": len(common), "total_samples": total_samples,
+        "sample_rate_hz": rate,
         "observed_agreement_p0": round(p0, 4) if p0 is not None else None,
         "expected_chance_pe": round(pe, 4) if pe is not None else None,
         "kappa": round(kappa, 4) if kappa is not None else None,

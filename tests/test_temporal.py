@@ -171,6 +171,18 @@ def test_csv_neutralizes_formula_like_text_without_mutating_json(payload):
         assert doc["segments"][0][field] == payload
 
 
+@pytest.mark.parametrize("payload", ['first\rsecond', 'first\r\nsecond', 'first\nsecond', '中文, "quoted"\rnext'])
+def test_csv_retains_internal_line_endings_and_following_rows(payload):
+    doc = _doc(segments=[_segment(text=payload, label=payload, track=payload), _segment("event-2", text="following row")])
+    original = copy.deepcopy(doc)
+    rows = list(csv.DictReader(io.StringIO(export_csv(doc), newline="")))
+    assert len(rows) == 2
+    assert rows[0]["text"] == rows[0]["label"] == rows[0]["track"] == payload
+    assert rows[1]["id"] == "event-2" and rows[1]["text"] == "following row"
+    assert all(None not in row for row in rows)
+    assert doc == original
+
+
 @pytest.mark.parametrize("fmt,delimiter", [("srt", ","), ("vtt", ".")])
 def test_subtitle_rounding_carries_minutes_hours_and_rounds_half_up(fmt, delimiter):
     doc = _doc(duration=4000, segments=[

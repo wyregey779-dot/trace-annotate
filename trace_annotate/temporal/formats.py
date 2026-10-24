@@ -84,7 +84,9 @@ def export_csv(doc: Dict[str, Any]) -> str:
     """Return segment rows; document metadata is omitted and formula text escaped."""
     require_valid_document(doc)
     output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=_CSV_FIELDS, lineterminator="\n")
+    # Python 3.9's minimal quoting does not quote bare CR with an LF-only
+    # terminator. Quote every field so multiline text round-trips consistently.
+    writer = csv.DictWriter(output, fieldnames=_CSV_FIELDS, lineterminator="\n", quoting=csv.QUOTE_ALL)
     writer.writeheader()
     for segment in doc["segments"]:
         row = dict(segment)

@@ -23,6 +23,7 @@ from .complement import compute_idle_complement
 from .differ import diff_expected_steps
 from .schema import ClipStatus
 from .validator import validate_embodied_doc
+from .quality_report import REPORT_CSS, summary_markup, agreement_markup
 from .quality_io import (
     AnnotationBatch, QualityInputError, QualityViolation, annotation_json,
     collect_annotations, load_annotations, load_docs_from_file,
@@ -245,21 +246,18 @@ def render_quality_html(report):
     return ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">"
-            "<title>TraceAnnotate annotation quality report</title>"
-            "<style>body{font:16px system-ui,sans-serif;margin:2rem;line-height:1.5}"
-            "table{border-collapse:collapse;width:100%}th,td{border:1px solid #aaa;padding:.5rem;text-align:left;vertical-align:top}"
-            "pre{white-space:pre-wrap;overflow-wrap:anywhere}td{overflow-wrap:anywhere}</style></head><body>"
-            "<h1>TraceAnnotate 标注文件机器质检</h1><p>状态：<strong>" + text(report["status"])
-            + "</strong></p><p>Run: " + text(report["run_id"]) + " · " + text(report["recorded_at"])
-            + "</p><p>" + text(report["scope"]) + "</p>"
-            "<p>仅比较所提交文件；没有核实独立人工标注身份，也没有观看视频证明动作或判定正确。"
+            "<meta name=\"color-scheme\" content=\"dark\"><title>TraceAnnotate 具身智能视频标注 QC 验收报告</title>"
+            "<style>" + REPORT_CSS + "</style></head><body><main><header>"
+            "<div class=\"brand\">TraceAnnotate</div><div class=\"eyebrow\">ANNOTATION QUALITY CONTROL</div>"
+            "<h1>具身智能视频标注 QC 验收报告</h1><p class=\"run\">Run: " + text(report["run_id"]) + " · " + text(report["recorded_at"])
+            + "</p></header>" + summary_markup(report) + agreement_markup(report) + "<p class=\"notice\">仅比较所提交文件；没有核实独立人工标注身份，也没有观看视频证明动作或判定正确。"
             "模拟/扰动对照只能作为软件测试。时间 Kappa 不等于语义准确率或真实黄金标准。</p>"
             "<p>结构检查与步骤对账分别报告。步骤差异可能真实记录视频中的执行错误，必须仲裁，不能据此断言标注错误。</p>"
-            "<h2>输入错误</h2><pre>" + text("\n".join(report.get("input_errors", [])) or "None")
-            + "</pre><h2>片段门禁</h2><table><thead><tr><th>Clip</th><th>任务描述</th><th>输入位置</th>"
-            "<th>结构检查</th><th>步骤对账</th><th>结果</th><th>原因</th></tr></thead><tbody>" + "".join(rows)
-            + "</tbody></table><h2>全部机器检查结果与输入摘要</h2><pre>" + text(payload)
-            + "</pre></body></html>\n")
+            "<details><summary>检查范围与输入错误</summary><pre>" + text(report["scope"]) + "\n" + text("\n".join(report.get("input_errors", [])) or "No input errors")
+            + "</pre></details><h2>片段门禁</h2><div class=\"table-wrap\"><table><caption>实际输入与机器检查结果</caption><thead><tr><th scope=\"col\">Clip</th><th scope=\"col\">任务描述</th><th scope=\"col\">输入位置</th>"
+            "<th scope=\"col\">结构检查</th><th scope=\"col\">步骤对账</th><th scope=\"col\">结果</th><th scope=\"col\">原因</th></tr></thead><tbody>" + "".join(rows)
+            + "</tbody></table></div><details><summary>全部机器检查结果与输入摘要 JSON</summary><pre>" + text(payload)
+            + "</pre></details><footer>TraceAnnotate · Local annotation review · scope recorded with each run</footer></main></body></html>\n")
 
 
 def generate_html_report(all_results, kappa_result=None, out_html_path="qc_report.html"):

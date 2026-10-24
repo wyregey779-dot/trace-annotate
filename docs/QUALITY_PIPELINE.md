@@ -45,6 +45,13 @@ Malformed JSONL lines, empty batches, duplicate clip identities, non-finite numb
 
 Reports label their scope and distinguish machine results from unverified video content. Simulated second-annotator fixtures are software regression data and cannot be presented as a real blind-labeling study or an official gold standard.
 
+The dark report dashboard calculates video-record counts and working/idle
+durations from the primary annotation input. Comparison files do not double
+the totals. Missing or structurally invalid inputs show unavailable time
+totals rather than a clean zero; pending procedure/comparison review remains
+visible even when the structure-error count is zero. See the [actual browser
+and report demonstration](DEMO_MEDIA.md).
+
 ## Windows launchers
 
 From a source checkout:

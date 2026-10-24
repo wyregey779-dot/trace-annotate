@@ -84,12 +84,17 @@ def validate_assets(dist: Path, expected_tag: str | None = None) -> list[Path]:
                      "docs/GENERAL_VIDEO_ANNOTATION.md",
                      "docs/MEDIA_COMPATIBILITY.md",
                      "docs/QUALITY_PIPELINE.md", "examples/annotations/quality-batch.json",
+                     "docs/DEMO_MEDIA.md", "docs/media/embodied-editor.png",
+                     "docs/media/embodied-qc.png", "docs/media/embodied-demo.mp4",
+                     "docs/media/traceannotate-cover.png",
+                     "docs/media/embodied-example.json", "docs/media/provenance.json",
                      "scripts/windows_qc.cmd", "scripts/windows_workbench.cmd",
                      "examples/run_quickstart.py", "examples/annotations/assembly.json",
                      "examples/annotations/general-video.json", "scripts/check_general_editor.py",
                      "scripts/check_editor_integrity.py",
                      "scripts/check_media_identity.py",
                      "scripts/check_media_admission.py", "scripts/check_prepared_editor.py",
+                     "scripts/check_embodied_editor.py",
                      "scripts/check_installed_package.py", "scripts/release_assets.py"):
             member = archive.extractfile(prefix + name)
             if member is None or member.read() != (root / name).read_bytes():

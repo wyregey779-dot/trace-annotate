@@ -1,0 +1,49 @@
+{
+  "recorded_at": "2026-10-24T08:09:13.183633+00:00",
+  "scope": "Actual isolated browser operations and CLI QC using synthetic media. No video semantic accuracy or independent-human certification.",
+  "browser": "153.0.8010.12",
+  "headless": true,
+  "native_file_picker_tested": false,
+  "input_sha256": "f1e09e012bfce29cb2e3c996443c753757f84ba40b6b1cd72d8e48ce4282c7f3",
+  "annotation_sha256": "3c5382672cc911140cd89c630c67c2209fec1eecdd8186de240ed9d9d6ee029f",
+  "duration_seconds": 12.0,
+  "source_recording_seconds": 19.08,
+  "playback_speed": 1.5899999999999999,
+  "audio": false,
+  "includes": "Actual edit/export, error and cancellation checks, zero-idle boundary and actual generated QC report; speed caption is a postproduction overlay.",
+  "cover_origin": "Promotional design, not a screenshot of the application.",
+  "source_sha256": {
+    "trace_annotate/embodied/ui/annotator.html": "e56b4aadb1341c2953ae905e3c0f57360eb057b076d6debd2071fee756c0ee70",
+    "trace_annotate/embodied/quality_pipeline.py": "3e89cf8738f8c74e67a80f70799b86e1f3ee7b4720d43d62e72c7a901463e653",
+    "trace_annotate/embodied/quality_report.py": "f5125d6c2bb2a52c2a0d22cef6fff0b064d4442d1768e2fd1cef741bf911fc23",
+    "trace_annotate/embodied/quality_io.py": "8fb9a697fb255106f3e0ceabe5863402bccbacdba9154a09077f0d2f284c5399",
+    "scripts/check_embodied_editor.py": "eaa2f0734305a13d911e328f47e038339a028a38d91649b99e05f1537b145360"
+  },
+  "assets": [
+    {
+      "path": "docs/media/embodied-editor.png",
+      "sha256": "4408868db6cb0dc44d65eb9faf951ea647c7cd417136aff9eb3e2ad1dad15b2a",
+      "bytes": 125728
+    },
+    {
+      "path": "docs/media/embodied-qc.png",
+      "sha256": "90390c79be0c8bc8d00702e83b9fb2fba48e777c170889f3bdacbeab26dfd5e1",
+      "bytes": 93598
+    },
+    {
+      "path": "docs/media/embodied-demo.mp4",
+      "sha256": "5c235888e139e756042efec19612f1ad286147441ce86499772ac4b632dc1948",
+      "bytes": 643661
+    },
+    {
+      "path": "docs/media/embodied-example.json",
+      "sha256": "3c5382672cc911140cd89c630c67c2209fec1eecdd8186de240ed9d9d6ee029f",
+      "bytes": 993
+    },
+    {
+      "path": "docs/media/traceannotate-cover.png",
+      "sha256": "2ce8eb87d2853bae050ddf4aab28144bfecebe03f84707bb5b90490e4373703c",
+      "bytes": 1271173
+    }
+  ]
+}

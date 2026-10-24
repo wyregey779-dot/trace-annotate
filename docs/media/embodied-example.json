@@ -1,0 +1,54 @@
+{
+  "clip": "synthetic-component-demo.mp4",
+  "duration": 12,
+  "text_description": "合成操作演示：定位组件、紧固、检查。仅用于软件验收，不代表独立人工标注真值。",
+  "clip_status": "正常",
+  "working": [
+    {
+      "start": 1,
+      "end": 3,
+      "step_number": 1,
+      "label": "position component",
+      "verdict": "对",
+      "error_type": null,
+      "evidence": ""
+    },
+    {
+      "start": 5,
+      "end": 7,
+      "step_number": 2,
+      "label": "fasten",
+      "verdict": "对",
+      "error_type": null,
+      "evidence": ""
+    },
+    {
+      "start": 9,
+      "end": 11,
+      "step_number": 3,
+      "label": "inspect",
+      "verdict": "对",
+      "error_type": null,
+      "evidence": ""
+    }
+  ],
+  "idle": [
+    {
+      "start": 0,
+      "end": 1
+    },
+    {
+      "start": 3,
+      "end": 5
+    },
+    {
+      "start": 7,
+      "end": 9
+    },
+    {
+      "start": 11,
+      "end": 12
+    }
+  ],
+  "expected_step_count": 3
+}

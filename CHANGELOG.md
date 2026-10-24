@@ -2,6 +2,10 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Add a dark embodied editor with task descriptions, independently declared step counts, segment labels, explicit pending verdicts, seconds-based seeking and a bottom segment list. Retain incomplete drafts and preserve current annotations when media replacement is cancelled or rejected.
+- Render actual QC totals in a dark, responsive report, keeping structural errors and pending review distinct. Add a reproducible synthetic-media browser recording, screenshots and regression workflow.
+- Quote CSV fields consistently across supported Python versions, including bare carriage returns and multiline values.
+- Reject unpaired Unicode surrogates in annotation fields and keys; encode complete text before publishing outputs so invalid strings cannot leave empty report files. Expose comparison-gate failures and sampling settings directly in QC reports.
 - Unify embodied QC, idle repair, procedure comparison and agreement behind the packaged quality pipeline and CLI. Reject invalid or incomplete batches and propagate failed/review gates through exit codes and newly created reports.
 - Validate working/idle/mid intervals and category-specific evidence; retain precise interval boundaries instead of rounding gaps into empty segments. Require declared media duration and independent expected-step coverage for complete pipeline checks.
 - Report incomplete comparison coverage, semantic conflicts and undefined single-class Kappa explicitly. Separate sampled time agreement from human independence and video-content truth.

@@ -91,6 +91,9 @@ jobs:
       - name: Prepare incompatible media and verify the actual project editor
         run: python scripts/check_prepared_editor.py --output output/prepared-editor-ci
 
+      - name: Record embodied editing and validate the actual downloaded annotations
+        run: python scripts/check_embodied_editor.py --output output/embodied-editor-ci
+
       - name: Upload browser acceptance evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -102,4 +105,5 @@ jobs:
             output/media-identity-ci
             output/media-admission-ci
             output/prepared-editor-ci
+            output/embodied-editor-ci
           if-no-files-found: warn
