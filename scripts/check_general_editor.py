@@ -212,6 +212,103 @@ def run_editor(output, channel=None):
             expect(page.locator("#status")).to_contain_text("失败", timeout=15000)
             assert save_json("ui-after-invalid-media.json") == fixture
             findings.append("Cancelled a video switch and rejected an undecodable synthetic file while preserving current work")
+
+            # Dense time intervals must not acquire wider pointer targets from
+            # button padding or borders and select their neighbours instead.
+            dense = copy.deepcopy(fixture)
+            dense["segments"] = []
+            short_start = 12 - 0.63 - 0.000001
+            boundaries = [round(short_start * i / 76, 6) for i in range(77)] + [11.999999, 12]
+            for index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), 1):
+                dense["segments"].append({
+                    "id": f"dense-{index:03d}", "start": start, "end": end,
+                    "label": f"Dense shot {index:03d}", "text": "Pointer and keyboard selection fixture",
+                    "tags": [], "track": "Dense shots", "review_status": "unreviewed",
+                })
+            for index, (start, end) in enumerate(((1, 3), (2, 4), (4, 5)), 1):
+                dense["segments"].append(dict(dense["segments"][0], id=f"overlap-{index}",
+                                               start=start, end=end, label=f"Overlap {index}", track="Overlap"))
+            dense_path = ROOT / "dense-timeline-fixture.json"
+            dense_path.write_text(json.dumps(dense, ensure_ascii=False, indent=2), encoding="utf-8")
+            page.set_viewport_size({"width": 1069, "height": 674})
+            page.locator("#jsonInput").set_input_files(dense_path)
+            expect(page.locator("#segmentCount")).to_contain_text("81 个片段")
+            assert page.locator(".lane").count() == 3
+            overlap_layout = page.evaluate("""() => {
+                const lane = id => document.querySelector('.clip[data-segment-id="' + id + '"]').parentElement;
+                return {overlappingSeparate: lane('overlap-1') !== lane('overlap-2'),
+                        adjacentReusesLane: lane('overlap-1') === lane('overlap-3')};
+            }""")
+            assert overlap_layout == {"overlappingSeparate": True, "adjacentReusesLane": True}
+            dense_clicks = []
+            for segment in dense["segments"][:77]:
+                target = page.locator('.clip[data-segment-id="' + segment["id"] + '"]')
+                target.scroll_into_view_if_needed()
+                geometry = target.evaluate("""el => {
+                    const rect = el.getBoundingClientRect();
+                    const lane = el.parentElement.getBoundingClientRect();
+                    const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+                    return {width: rect.width, laneWidth: lane.width - 2,
+                            centerHit: hit?.closest('button')?.dataset.segmentId};
+                }""")
+                assert geometry["centerHit"] == segment["id"], (segment["id"], geometry)
+                expected_width = (segment["end"] - segment["start"]) / 12 * geometry["laneWidth"]
+                assert abs(geometry["width"] - expected_width) < 0.05, (segment["id"], geometry)
+                target.click()
+                expect(page.locator("#segmentId")).to_have_text("ID：" + segment["id"])
+                expect(page.locator("#labelInput")).to_have_value(segment["label"])
+                assert float(page.locator("#startInput").input_value()) == segment["start"]
+                dense_clicks.append({"id": segment["id"], **geometry})
+            first_clip = page.locator('.clip[data-segment-id="dense-001"]')
+            second_clip = page.locator('.clip[data-segment-id="dense-002"]')
+            first_clip.focus()
+            page.keyboard.press("Enter")
+            expect(first_clip).to_be_focused()
+            expect(page.locator("#segmentId")).to_have_text("ID：dense-001")
+            page.keyboard.press("Tab")
+            expect(second_clip).to_be_focused()
+            assert second_clip.evaluate("el => el.matches(':focus-visible')")
+            page.keyboard.press("Space")
+            expect(second_clip).to_be_focused()
+            expect(page.locator("#segmentId")).to_have_text("ID：dense-002")
+            tiny_list_item = page.locator('.segment-item[data-segment-id="dense-078"]')
+            tiny_list_item.scroll_into_view_if_needed()
+            tiny_list_item.focus()
+            list_position = """el => {
+                const list = el.closest('ol'), item = el.getBoundingClientRect(), box = list.getBoundingClientRect();
+                return {scrollTop: list.scrollTop, visible: item.top >= box.top && item.bottom <= box.bottom};
+            }"""
+            list_before = tiny_list_item.evaluate(list_position)
+            assert list_before["visible"]
+            page.keyboard.press("Enter")
+            expect(tiny_list_item).to_be_focused()
+            expect(page.locator("#segmentId")).to_have_text("ID：dense-078")
+            list_after = tiny_list_item.evaluate(list_position)
+            assert list_after["visible"] and abs(list_after["scrollTop"] - list_before["scrollTop"]) <= 1
+            page.screenshot(path=str(ROOT / "dense-timeline.png"), full_page=True)
+            page.emulate_media(forced_colors="active")
+            expect(first_clip).to_have_css("outline-style", "solid")
+            expect(first_clip).to_have_css("outline-width", "1px")
+            expect(first_clip).to_have_css("outline-offset", "-1px")
+            first_clip.focus()
+            expect(first_clip).to_have_css("outline-width", "3px")
+            first_clip.press("Enter")
+            expect(first_clip).to_be_focused()
+            expect(page.locator("#segmentId")).to_have_text("ID：dense-001")
+            page.screenshot(path=str(ROOT / "dense-timeline-forced-colors.png"), full_page=True)
+            page.emulate_media(forced_colors="none")
+            assert save_json("ui-dense-timeline.json") == dense
+            (ROOT / "dense-timeline-results.json").write_text(json.dumps({
+                "status": "PASS", "viewport": {"width": 1069, "height": 674},
+                "pointer_checks": dense_clicks, "keyboard_enter_tab_space": True,
+                "tiny_segment_list_fallback": True, "overlap_lanes": 2,
+                "overlap_layout": overlap_layout, "focused_list_before": list_before, "focused_list_after": list_after,
+                "forced_colors_edges_and_focus": True, "download_equal": True,
+            }, indent=2), encoding="utf-8")
+            findings.append("Dense 78-shot track: 77 true interval widths/center hits and actual pointer selections; 0.63s interval; keyboard Enter/Tab/Space focus retained; subpixel segment selectable from list; same-track overlap stays in separate lanes")
+            page.locator("#jsonInput").set_input_files(fixture_path)
+            expect(page.locator("#segmentCount")).to_contain_text("4 个片段")
+            page.set_viewport_size({"width": 1440, "height": 1100})
             page.screenshot(path=str(ROOT / "general-workspace.png"), full_page=True)
             page.set_viewport_size({"width": 390, "height": 844})
             assert page.evaluate("() => document.documentElement.scrollWidth <= innerWidth + 1")

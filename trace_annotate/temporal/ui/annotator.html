@@ -44,8 +44,9 @@
     .timeline-tracks { display: grid; gap: .8rem; margin-block-start: .8rem; }
     .track-label { font-size: .82rem; margin-block-end: .25rem; overflow-wrap: anywhere; }
     .lane { position: relative; min-block-size: 2.5rem; background: #101c26; border: 1px solid #324658; border-radius: .3rem; margin-block-end: .2rem; }
-    .clip { position: absolute; inset-block: 2px; min-inline-size: 4px; min-block-size: 0; padding: .2rem .4rem; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border: 1px solid #92b6cf; background: #314f63; font-size: .75rem; text-align: start; }
-    .clip.reviewed { border-color: #8ed5bc; background: #294f46; }
+    /* Paint the edge inside the time interval: padding/borders must not widen a short clip over its neighbour. */
+    .clip { position: absolute; inset-block: 2px; min-inline-size: 0; min-block-size: 0; padding: .2rem 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border: 0; box-shadow: inset 0 0 0 1px #92b6cf; background: #314f63; font-size: .75rem; text-align: start; }
+    .clip.reviewed { box-shadow: inset 0 0 0 1px #8ed5bc; background: #294f46; }
     .clip[aria-pressed="true"] { box-shadow: inset 0 0 0 2px #e7f6ff; }
     .track-cursor { position: absolute; inset-block: 0; inline-size: 2px; background: #ffce82; pointer-events: none; }
     .empty { color: var(--muted); padding: 1rem; text-align: center; border: 1px dashed var(--line); border-radius: .4rem; }
@@ -85,7 +86,11 @@
     @media (max-width: 64rem) { .workspace { grid-template-columns: minmax(0, 1fr); } video { max-block-size: 60vh; } }
     @media (max-width: 40rem) { header, .workspace, footer, #status { padding-inline: .8rem; } .times { grid-template-columns: 1fr; } .segment-item { grid-template-columns: minmax(0, 1fr); } }
     @media (pointer: coarse) { button, .file-label, input, select { min-block-size: 3rem; } .clip { min-block-size: 0; } .lane { min-block-size: 3rem; } }
-    @media (forced-colors: active) { .clip[aria-pressed="true"], .segment-item[aria-pressed="true"] { outline: 2px solid Highlight; } }
+    @media (forced-colors: active) {
+      .clip { outline: 1px solid ButtonText; outline-offset: -1px; }
+      .clip[aria-pressed="true"], .segment-item[aria-pressed="true"] { outline: 2px solid Highlight; }
+      .clip:focus-visible { outline: 3px solid Highlight; outline-offset: 3px; }
+    }
   </style>
 </head>
 <body>
@@ -119,7 +124,7 @@
       <section class="panel timeline-section">
         <div class="seek-label"><h2>多轨时间线</h2><span class="small" id="segmentCount">0 个片段</span></div>
         <label for="seek" class="hint">播放位置（秒）</label><input id="seek" name="seek" type="range" min="0" max="1" step="0.001" value="0" disabled>
-        <p class="hint">同一轨道的重叠片段分行显示。空白时段保持空白；不会自动生成 Idle。</p>
+        <p class="hint">同一轨道的重叠片段分行显示。空白时段保持空白；不会自动生成 Idle。过短或密集的片段可通过下方片段清单选择。</p>
         <div id="timelineTracks" class="timeline-tracks"><p class="empty">加载视频后，设置起止时间并保存第一个片段。</p></div>
       </section>
       <section class="panel list-panel">
@@ -469,6 +474,9 @@
       scheduleDraft();
     }
     function render() {
+      const focused = document.activeElement;
+      const focusId = focused?.matches('.clip, .segment-item') ? focused.dataset.segmentId : null;
+      const focusClass = focused?.classList.contains('clip') ? 'clip' : 'segment-item';
       const tracks = $('timelineTracks');
       const list = $('segmentList');
       const names = $('trackNames');
@@ -485,7 +493,7 @@
         if (!groups.has(segment.track)) groups.set(segment.track, []);
         groups.get(segment.track).push(segment);
         const li = document.createElement('li');
-        const button = document.createElement('button'); button.type = 'button'; button.className = 'segment-item'; button.setAttribute('aria-pressed', String(segment.id === selectedId)); button.disabled = !videoReady;
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'segment-item'; button.dataset.segmentId = segment.id; button.setAttribute('aria-pressed', String(segment.id === selectedId)); button.disabled = !videoReady;
         const title = document.createElement('span'); title.className = 'segment-title'; title.textContent = segment.label;
         const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = segment.review_status === 'reviewed' ? '已复核' : '待复核';
         const detail = document.createElement('span'); detail.className = 'segment-detail'; detail.textContent = segment.track + ' · ' + formatTime(segment.start) + ' → ' + formatTime(segment.end) + '\n' + (segment.text || '无描述') + '\nID：' + segment.id;
@@ -505,7 +513,7 @@
             const lane = document.createElement('div'); lane.className = 'lane'; section.append(lane); lanes.push(lane); ends.push(0);
           }
           ends[laneIndex] = segment.end;
-          const button = document.createElement('button'); button.type = 'button'; button.className = 'clip' + (segment.review_status === 'reviewed' ? ' reviewed' : '');
+          const button = document.createElement('button'); button.type = 'button'; button.className = 'clip' + (segment.review_status === 'reviewed' ? ' reviewed' : ''); button.dataset.segmentId = segment.id;
           button.style.left = segment.start / annotation.duration * 100 + '%'; button.style.width = (segment.end - segment.start) / annotation.duration * 100 + '%';
           button.textContent = segment.label; button.title = segment.label + ' · ' + formatTime(segment.start) + ' → ' + formatTime(segment.end); button.setAttribute('aria-label', track + '：' + button.title); button.setAttribute('aria-pressed', String(segment.id === selectedId)); button.disabled = !videoReady;
           button.addEventListener('click', () => selectSegment(segment.id)); lanes[laneIndex].append(button);
@@ -517,6 +525,7 @@
       if (!segments.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = '尚无片段。设置起点、终点和标签后，点击“保存片段”。'; tracks.append(empty); }
       $('metadataPreview').textContent = annotation && Object.hasOwn(annotation, 'metadata') ? JSON.stringify(annotation.metadata, null, 2) : '未提供 metadata';
       updateControls(); updateTime();
+      if (focusId !== null) Array.from(document.querySelectorAll('.' + focusClass)).find(button => button.dataset.segmentId === focusId)?.focus({ preventScroll: true });
     }
     function newId() {
       let id;
