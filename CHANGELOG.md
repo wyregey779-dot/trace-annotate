@@ -2,6 +2,10 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Add an experimental persistent workspace with cross-platform writer locking, real SQLite transactions, immutable verified objects, revision-bound receipts and exact decoded media maps. Preserve failed intakes and keep repeated-content tasks independent.
+- Add durable candidate jobs with bounded dispatch, leases, cancellation fencing, pause/retry and process-crash recovery. Expose batch integrity verification in the CLI and authenticated controls through the loopback API; semantic auto-annotation and the multi-video workbench remain unfinished.
+- Reject legacy experimental workspace storage until explicit migration, unsafe exports, missing object references, malformed times and inconsistent task identities. Run the existing CI matrix on feature branches as well as main/master so development pushes receive actual remote checks.
+
 - Distinguish unavailable final-frame duration metadata from ambiguous PTS mapping. Keep old-probe rejection explicit with a toolchain upgrade path; CI uses a fixed, SHA-256-verified FFmpeg build to execute the full media regressions without estimating timing.
 - Verify explicit demux-packet durations when older FFprobe versions omit the decoded final-frame duration. Require a unique packet/frame PTS mapping, record the duration source and retain rejection of ambiguous endpoints.
 - Require FFmpeg/ffprobe in every CI test environment so media regressions execute. Synchronize the browser seek-control test with completed segment selection before issuing Home/End inputs.

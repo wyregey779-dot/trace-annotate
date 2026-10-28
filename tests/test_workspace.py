@@ -145,6 +145,9 @@ def test_same_content_rename_relates_by_hash(project: Path, tmp_path: Path):
     r = s2.import_source(renamed, display_name="renamed.mp4")
     # same bytes -> same media_id identity
     assert r["media_id"] == media_id
+    assert r["task_id"] != tid
+    assert s2.get_task(r["task_id"])["revision"] == 0
+    assert len(s2.list_intakes()) == 2
     s2.close()
 
 
@@ -152,4 +155,57 @@ def test_missing_source_rejected(project: Path):
     s = reopen(project)
     with pytest.raises(NotFound):
         s.import_source(project / "nope.mp4")
+    failed = s.list_intakes()[-1]
+    assert failed["state"] == "failed"
+    assert failed["source_sha256"] is None
+    assert failed["task_id"] is None
     s.close()
+
+
+def test_deleted_frame_map_registration_blocks_reopen(project):
+    s = reopen(project)
+    media = s.get_media(s.list_tasks()[0]["media_id"])
+    s.conn.execute("DELETE FROM artifacts WHERE id=?", (media["frame_map_artifact"],))
+    s.close()
+    again = WorkspaceStore(project)
+    with pytest.raises(WorkspaceError) as error:
+        again.open()
+    assert error.value.code == "RECOVERY_REQUIRED"
+    assert again.lock._handle is None
+
+
+def test_interrupted_import_is_failed_on_reopen(project):
+    s = reopen(project)
+    s.conn.execute("INSERT INTO intakes(id,group_id,state,created_at,template_id,template_version) "
+                   "VALUES('int-interrupted','grp-test','running','test','generic-segment',1)")
+    s.close()
+    s = reopen(project)
+    try:
+        record = next(item for item in s.list_intakes() if item["id"] == "int-interrupted")
+        assert record["state"] == "failed" and record["error_code"] == "INTERRUPTED"
+        assert record["task_id"] is None
+    finally:
+        s.close()
+
+
+def test_changed_task_digest_blocks_reopen(project):
+    s = reopen(project)
+    s.conn.execute("UPDATE task_revisions SET body=json_set(body,'$.annotations',json('[]'),'$.content_sha256',?)", ("b" * 64,))
+    s.close()
+    s = WorkspaceStore(project)
+    with pytest.raises(WorkspaceError) as error:
+        s.open()
+    assert error.value.code == "RECOVERY_REQUIRED"
+
+
+def test_unknown_storage_version_is_preserved(project):
+    s = reopen(project)
+    s.conn.execute("UPDATE meta SET value='999' WHERE key='storage_version'")
+    s.close()
+    s = WorkspaceStore(project)
+    with pytest.raises(WorkspaceError) as error:
+        s.open()
+    assert error.value.code == "WORKSPACE_MIGRATION_REQUIRED"
+    import sqlite3
+    with sqlite3.connect(project / "workspace.sqlite3") as connection:
+        assert connection.execute("SELECT value FROM meta WHERE key='storage_version'").fetchone()[0] == "999"

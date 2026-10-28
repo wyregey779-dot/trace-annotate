@@ -300,6 +300,9 @@ def main() -> None:
 
     args = parser.parse_args()
     if hasattr(args, "func"):
+        if args.command == "workspace":
+            from .workspace.commands import run_workspace_command
+            raise SystemExit(run_workspace_command(args))
         if args.command in {"embodied-idle", "embodied-diff", "embodied-kappa", "embodied-validate", "embodied-qc", "embodied-pipeline", "embodied-export"}:
             raise SystemExit(guarded(args.func, args))
         args.func(args)

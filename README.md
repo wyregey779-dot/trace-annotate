@@ -30,6 +30,8 @@ New browser documents use schema v2 and bind annotations/drafts to the full medi
 
 For local formats the browser cannot play directly, use `video-open SOURCE -o NEW_PROJECT`. Local FFmpeg/ffprobe create an H.264/AAC playback copy, verify decoded frame correspondence and audio offsets, retain source identity, and open the editor through a read-only loopback server. Resume with `video-ui --project PROJECT` and import your downloaded JSON. HDR previews require explicit `--tone-map-hdr`; corrupt, encrypted or unverifiable inputs fail clearly. See the [media compatibility guide](docs/MEDIA_COMPATIBILITY.md).
 
+The feature branch also contains a [persistent workspace development slice](docs/WORKSPACE_DEVELOPMENT.md): verified multi-video admission, atomic annotation commands, durable candidate jobs and an authenticated local API. Its `verify-media` batch processor checks media integrity; it does not infer video labels. The workspace browser page is currently a snapshot viewer. The full batch editing workbench remains under development.
+
 ## Start with a complete example
 
 The quickstart takes a synthetic annotation document through idle calculation, validation, step comparison, an HTML report and SRT export. It requires no video file, model weights or API key.
