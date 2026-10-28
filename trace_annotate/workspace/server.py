@@ -23,6 +23,7 @@ from .http_media import (MAX_UPLOAD_BYTES, UPLOAD_TIMEOUT_SECONDS, STREAM_CHUNK_
                          _identity, receive_and_import, resolve_media_object)
 from ..temporal.project_server import _byte_range
 from .store import _safe
+from .reporting import export_task, task_report
 
 MAX_COMMAND_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 10
@@ -312,16 +313,24 @@ class _Handler(BaseHTTPRequestHandler):
             raise NotFound("NOT_FOUND", "Unknown route")
         self._query = {}
         if parsed.query:
-            if (self.command != "GET" or not re.fullmatch(
-                    r"/api/v1/projects/[A-Za-z0-9_-]+/media/[A-Za-z0-9_-]+/frames", parsed.path)
-                    or len(parsed.query) > 160):
+            frame_query = re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/media/[A-Za-z0-9_-]+/frames", parsed.path)
+            export_query = re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/tasks/[A-Za-z0-9_-]+/export", parsed.path)
+            if (self.command != "GET" or not (frame_query or export_query)
+                    or len(parsed.query) > (160 if frame_query else 4096)):
                 raise NotFound("NOT_FOUND", "Unknown route")
             try:
-                self._query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True)
-                if set(self._query) - {"offset", "limit"} or any(len(value) != 1 for value in self._query.values()):
-                    raise ValueError("Unexpected pagination parameter")
-            except ValueError as exc:
-                raise BadRequest("INVALID_QUERY", "Invalid pagination parameters") from exc
+                if re.search(r"%(?![0-9a-fA-F]{2})", parsed.query):
+                    raise ValueError("Malformed percent escape")
+                self._query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True, errors="strict")
+                allowed = {"offset", "limit"} if frame_query else {"format", "track"}
+                if set(self._query) - allowed or any(len(value) != 1 for value in self._query.values()):
+                    raise ValueError("Unexpected query parameter")
+                if export_query:
+                    for value in self._query.values():
+                        if any(ord(char) < 32 or ord(char) == 127 for char in value[0]):
+                            raise ValueError("Unsupported query control character")
+            except (ValueError, UnicodeError) as exc:
+                raise BadRequest("INVALID_QUERY", "Invalid query parameters") from exc
         return parsed.path
 
     def _pagination(self):
@@ -471,6 +480,22 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, snapshot)
             return
         if self.command == "GET":
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] in {"report", "export"}:
+                _require_id(parts[1], "task_id")
+                if parts[2] == "report":
+                    self._send_json(200, task_report(store, parts[1]))
+                else:
+                    if "format" not in self._query:
+                        raise BadRequest("INVALID_QUERY", "Task export requires an explicit format")
+                    item = export_task(store, parts[1], self._query["format"][0],
+                                       track=self._query.get("track", [None])[0])
+                    self._extra_headers = [("Content-Disposition", f'attachment; filename="{item["filename"]}"'),
+                                           ("X-TraceAnnotate-Task-Revision", str(item["binding"]["revision"])),
+                                           ("X-TraceAnnotate-Content-SHA256", item["binding"]["content_sha256"]),
+                                           ("X-TraceAnnotate-Export-Losses", item["losses"])]
+                    self._headers(200, len(item["data"]), item["content_type"])
+                    self.wfile.write(item["data"])
+                return
             if len(parts) == 3 and parts[0] == "media" and parts[2] == "frames":
                 _require_id(parts[1], "media_id")
                 offset, limit = self._pagination()
