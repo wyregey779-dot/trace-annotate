@@ -35,7 +35,8 @@ else:
     import trace_annotate
     package = Path(trace_annotate.__file__).resolve().parent
     roots = {Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "platlib")}
-    if SOURCE in package.parents or not any(root in package.parents for root in roots):
+    source_package = (SOURCE / "trace_annotate").resolve()
+    if source_package in [package, *package.parents] or not any(root in package.parents for root in roots):
         raise RuntimeError("Installed acceptance must load trace_annotate from target site-packages")
     INSTALLED_WHEEL = INSTALLED_WHEEL.expanduser().resolve(strict=True)
     expected = {}

@@ -130,11 +130,11 @@ jobs:
         run: |
           python -m pip install build
           python -m build --outdir output/workspace-dist
-          python -m venv output/workspace-wheel-env
-          output/workspace-wheel-env/bin/python -m pip install output/workspace-dist/*.whl playwright
+          python -m venv "${{ runner.temp }}/workspace-wheel-env"
+          "${{ runner.temp }}/workspace-wheel-env/bin/python" -m pip install output/workspace-dist/*.whl playwright
           candidate_wheels=(output/workspace-dist/*.whl)
           test "${#candidate_wheels[@]}" -eq 1
-          output/workspace-wheel-env/bin/python -I scripts/check_workspace_editor.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-workspace-ci
+          "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_editor.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-workspace-ci
 
       - name: Upload browser acceptance evidence
         if: always()
