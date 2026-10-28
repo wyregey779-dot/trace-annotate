@@ -610,7 +610,12 @@ class WorkspaceStore:
 
     def _apply_operation(self, annotations: List[Dict[str, Any]], operation: str,
                          payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        required = {"add_annotation": {"annotation"}, "update_annotation": {"annotation_id", "changes"}, "delete_annotation": {"annotation_id"}}
+        required = {
+            "add_annotation": {"annotation"},
+            "update_annotation": {"annotation_id", "changes"},
+            "delete_annotation": {"annotation_id"},
+            "replace_annotations": {"annotations"},
+        }
         if operation not in required:
             raise SchemaInvalid("UNSUPPORTED_OPERATION", "Unsupported annotation operation")
         if set(payload) != required[operation]:
@@ -623,6 +628,19 @@ class WorkspaceStore:
             if any(a["id"] == ann["id"] for a in annotations):
                 raise Conflict("ID_EXISTS", f"Annotation {ann['id']} already exists")
             annotations.append(ann)
+        elif operation == "replace_annotations":
+            new_list = payload["annotations"]
+            if not isinstance(new_list, list):
+                raise SchemaInvalid("SCHEMA_INVALID", "Annotations must be a list")
+            seen_ids = set()
+            for item in new_list:
+                if not isinstance(item, dict):
+                    raise SchemaInvalid("SCHEMA_INVALID", "Annotation must be an object")
+                aid = S.require_id(item.get("id"), "annotation.id")
+                if aid in seen_ids:
+                    raise Conflict("ID_EXISTS", f"Duplicate annotation id {aid}")
+                seen_ids.add(aid)
+            annotations = [dict(a) for a in new_list]
         elif operation == "update_annotation":
             aid = payload["annotation_id"]
             changes = payload["changes"]
@@ -649,7 +667,7 @@ class WorkspaceStore:
         return annotations
 
     def _validate_annotation(self, ann, media, template):
-        allowed = {"id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids", "provenance", "start", "end", "at", "legacy_id"}
+        allowed = {"id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids", "provenance", "start", "end", "at", "legacy_id", "review_status"}
         if set(ann) - allowed:
             raise SchemaInvalid("SCHEMA_INVALID", "Annotation contains unknown fields")
         S.require_id(ann.get("id"))
@@ -670,6 +688,11 @@ class WorkspaceStore:
             raise SchemaInvalid("SCHEMA_INVALID", "Invalid text or track")
         if not isinstance(ann["tags"], list) or any(not isinstance(tag, str) for tag in ann["tags"]):
             raise SchemaInvalid("SCHEMA_INVALID", "Tags must be strings")
+        ann.setdefault("review_status", "unreviewed")
+        if ann["review_status"] not in {"unreviewed", "reviewed"}:
+            raise SchemaInvalid("SCHEMA_INVALID", "review_status must be 'unreviewed' or 'reviewed'")
+        if "legacy_id" in ann and (not isinstance(ann["legacy_id"], str) or not ann["legacy_id"].strip()):
+            raise SchemaInvalid("SCHEMA_INVALID", "legacy_id must be a nonempty string")
         if ann["evidence_ids"] != [] or ann["attributes"] != {}:
             raise SchemaInvalid("UNSUPPORTED_OPERATION", "Evidence and custom attributes need their own admission workflow")
         provenance = ann["provenance"]

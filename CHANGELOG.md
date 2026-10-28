@@ -2,6 +2,13 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Add progressive enhancements to the unified workspace editor while preserving classic tools:
+  - Multi-track visual timeline with sub-lane interval scheduling for overlapping segment clips, review state markers, and interactive click-to-seek navigation.
+  - Task-isolated undo and redo history stack (Undo/Redo buttons, Ctrl+Z, Ctrl+Y/Ctrl+Shift+Z) backed by server replace_annotations commands.
+  - Form-level manual review toggle with strict automatic invalidation on any content or timing modification.
+  - Bidirectional lossless adapter and endpoints (export format=temporal, import-temporal) for seamless round-trips with temporal v1/v2 schema documents, preserving legacy IDs, tracks, tags, text, and review states.
+  - Emergency in-memory draft rescue export to download uncommitted drafts and task states as local JSON snapshots.
+
 - Restore continuous playback after selected-segment playback ends. Keep explicit play/pause, speed, segment loop and exact-frame controls; add actual button and task-switch browser regressions.
 - Link the original general and embodied editors from the experimental batch workbench. Serve unchanged packaged editors with page-specific Blob/Worker policies and script nonces, retaining existing file workflows and API authorization.
 - Keep exact derived coverage statistics within a separate computation budget, report budget exhaustion explicitly and preserve original task JSON/CSV exports. Accept stored multiline track names when selecting SRT tracks; add parsed export round-trip and read-only consistency tests.

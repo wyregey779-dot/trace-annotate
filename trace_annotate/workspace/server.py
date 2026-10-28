@@ -90,6 +90,7 @@ def _command(body):
         "add_annotation": {"annotation"},
         "update_annotation": {"annotation_id", "changes"},
         "delete_annotation": {"annotation_id"},
+        "replace_annotations": {"annotations"},
     }.get(body["operation"])
     if required is None:
         raise SchemaInvalid("UNSUPPORTED_OPERATION", "Operation is not implemented in this slice")
@@ -100,6 +101,8 @@ def _command(body):
     for field in ("annotation", "changes"):
         if field in payload and not isinstance(payload[field], dict):
             raise SchemaInvalid("SCHEMA_INVALID", f"{field} must be an object")
+    if "annotations" in payload and not isinstance(payload["annotations"], list):
+        raise SchemaInvalid("SCHEMA_INVALID", "annotations must be a list")
     return body
 
 
@@ -543,8 +546,9 @@ class _Handler(BaseHTTPRequestHandler):
                     raise NotFound("NOT_FOUND", "Unknown route")
         elif self.command == "POST":
             task_command = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "commands"
+            task_import_temporal = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "import-temporal"
             control = len(parts) == 3 and parts[0] in ("batches", "jobs") and parts[2] == "control"
-            if not (task_command or control or parts == ["batches"]):
+            if not (task_command or task_import_temporal or control or parts == ["batches"]):
                 raise NotFound("NOT_FOUND", "Unknown route")
             if len(parts) > 1:
                 _require_id(parts[1], "resource_id")
@@ -553,6 +557,25 @@ class _Handler(BaseHTTPRequestHandler):
                 if task_command:
                     body = _command(body)
                     result = store.apply_task_command(task_id=parts[1], request_body=raw, **body)["response"]
+                elif task_import_temporal:
+                    task = store.get_task(parts[1])
+                    media = store.get_media(task["media_id"])
+                    doc = body.get("document", body)
+                    from .legacy_adapter import import_temporal_document
+                    annotations = import_temporal_document(doc, media)
+                    cmd_id = body.get("command_id") or ("cmd-imp-" + secrets.token_hex(8))
+                    exp_rev = body.get("expected_revision", task["revision"])
+                    exp_sha = body.get("expected_sha256", task["content_sha256"])
+                    result = store.apply_task_command(
+                        command_id=cmd_id,
+                        task_id=task["id"],
+                        expected_revision=exp_rev,
+                        expected_sha256=exp_sha,
+                        operation="replace_annotations",
+                        payload={"annotations": annotations},
+                        request_body=raw,
+                    )["response"]
+                    result["imported_count"] = len(annotations)
                 elif control:
                     body = _fields(body, {"command_id", "action"})
                     if not isinstance(body["action"], str):

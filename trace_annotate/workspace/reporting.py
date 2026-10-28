@@ -271,7 +271,7 @@ def _srt(task, track, track_id=None):
 
 
 def export_task(store, task_id, format, *, track=None, track_id=None):
-    if format not in {"json", "csv", "srt"}:
+    if format not in {"json", "csv", "srt", "temporal"}:
         raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT", "Supported task exports are json, csv and srt")
     if track is not None and track_id is not None:
         raise SchemaInvalid("TRACK_SELECTION_CONFLICT", "Select a track by either name or ID, not both")
@@ -295,10 +295,17 @@ def export_task(store, task_id, format, *, track=None, track_id=None):
             data = _csv(task).encode("utf-8-sig")
             content_type = "text/csv; charset=utf-8"
             losses = "Spreadsheet text is formula-escaped; annotation_json preserves originals; no media or review history."
+        elif format == "temporal":
+            from .legacy_adapter import export_temporal_document
+            doc = export_temporal_document(task, media, schema_version=2)
+            data = json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
+            content_type = "application/json; charset=utf-8"
+            losses = "Lossless temporal v2 projection: preserves segments, labels, tracks, review statuses, metadata; excludes workspace-only revisions."
         else:
             data = _srt(task, track, track_id).encode("utf-8")
             content_type = "application/x-subrip; charset=utf-8"
             losses = ("One segment track; round-half-up milliseconds; text else label; excludes events, whole-clip labels, "
                       "IDs, tags, anchors, metadata and review history; overlapping cues retained.")
-    return {"data": data, "content_type": content_type, "filename": f"TraceAnnotate-{task_id}-r{binding['revision']}.{format}",
+    ext = "temporal.json" if format == "temporal" else format
+    return {"data": data, "content_type": content_type, "filename": f"TraceAnnotate-{task_id}-r{binding['revision']}.{ext}",
             "binding": binding, "losses": losses}
