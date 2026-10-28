@@ -94,7 +94,8 @@ def validate_assets(dist: Path, expected_tag: str | None = None) -> list[Path]:
                      "scripts/check_editor_integrity.py",
                      "scripts/check_media_identity.py",
                      "scripts/check_media_admission.py", "scripts/check_prepared_editor.py",
-                     "scripts/check_embodied_editor.py",
+                     "scripts/check_embodied_editor.py", "scripts/check_workspace_editor.py",
+                     "docs/WORKSPACE_DEVELOPMENT.md",
                      "scripts/check_installed_package.py", "scripts/release_assets.py"):
             member = archive.extractfile(prefix + name)
             if member is None or member.read() != (root / name).read_bytes():

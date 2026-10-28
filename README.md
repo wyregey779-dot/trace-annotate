@@ -30,7 +30,7 @@ New browser documents use schema v2 and bind annotations/drafts to the full medi
 
 For local formats the browser cannot play directly, use `video-open SOURCE -o NEW_PROJECT`. Local FFmpeg/ffprobe create an H.264/AAC playback copy, verify decoded frame correspondence and audio offsets, retain source identity, and open the editor through a read-only loopback server. Resume with `video-ui --project PROJECT` and import your downloaded JSON. HDR previews require explicit `--tone-map-hdr`; corrupt, encrypted or unverifiable inputs fail clearly. See the [media compatibility guide](docs/MEDIA_COMPATIBILITY.md).
 
-The feature branch also contains a [persistent workspace development slice](docs/WORKSPACE_DEVELOPMENT.md): verified multi-video admission, atomic annotation commands, durable candidate jobs and an authenticated local API. Its `verify-media` batch processor checks media integrity; it does not infer video labels. The workspace browser page is currently a snapshot viewer. The full batch editing workbench remains under development.
+The feature branch also contains a [persistent multi-video workspace](docs/WORKSPACE_DEVELOPMENT.md). Run `workspace init --project NEW_DIRECTORY`, then `workspace serve --project NEW_DIRECTORY` to import multiple videos, edit and save manual segments, select exact decoded frames, reopen saved tasks and download a development snapshot. Revisions and task conflicts are checked on the server. Its `verify-media` batch processor checks media integrity; it does not infer video labels. Bulk edits, review/evidence workflows and portable project import remain under development.
 
 ## Start with a complete example
 

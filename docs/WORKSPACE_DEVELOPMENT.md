@@ -1,8 +1,9 @@
 # Persistent workspace development slice
 
 This is part of `1.1.0.dev0`, on `feat/general-video-annotation`. It is not a
-finished batch annotation product or a release candidate. The existing
-`video-ui` and embodied editor remain the available annotation interfaces.
+finished batch annotation product or a release candidate. `workspace serve`
+opens the persistent multi-video segment editor. The existing `video-ui` and
+embodied editor remain separate, compatible annotation interfaces.
 
 ## What this slice implements
 
@@ -22,7 +23,11 @@ finished batch annotation product or a release candidate. The existing
   separate candidate artifacts and never overwrite manual annotations.
 - A loopback HTTP API with Host/Origin checks, a per-instance capability header,
   bounded JSON, revision conflicts and persistent command receipts. Its browser
-  page is currently a JSON snapshot viewer, not the W04 editing workbench.
+  workbench lists independent tasks, plays admitted media, edits manual segments,
+  handles unsaved changes/conflicts, and downloads a development snapshot.
+- Exact frame navigation uses a paginated decoded index and locally decoded PNG
+  images. Saved frame anchors must match the admitted map's index, source PTS,
+  proxy PTS and rational time. Ordinary playback navigation remains second-based.
 - `verify-media` is a real queue processor that rehashes the admitted playback
   and frame-map objects and checks their frame/time correspondence. It does not
   infer labels or establish annotation correctness.
@@ -75,12 +80,57 @@ use that server's authenticated control endpoint while it owns the project.
 `tasks/{id}/commands`, `commands/{id}`, `intakes`, `batches`, `batches/{id}`,
 `batches/{id}/control`, `jobs/{id}` and `jobs/{id}/control` as implemented in
 `workspace/server.py`. Reads require `X-TraceAnnotate-Token`; writes also require
-the exact local Origin and JSON Content-Type. Do not publish the token.
+the exact local Origin and JSON Content-Type. Do not publish the token. The
+bootstrap document also creates an HttpOnly SameSite=Strict cookie scoped to
+media resources, so native video/image requests do not put a token in a URL.
 
 Only add/update/delete manual annotations are available in this slice. Unknown
-fields, out-of-range times, unsupported evidence, frame anchors and custom
+fields, out-of-range times, unsupported evidence and custom
 attributes fail explicitly. The server does not accept arbitrary local file
 paths or run unknown queued processors automatically.
+
+## Browser workflow
+
+After initializing a new workspace, run:
+
+```powershell
+trace-annotate workspace serve --project D:\TraceAnnotateProjects\sample
+```
+
+Select multiple files in the workbench. Each selected file is uploaded and
+fully prepared in order; a rejected file does not stop unrelated files. The
+development upload limit is 512 MiB per file. Preparation is synchronous per
+file, not the complete durable asynchronous intake protocol. Interrupted uploads
+are not admitted; completed but invalid media stays in the intake error ledger.
+If the connection is lost during admission, refresh the task/intake list before
+retrying: an import does not have the task command's idempotency guarantee.
+
+Select a task, enter a label and interval, then save. An unchanged time field
+retains its original rational value and frame anchor. Editing a time manually
+removes that field's anchor. Another tab's save produces a revision conflict;
+the editor keeps the draft for comparison rather than overwriting the newer
+revision. Unsaved input is guarded during navigation but is not a durable draft;
+save before closing the browser. A committed save is recovered from SQLite after
+the browser or service reopens.
+
+Use the exact-frame view for frame boundaries. Frames are zero-based, and a
+segment is `[start,end)`: selecting frame N as its end excludes frame N. Use
+the actual video endpoint to include the last frame's entire hold; no imaginary
+end frame is created. Frame images are the compatibility proxy's decoded RGB
+pixels, not original-lossless evidence. The decoder selects by display index
+from the beginning, has a 120-second timeout and one concurrent decode slot.
+The image cache is limited to 32 images/256 MiB; high-resolution/long-video
+latency has not been qualified. Source media is never rewritten.
+
+Normal service shutdown requests cancellation of in-flight media admission and
+waits for request workers before closing SQLite. Successful frame cache images
+owned by that service are removed on normal close; diagnostic logs and interrupted
+session remnants are retained. This is not a disk quota or automatic recovery
+cleanup policy for crashes.
+
+The snapshot download contains saved revisions and the intake ledger, not the
+unsaved form. It contains no media bytes and cannot yet be reimported as a
+portable project. Keep the workspace directory to resume saved work.
 
 ## Data and compatibility boundaries
 
@@ -112,11 +162,15 @@ terminations around commit, competing saves, cancelled/stale workers, interrupte
 imports, corrupt/missing objects, same-content task isolation, actual HTTP
 requests and real FFmpeg CFR/VFR/audio-offset/rotation fixtures. These establish
 the stated engineering behavior; they do not establish arbitrary filesystem
-power-loss safety, semantic video accuracy or browser frame-accurate editing.
+power-loss safety or semantic video accuracy. The workbench browser regression
+checks actual displayed pixel markers for encoded CFR/VFR/audio-offset fixtures,
+then verifies saved anchors, reload, task isolation and revision conflicts.
 
-The next slice must integrate the multi-video browser workbench, mapped-frame
-navigation, evidence and review history, candidate adoption, complete-partition
-QC, migration and portable exports. Intake scheduling is still synchronous in
-the CLI; its cancellation/retry protocol is not yet unified with task jobs.
+The next slice must integrate evidence and review history, candidate adoption,
+complete-partition QC, bulk edits, migration and portable exports. Intake
+scheduling is still synchronous; its cancellation/retry protocol is not yet
+unified with task jobs. A mapped anchor establishes a frame reference, not a
+reviewed or portable evidence artifact. The complete W04/W09 acceptance matrix
+(including real-media scale/performance and release qualification) remains open.
 Real sample reference labels, quality thresholds, performance limits and the
 release acceptance matrix still require measured validation before release.

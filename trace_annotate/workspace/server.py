@@ -1,22 +1,28 @@
 """Loopback HTTP access to one opened, revisioned workspace.
 
-The initial page is a snapshot viewer. It serves no arbitrary files and accepts
-no filesystem paths. Write requests require an exact origin and private header.
+The editor serves only registered media and accepts uploads as bytes, never
+filesystem paths. Write requests require an exact origin and private header.
 """
 from __future__ import annotations
 import json
 import math
+import os
 import re
 import secrets
 import socket
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 import webbrowser
 
-from .errors import BadRequest, LimitExceeded, NotFound, SchemaInvalid, WorkspaceError
+from .errors import BadRequest, Conflict, LimitExceeded, NotFound, SchemaInvalid, WorkspaceError
 from .queue import DurableQueue
 from .store import WorkspaceStore
+from .http_media import (MAX_UPLOAD_BYTES, UPLOAD_TIMEOUT_SECONDS, STREAM_CHUNK_BYTES,
+                         _identity, receive_and_import, resolve_media_object)
+from ..temporal.project_server import _byte_range
+from .store import _safe
 
 MAX_COMMAND_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 10
@@ -27,26 +33,7 @@ TOKEN_HEADER = "X-TraceAnnotate-Token"
 ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,95}")
 HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
 
-EDITOR_HTML = """<!doctype html><meta charset=utf-8><title>TraceAnnotate Workspace</title>
-<body style=font-family:system-ui;padding:16px>
-<h2>TraceAnnotate Workspace</h2><pre id=out>loading…</pre>
-<script nonce=__NONCE__>
-const token=__TOKEN__;
-async function j(path, opts={}) {
-  const headers=new Headers(opts.headers);
-  headers.set('X-TraceAnnotate-Token',token);
-  const r=await fetch(path,{...opts,headers,mode:'same-origin',cache:'no-store'});
-  return {status:r.status, body: await r.json().catch(()=>null)};
-}
-(async()=>{
-  try {
-    const s=await j('/api/v1/projects/current/snapshot');
-    document.getElementById('out').textContent=JSON.stringify(s.body,null,2);
-  } catch (_) {
-    document.getElementById('out').textContent='Workspace connection failed. Reload to retry.';
-  }
-})();
-</script></body>"""
+from .ui import EDITOR_HTML
 
 
 def _unique_object(pairs):
@@ -123,13 +110,22 @@ def _fields(body, expected):
 
 class WorkspaceHTTPServer(ThreadingHTTPServer):
     """Caller-managed HTTP lifecycle; token and store belong to this instance."""
-    daemon_threads = True
+    # Closing must wait for admitted writes and frame deliveries before the
+    # caller closes SQLite or removes the decoder's owned cache images.
+    daemon_threads = False
     allow_reuse_address = False
 
     def get_request(self):
         connection, address = super().get_request()
         connection.settimeout(REQUEST_TIMEOUT_SECONDS)
         return connection, address
+
+    def server_close(self):
+        if hasattr(self, "closing"):
+            self.closing.set()
+        super().server_close()
+        if hasattr(self, "image_service"):
+            self.image_service.close()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -165,9 +161,12 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Content-Security-Policy", "default-src 'none'; connect-src 'self'; "
                          f"script-src 'nonce-{self.server.nonce}'; style-src 'unsafe-inline'; "
+                         "media-src 'self'; img-src 'self' blob:; "
                          "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+        for name, value in getattr(self, "_extra_headers", []):
+            self.send_header(name, value)
         if status == 405:
-            self.send_header("Allow", "GET, POST")
+            self.send_header("Allow", "GET, HEAD, POST")
         self.end_headers()
         self.close_connection = True
 
@@ -287,14 +286,128 @@ class _Handler(BaseHTTPRequestHandler):
                 or not secrets.compare_digest(tokens[0], self.server.token)):
             self._deny("INVALID_TOKEN")
 
+    def _media_token(self):
+        """The media-only cookie cannot authorize API reads or any write."""
+        if self.headers.get_all(TOKEN_HEADER, []):
+            self._token()
+            return
+        values = self.headers.get_all("Cookie", [])
+        if len(values) != 1:
+            self._deny("INVALID_TOKEN")
+        matches = []
+        for part in values[0].split(";"):
+            key, separator, value = part.strip().partition("=")
+            if separator and key == self.server.media_cookie_name:
+                matches.append(value)
+        if (len(matches) != 1 or not matches[0].isascii()
+                or not secrets.compare_digest(matches[0], self.server.media_cookie)):
+            self._deny("INVALID_TOKEN")
+
     def _path(self):
         try:
             parsed = urlsplit(self.path)
         except ValueError as exc:
             raise BadRequest("INVALID_JSON", "Invalid request target") from exc
-        if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+        if parsed.scheme or parsed.netloc or parsed.fragment:
             raise NotFound("NOT_FOUND", "Unknown route")
+        self._query = {}
+        if parsed.query:
+            if (self.command != "GET" or not re.fullmatch(
+                    r"/api/v1/projects/[A-Za-z0-9_-]+/media/[A-Za-z0-9_-]+/frames", parsed.path)
+                    or len(parsed.query) > 160):
+                raise NotFound("NOT_FOUND", "Unknown route")
+            try:
+                self._query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True)
+                if set(self._query) - {"offset", "limit"} or any(len(value) != 1 for value in self._query.values()):
+                    raise ValueError("Unexpected pagination parameter")
+            except ValueError as exc:
+                raise BadRequest("INVALID_QUERY", "Invalid pagination parameters") from exc
         return parsed.path
+
+    def _pagination(self):
+        values = {"offset": "0", "limit": "100"}
+        values.update({name: value[0] for name, value in self._query.items()})
+        if any(re.fullmatch(r"0|[1-9][0-9]{0,18}", value) is None for value in values.values()):
+            raise BadRequest("INVALID_QUERY", "Pagination requires decimal integers")
+        offset, limit = int(values["offset"]), int(values["limit"])
+        if not 1 <= limit <= 1000:
+            raise BadRequest("INVALID_QUERY", "Frame page limit must be 1 through 1000")
+        return offset, limit
+
+    def _send_file(self, path, content_type, *, byte_ranges=False, extra_headers=()):
+        _safe(path)
+        before = path.stat()
+        with path.open("rb") as source:
+            # Python 3.13 on Windows may report creation time through stat's
+            # ctime but change time through fstat's ctime. Compare handle
+            # identity/size/mtime and separately recheck the path snapshot.
+            if (_identity(os.fstat(source.fileno()))[:4] != _identity(before)[:4]
+                    or _identity(path.stat()) != _identity(before)):
+                raise Conflict("MEDIA_CHANGED", "Resource changed before delivery")
+            _safe(path)
+            size = before.st_size
+            start, end, status = 0, size - 1, 200
+            self._extra_headers = list(extra_headers)
+            if byte_ranges:
+                self._extra_headers.append(("Accept-Ranges", "bytes"))
+                ranges = self.headers.get_all("Range", [])
+                if ranges:
+                    try:
+                        if len(ranges) != 1:
+                            raise ValueError("Multiple ranges")
+                        start, end = _byte_range(ranges[0], size)
+                        status = 206
+                    except ValueError:
+                        self._extra_headers.append(("Content-Range", f"bytes */{size}"))
+                        self._headers(416, 0, content_type)
+                        return
+                    self._extra_headers.append(("Content-Range", f"bytes {start}-{end}/{size}"))
+            remaining = max(0, end - start + 1)
+            self._headers(status, remaining, content_type)
+            if self.command == "HEAD":
+                return
+            source.seek(start)
+            while remaining:
+                chunk = source.read(min(STREAM_CHUNK_BYTES, remaining))
+                if not chunk:
+                    # A truncated response cannot be reported as complete.
+                    self.close_connection = True
+                    return
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
+    def _media_request(self, parts):
+        """Return True only for the fixed playback/image routes."""
+        playback = len(parts) == 3 and parts[0] == "media" and parts[2] == "playback"
+        frame = len(parts) == 5 and parts[0] == "media" and parts[2] == "frames" and parts[4] == "image"
+        if not (playback or frame):
+            return False
+        self._media_token()
+        if self.command not in {"GET", "HEAD"}:
+            self._deny("METHOD_NOT_ALLOWED", 405)
+        _require_id(parts[1], "media_id")
+        if playback:
+            path, digest, _ = resolve_media_object(self.server.store, parts[1], "playback_path")
+            self._send_file(path, "video/mp4", byte_ranges=True,
+                            extra_headers=[("X-TraceAnnotate-Media-SHA256", digest)])
+        else:
+            if re.fullmatch(r"0|[1-9][0-9]{0,18}", parts[3]) is None:
+                raise BadRequest("INVALID_QUERY", "Frame index must be a decimal integer")
+            image = self.server.image_service.image(parts[1], int(parts[3]))
+            row = image["row"]
+            self._extra_headers = [
+                ("X-TraceAnnotate-Frame-Index", row["frame_index"]),
+                ("X-TraceAnnotate-Source-PTS", row["source_pts"]),
+                ("X-TraceAnnotate-Proxy-PTS", row["proxy_pts"]),
+                ("X-TraceAnnotate-Image-SHA256", image["sha256"]),
+                ("X-TraceAnnotate-Media-SHA256", image["playback_sha256"]),
+            ]
+            # Bytes are pinned and hashed under the decoder lock. Reopening a
+            # cache filename here would race eviction by another request.
+            self._headers(200, len(image["data"]), "image/png")
+            if self.command != "HEAD":
+                self.wfile.write(image["data"])
+        return True
 
     def _api_parts(self, path):
         parts = path.split("/")
@@ -333,13 +446,36 @@ class _Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and path == "/":
             html = EDITOR_HTML.replace("__TOKEN__", json.dumps(self.server.token)).replace("__NONCE__", self.server.nonce)
             data = html.encode("utf-8")
+            self._extra_headers = [("Set-Cookie", f"{self.server.media_cookie_name}={self.server.media_cookie}; "
+                                    f"Path=/api/v1/projects/{project}/media/; HttpOnly; SameSite=Strict")
+                                   for project in ("current", self.server.project_id)]
             self._headers(200, len(data), "text/html; charset=utf-8")
             self.wfile.write(data)
             return
-        self._token()
         parts = self._api_parts(path)
+        if self._media_request(parts):
+            return
+        self._token()
         store = self.server.store
+        if self.command == "POST" and parts == ["imports"]:
+            result = receive_and_import(self)
+            self._send_json(200, result)
+            return
+        if self.command == "GET" and parts == ["export"]:
+            with store.transaction():
+                snapshot = store.get_snapshot()
+                snapshot["intakes"] = store.list_intakes()
+                snapshot["export_scope"] = "development_snapshot_without_media_or_portable_import"
+            self._extra_headers = [("Content-Disposition", 'attachment; filename="'
+                                    f'TraceAnnotate-{self.server.project_id}-r{snapshot["workspace_revision"]}.json"')]
+            self._send_json(200, snapshot)
+            return
         if self.command == "GET":
+            if len(parts) == 3 and parts[0] == "media" and parts[2] == "frames":
+                _require_id(parts[1], "media_id")
+                offset, limit = self._pagination()
+                self._send_json(200, self.server.image_service.page(parts[1], offset, limit))
+                return
             with store.transaction():
                 if parts == ["snapshot"]:
                     result = store.get_snapshot()
@@ -353,6 +489,9 @@ class _Handler(BaseHTTPRequestHandler):
                     result = {"batches": self.server.queue.list_batches()}
                 elif parts == ["intakes"]:
                     result = {"intakes": store.list_intakes()}
+                elif parts == ["imports"]:
+                    result = {"busy": self.server.import_lock.locked(),
+                              "max_upload_bytes": str(self.server.max_upload_bytes)}
                 elif len(parts) == 2 and parts[0] in ("batches", "jobs"):
                     _require_id(parts[1], "resource_id")
                     result = (self.server.queue.get_batch if parts[0] == "batches"
@@ -388,7 +527,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve(self):
         request_id = "req-" + secrets.token_hex(12)
         try:
-            if self.command not in ("GET", "POST"):
+            if self.command not in ("GET", "POST", "HEAD"):
                 self._authorize()
                 self._deny("METHOD_NOT_ALLOWED", 405)
             self._dispatch()
@@ -417,7 +556,15 @@ def make_server(store: WorkspaceStore, host: str = "127.0.0.1", port: int = 0) -
     server.project_id = project_id
     server.token = secrets.token_urlsafe(32)
     server.nonce = secrets.token_urlsafe(24)
+    server.media_cookie = secrets.token_urlsafe(32)
+    server.media_cookie_name = f"ta_media_{server.server_port}_{secrets.token_hex(6)}"
     server.max_command_bytes = MAX_COMMAND_BYTES
+    server.max_upload_bytes = MAX_UPLOAD_BYTES
+    server.upload_timeout_seconds = UPLOAD_TIMEOUT_SECONDS
+    server.import_lock = threading.Lock()
+    server.closing = threading.Event()
+    from .frames import FrameService
+    server.image_service = FrameService(store)
     server.authority = f"127.0.0.1:{server.server_port}"
     server.origin = f"http://{server.authority}"
     server.editor_url = server.origin + "/"

@@ -375,8 +375,13 @@ class WorkspaceStore:
         return [json.loads(r[0]) for r in rows]
 
     # -- intake / admission -------------------------------------------------
-    def import_source(self, source, *, display_name=None, template_id="generic-segment", template_version=1):
+    def import_source(self, source, *, display_name=None, template_id="generic-segment", template_version=1, cancelled=None):
         from .media import prepare_workspace_media
+        if cancelled is not None and not callable(cancelled):
+            raise SchemaInvalid("SCHEMA_INVALID", "Cancellation must be a callback")
+        def check_cancelled():
+            if cancelled is not None and cancelled():
+                raise WorkspaceError("CANCELLED", "Media admission was cancelled")
         source = Path(source)
         display_name = source.name if display_name is None else display_name
         if not isinstance(display_name, str) or not display_name:
@@ -392,9 +397,10 @@ class WorkspaceStore:
             self.conn.execute("INSERT INTO intakes(id,group_id,state,display_name,created_at,job_id,template_id,template_version) VALUES(?,?,?,?,?,?,?,?)",
                               (intake_id, group_id, "running", display_name, _now(), job_id, template_id, template_version))
         try:
+            check_cancelled()
             if not source.is_file():
                 raise NotFound("SOURCE_MISSING", "Source file does not exist")
-            digest = stream_sha256(source)
+            digest = stream_sha256(source, cancelled=cancelled)
             size = source.stat().st_size
             with self.transaction():
                 self.conn.execute("UPDATE intakes SET source_sha256=?,source_size=? WHERE id=?", (digest, size, intake_id))
@@ -405,7 +411,7 @@ class WorkspaceStore:
             if reused:
                 self._check_artifacts()
             if media is None:
-                prepared = prepare_workspace_media(source, self.tmp_dir / job_id)
+                prepared = prepare_workspace_media(source, self.tmp_dir / job_id, cancelled=cancelled)
                 if prepared["source_sha256"] != digest or prepared["source_size"] != size:
                     raise Conflict("MEDIA_CHANGED", "Source changed during preparation")
                 objects = {key: self._put_file(prepared[key]) for key in
@@ -416,12 +422,13 @@ class WorkspaceStore:
                 media["frame_map_artifact"] = objects["frame_map_path"]["id"]
                 if objects["playback_path"]["sha256"] != media["playback"]["sha256"]:
                     raise Conflict("MEDIA_CHANGED", "Playback changed during admission")
-            if stream_sha256(source) != digest or source.stat().st_size != size:
+            if stream_sha256(source, cancelled=cancelled) != digest or source.stat().st_size != size:
                 raise Conflict("MEDIA_CHANGED", "Source changed before admission commit")
             task_id = _new_id("tsk")
             task = {"id": task_id, "media_id": media["id"], "template_id": template_id,
                     "template_version": template_version, "revision": 0, "annotations": [], "extensions": {}}
             with self.transaction():
+                check_cancelled()
                 self.conn.execute("INSERT OR IGNORE INTO media VALUES(?,?)", (media["id"], S.canonical_json(media).decode("utf-8")))
                 if objects:
                     self.conn.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (f"media_objects:{media['id']}", S.canonical_json(objects).decode("utf-8")))
@@ -433,8 +440,12 @@ class WorkspaceStore:
             return {"intake_id": intake_id, "media_id": media["id"], "task_id": task_id,
                     "duration_seconds": float(S.rational_value(media["duration"])), "frames": media["frame_count"], "reused_existing": reused}
         except BaseException as exc:
+            is_cancelled = isinstance(exc, InterruptedError) or getattr(exc, "code", None) == "CANCELLED"
             with self.transaction():
-                self.conn.execute("UPDATE intakes SET state='failed',error_code=? WHERE id=?", (getattr(exc, "code", "IMPORT_FAILED"), intake_id))
+                self.conn.execute("UPDATE intakes SET state=?,error_code=? WHERE id=?",
+                                  ("cancelled" if is_cancelled else "failed", "CANCELLED" if is_cancelled else getattr(exc, "code", "IMPORT_FAILED"), intake_id))
+            if isinstance(exc, InterruptedError):
+                raise WorkspaceError("CANCELLED", "Media admission was cancelled") from exc
             raise
 
     @_serialized
@@ -673,8 +684,8 @@ class WorkspaceStore:
         duration = S.rational_value(media["duration"])
         for key in times:
             value = ann[key]
-            if not isinstance(value, dict) or set(value) != {"seconds"}:
-                raise SchemaInvalid("UNSUPPORTED_OPERATION", "Frame anchors require mapped-frame validation, not yet exposed here")
+            if not isinstance(value, dict) or set(value) not in ({"seconds"}, {"seconds", "anchor"}):
+                raise SchemaInvalid("SCHEMA_INVALID", "Time requires seconds and an optional mapped frame anchor")
             if not isinstance(value["seconds"], dict):
                 raise SchemaInvalid("INVALID_RATIONAL", "Time must be an n/d object with decimal strings")
             reduced = S.rational(value["seconds"])
@@ -683,6 +694,9 @@ class WorkspaceStore:
             values[key] = S.rational_value(reduced)
             if values[key] < 0 or values[key] > duration or (key != "end" and values[key] == duration):
                 raise SchemaInvalid("SCHEMA_INVALID", "Annotation time is outside media duration")
+            if "anchor" in value:
+                from .frames import validate_anchor
+                validate_anchor(self, media, value)
         if kind == "segment" and values["start"] >= values["end"]:
             raise SchemaInvalid("SCHEMA_INVALID", "Segment start must precede end")
 

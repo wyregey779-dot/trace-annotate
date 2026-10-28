@@ -50,6 +50,12 @@ assert "video-prepare" in result.stdout and "video-open" in result.stdout
 from trace_annotate.temporal.preparation import prepare_media
 from trace_annotate.temporal.project_server import make_project_server
 assert callable(prepare_media) and callable(make_project_server)
+from trace_annotate.workspace.ui import EDITOR_HTML
+from trace_annotate.workspace.frames import FrameService
+from trace_annotate.workspace.server import make_server
+assert '<video' in EDITOR_HTML and '__TOKEN__' in EDITOR_HTML and '__NONCE__' in EDITOR_HTML
+assert callable(FrameService) and callable(make_server)
+assert 'workspace' in result.stdout
 editor = subprocess.run([cli, "video-ui", "--print-path"], check=True, capture_output=True,
                         text=True, encoding="utf-8", env=cli_env)
 assert Path(editor.stdout.strip()).is_file()
@@ -96,7 +102,7 @@ invalid = subprocess.run([cli, "embodied-pipeline", "invalid-quality.json", "--r
 assert invalid.returncode == 1
 assert "INVALID_TIME" in Path("invalid-quality-report.html").read_text(encoding="utf-8")
 print(f"Installed package smoke check passed: version={trace_annotate.__version__}, package={installed_path}")
-print("Templates, both HTML editors, general segment export, embodied XML and quality failure gates verified outside checkout.")
+print("Templates, editors, workspace modules, general segment export, embodied XML and quality failure gates verified outside checkout.")
 '''
 
 

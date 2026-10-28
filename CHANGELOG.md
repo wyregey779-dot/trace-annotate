@@ -2,8 +2,10 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Add the persistent multi-video browser segment workbench with ordered file admission, task isolation, exact rational times, revision conflict handling, durable save receipt recovery and development snapshot downloads.
+- Decode selected frames by display index, verify mapped source/proxy PTS before saving anchors, and reject invalid or nonexistent frame references. Add actual browser pixel-identity and editing regressions; ordinary player seeks remain second-based.
 - Add an experimental persistent workspace with cross-platform writer locking, real SQLite transactions, immutable verified objects, revision-bound receipts and exact decoded media maps. Preserve failed intakes and keep repeated-content tasks independent.
-- Add durable candidate jobs with bounded dispatch, leases, cancellation fencing, pause/retry and process-crash recovery. Expose batch integrity verification in the CLI and authenticated controls through the loopback API; semantic auto-annotation and the multi-video workbench remain unfinished.
+- Add durable candidate jobs with bounded dispatch, leases, cancellation fencing, pause/retry and process-crash recovery. Expose batch integrity verification in the CLI and authenticated controls through the loopback API; semantic auto-annotation remains unfinished.
 - Reject legacy experimental workspace storage until explicit migration, unsafe exports, missing object references, malformed times and inconsistent task identities. Run the existing CI matrix on feature branches as well as main/master so development pushes receive actual remote checks.
 
 - Distinguish unavailable final-frame duration metadata from ambiguous PTS mapping. Keep old-probe rejection explicit with a toolchain upgrade path; CI uses a fixed, SHA-256-verified FFmpeg build to execute the full media regressions without estimating timing.

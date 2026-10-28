@@ -123,6 +123,9 @@ jobs:
       - name: Record embodied editing and validate the actual downloaded annotations
         run: python scripts/check_embodied_editor.py --output output/embodied-editor-ci
 
+      - name: Verify persistent multi-video workspace and displayed frame identity
+        run: python scripts/check_workspace_editor.py --output output/workspace-editor-ci
+
       - name: Upload browser acceptance evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -135,4 +138,5 @@ jobs:
             output/media-admission-ci
             output/prepared-editor-ci
             output/embodied-editor-ci
+            output/workspace-editor-ci
           if-no-files-found: warn
