@@ -2,6 +2,11 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Restore continuous playback after selected-segment playback ends. Keep explicit play/pause, speed, segment loop and exact-frame controls; add actual button and task-switch browser regressions.
+- Link the original general and embodied editors from the experimental batch workbench. Serve unchanged packaged editors with page-specific Blob/Worker policies and script nonces, retaining existing file workflows and API authorization.
+- Keep exact derived coverage statistics within a separate computation budget, report budget exhaustion explicitly and preserve original task JSON/CSV exports. Accept stored multiline track names when selecting SRT tracks; add parsed export round-trip and read-only consistency tests.
+- Run the workbench browser checks against the built wheel in isolation as well as the checkout, rejecting fallback to checkout modules or stale packaged resources.
+
 - Add the persistent multi-video browser segment workbench with ordered file admission, task isolation, exact rational times, revision conflict handling, durable save receipt recovery and development snapshot downloads.
 - Decode selected frames by display index, verify mapped source/proxy PTS before saving anchors, and reject invalid or nonexistent frame references. Add actual browser pixel-identity and editing regressions; ordinary player seeks remain second-based.
 - Add an experimental persistent workspace with cross-platform writer locking, real SQLite transactions, immutable verified objects, revision-bound receipts and exact decoded media maps. Preserve failed intakes and keep repeated-content tasks independent.

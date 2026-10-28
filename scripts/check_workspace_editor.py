@@ -5,23 +5,63 @@ manual-editing and displayed-frame identity regression, not semantic accuracy
 or full W04/release certification. Existing output directories are refused.
 """
 import argparse
+import csv
 from datetime import datetime, timezone
 from fractions import Fraction
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import traceback
+import zipfile
 
 SOURCE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SOURCE))
+_bootstrap = argparse.ArgumentParser(add_help=False)
+_bootstrap.add_argument("--installed-wheel", type=Path)
+_bootstrap_args, _ = _bootstrap.parse_known_args()
+INSTALLED_WHEEL = _bootstrap_args.installed_wheel
+INSTALLED_IDENTITY = None
+if INSTALLED_WHEEL is None:
+    sys.path.insert(0, str(SOURCE))
+else:
+    if not sys.flags.isolated:
+        raise RuntimeError("Installed acceptance requires the target venv Python with -I")
+    import trace_annotate
+    package = Path(trace_annotate.__file__).resolve().parent
+    roots = {Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "platlib")}
+    if SOURCE in package.parents or not any(root in package.parents for root in roots):
+        raise RuntimeError("Installed acceptance must load trace_annotate from target site-packages")
+    INSTALLED_WHEEL = INSTALLED_WHEEL.expanduser().resolve(strict=True)
+    expected = {}
+    with zipfile.ZipFile(INSTALLED_WHEEL) as archive:
+        for name in archive.namelist():
+            item = Path(name)
+            if (name.startswith("trace_annotate/") and item.suffix in {".py", ".html", ".js"}):
+                if ".." in item.parts or name in expected:
+                    raise RuntimeError("Invalid or duplicated package member in wheel")
+                local = package.joinpath(*item.parts[1:])
+                contents = archive.read(name)
+                if not local.is_file() or local.read_bytes() != contents:
+                    raise RuntimeError("Installed resource differs from wheel: " + name)
+                expected[name] = hashlib.sha256(contents).hexdigest()
+    actual = {"trace_annotate/" + path.relative_to(package).as_posix()
+              for path in package.rglob("*") if path.is_file() and path.suffix in {".py", ".html", ".js"}}
+    if not expected or set(expected) != actual:
+        raise RuntimeError("Installed Python/HTML/JS resource inventory differs from wheel")
+    INSTALLED_IDENTITY = {"wheel": str(INSTALLED_WHEEL),
+                          "wheel_sha256": hashlib.sha256(INSTALLED_WHEEL.read_bytes()).hexdigest(),
+                          "package": str(package), "resources": expected}
 
 from trace_annotate.workspace.server import make_server
 from trace_annotate.workspace.store import WorkspaceStore
+import trace_annotate
+PACKAGE = Path(trace_annotate.__file__).resolve().parent
 
 
 def digest(path):
@@ -142,6 +182,8 @@ def run_browser(output, sources, channel, summary):
     summary["responses"] = []
     summary["displayed_frame_checks"] = []
     summary["downloads"] = []
+    summary["playback_observations"] = []
+    summary["layout_observations"] = []
     page = None
     browser = None
     context = None
@@ -232,6 +274,227 @@ def run_browser(output, sources, channel, summary):
             raise AssertionError(f"Displayed image is not requested frame {index}: {pixels}")
         return pixels
 
+    def video_observation(target, selector="#player"):
+        return target.locator(selector).evaluate("""video => {
+            const canvas=document.createElement('canvas');canvas.width=320;canvas.height=180;
+            const ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.drawImage(video,0,0,320,180);
+            const bits=[];for(let col=0;col<5;col++){
+                const p=ctx.getImageData(40+col*56,35,1,1).data;
+                bits.push(Number(p[0]+p[1]+p[2]>384));
+            }
+            return {time:video.currentTime,paused:video.paused,ended:video.ended,
+                ready:video.readyState,rate:video.playbackRate,src:video.currentSrc,
+                pixel_id:bits.reduce((sum,bit,col)=>sum+(bit<<(4-col)),0)};
+        }""")
+
+    def exercise_transport(target, task_id, other_task):
+        select(target, task_id)
+        wait_value(target.locator("#player"), "v=>v.readyState>=2")
+        fill(target, "Playback boundary regression", "0.2", "0.8")
+        save(target, task_id, 1)
+        wait_value(target.locator("#player"), "v=>v.readyState>=2")
+        target.locator("#skip-back").click()
+        wait_value(target.locator("#player"), "v=>!v.seeking && v.currentTime<0.01")
+        initial = video_observation(target)
+        target.locator("#play-toggle").click()
+        wait_value(target.locator("#player"), "v=>!v.paused && v.currentTime>0.4")
+        moving = video_observation(target)
+        target.locator("#play-toggle").click()
+        wait_value(target.locator("#player"), "v=>v.paused")
+        stopped = video_observation(target)
+        target.wait_for_timeout(180)
+        assert abs(video_observation(target)["time"] - stopped["time"]) < 0.02
+        assert moving["pixel_id"] != initial["pixel_id"]
+        summary["playback_observations"].append({"case":"click-play-pause", "initial":initial,"moving":moving,"paused":stopped})
+        check("Visible play/pause clicks advance decoded pixels and pause the actual video")
+
+        target.locator("#play-selection").click()
+        wait_value(target.locator("#player"), "v=>v.paused && Math.abs(v.currentTime-0.8)<0.03")
+        target.locator("#play-toggle").click()
+        wait_value(target.locator("#player"), "v=>!v.paused && v.currentTime>1.1")
+        target.locator("#play-toggle").click()
+        check("Main playback continues past a completed 0.2–0.8 second selection")
+
+        target.locator("#loop-selection").check()
+        target.locator("#play-selection").click()
+        samples, loops, previous = [], 0, None
+        deadline=time.monotonic()+8
+        while loops < 2 and time.monotonic() < deadline:
+            value=target.locator("#player").evaluate("v=>({time:v.currentTime,paused:v.paused})")
+            samples.append(value)
+            if previous is not None and previous-value["time"]>0.3:
+                loops+=1
+            previous=value["time"]
+            target.wait_for_timeout(40)
+        assert loops >= 2 and not samples[-1]["paused"], samples
+        target.locator("#play-toggle").click()
+        target.locator("#loop-selection").uncheck()
+        summary["playback_observations"].append({"case":"selection-loop", "observed_wraps":loops,"samples":samples})
+        check("Selected interval loops across its boundary at least twice through actual playback")
+
+        rates=[]
+        for rate in ("0.25","1.5"):
+            target.locator("#skip-back").click()
+            target.locator("#playback-rate").select_option(rate)
+            target.locator("#play-toggle").click()
+            wait_value(target.locator("#player"), "v=>!v.paused && v.currentTime>0.02")
+            begin=time.monotonic(); before=target.locator("#player").evaluate("v=>v.currentTime")
+            target.wait_for_timeout(400)
+            after=target.locator("#player").evaluate("v=>v.currentTime")
+            elapsed=time.monotonic()-begin
+            target.locator("#play-toggle").click()
+            actual=target.locator("#player").evaluate("v=>v.playbackRate")
+            assert actual == float(rate) and after>before
+            rates.append({"selected":actual,"media_delta":after-before,"wall_seconds":elapsed})
+        assert rates[1]["media_delta"]/rates[1]["wall_seconds"] > 3*rates[0]["media_delta"]/rates[0]["wall_seconds"]
+        target.locator("#playback-rate").select_option("1")
+        target.locator("#skip-forward").click()
+        wait_value(target.locator("#player"), "v=>Math.abs(v.currentTime-v.duration)<0.01")
+        target.locator("#skip-back").click()
+        wait_value(target.locator("#player"), "v=>v.currentTime<0.01")
+        summary["playback_observations"].append({"case":"rates-and-clamps","rates":rates})
+        check("Selected speeds change observed progression; five-second jumps clamp at both media ends")
+
+        target.locator("#frame-mode").check()
+        wait_value(target.locator("#frame-image"), "image=>!image.hidden && image.complete && image.dataset.frameIndex==='0'")
+        show_frame(target, 12)
+        expect(target.locator("#player")).to_be_hidden()
+        target.locator("#play-toggle").click()
+        expect(target.locator("#frame-mode")).not_to_be_checked()
+        expect(target.locator("#frame-image")).to_be_hidden()
+        wait_value(target.locator("#player"), "v=>!v.paused && v.currentTime>=1.2 && v.currentTime<2.4")
+        resumed=video_observation(target)
+        target.locator("#play-toggle").click()
+        assert resumed["pixel_id"] >= 12
+        summary["playback_observations"].append({"case":"frame-to-video","frame":12,"resumed":resumed})
+        check("Primary play returns from the displayed deterministic frame to continuous video")
+
+        target.locator("#loop-selection").check()
+        target.locator("#play-selection").click()
+        wait_value(target.locator("#player"), "v=>!v.paused")
+        select(target, other_task)
+        wait_value(target.locator("#player"), "v=>v.readyState>=2 && v.paused")
+        expect(target.locator("#loop-selection")).not_to_be_checked()
+        expect(target.locator("#play-selection")).to_be_disabled()
+        target.wait_for_timeout(800)
+        assert target.locator("#player").evaluate("v=>v.paused && v.currentTime<0.05")
+        select(target, task_id)
+        target.locator("#segments tbody button[data-annotation-id]").first.click()
+        check("Switching tasks cancels playback and loop state without changing the other task")
+
+        before_fields={name:target.locator("#segment-"+name).input_value() for name in ("label","start","end","text")}
+        target.locator("#segment-text").focus()
+        for key in ("Space","i","o","ArrowLeft","ArrowRight"):
+            target.keyboard.press(key)
+        assert target.locator("#player").evaluate("v=>v.paused")
+        for name in ("start","end"):
+            assert target.locator("#segment-"+name).input_value() == before_fields[name]
+        target.locator("#segment-text").fill(before_fields["text"])
+        for composing, code in ((True,0),(False,229)):
+            for key, key_code, control in ((" ","Space",False),("i","KeyI",False),("o","KeyO",False),("s","KeyS",True)):
+                target.locator("body").dispatch_event("keydown", {"key":key,"code":key_code,
+                    "bubbles":True,"isComposing":composing,"keyCode":code,"ctrlKey":control})
+        assert target.locator("#player").evaluate("v=>v.paused")
+        assert store.get_task(task_id)["revision"] == 1
+        for name,value in before_fields.items():
+            assert target.locator("#segment-"+name).input_value() == value
+        check("Text typing and injected IME composition/keyCode-229 events do not trigger playback, marks or save")
+
+        for width,height,scale,label in ((1070,720,1,"1070x720"),(1366,768,1,"1366x768"),(683,384,2,"200-percent-equivalent-reflow")):
+            target.set_viewport_size({"width":width,"height":height})
+            target.evaluate("window.scrollTo(0,0)")
+            if scale==2:
+                target.locator("#play-toggle").scroll_into_view_if_needed()
+            target.locator("#play-toggle").hover()
+            metrics=target.locator("#play-toggle").evaluate("""el=>{
+                const r=el.getBoundingClientRect(),hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+                const style=getComputedStyle(el),lum=color=>{
+                    const rgb=color.match(/[\\d.]+/g).slice(0,3).map(Number).map(v=>{
+                        v/=255;return v<=0.04045?v/12.92:((v+0.055)/1.055)**2.4;});
+                    return rgb[0]*0.2126+rgb[1]*0.7152+rgb[2]*0.0722;};
+                const a=lum(style.color),b=lum(style.backgroundColor);
+                return {x:r.x,y:r.y,width:r.width,height:r.height,viewport_width:innerWidth,
+                    viewport_height:innerHeight,unobscured:hit===el||el.contains(hit),
+                    hovered_text:style.color,hovered_background:style.backgroundColor,
+                    hovered_contrast:(Math.max(a,b)+0.05)/(Math.min(a,b)+0.05)};
+            }""")
+            assert metrics["x"]>=0 and metrics["y"]>=0 and metrics["x"]+metrics["width"]<=width
+            assert metrics["y"]+metrics["height"]<=height and metrics["unobscured"], metrics
+            assert metrics["hovered_contrast"] >= 4.5, metrics
+            target.locator("#skip-back").click()
+            target.locator("#play-toggle").click()
+            wait_value(target.locator("#player"), "v=>!v.paused && v.currentTime>0.15")
+            target.locator("#play-toggle").click()
+            target.screenshot(path=str(output / ("playback-"+label+".png")))
+            summary["layout_observations"].append({"case":label,"css_scale_equivalent":scale,**metrics})
+        target.set_viewport_size({"width":1500,"height":1060})
+        check("Laptop play controls are visible and clickable; 200-percent-equivalent CSS reflow remains reachable")
+
+    def exercise_classic_routes(target):
+        for mode in ("general","embodied"):
+            links=target.locator('a[href="/tools/'+mode+'/"]')
+            expect(links.first).to_be_visible()
+        classic=context.new_page();observe(classic)
+        classic.on("dialog",lambda dialog: dialog.accept())
+        classic.goto(server.origin+"/tools/general/")
+        classic.locator("#videoInput").set_input_files(sources["cfr"]["path"])
+        expect(classic.locator("#togglePlay")).to_be_enabled(timeout=30000)
+        expect(classic.locator("#mediaIdentity")).to_contain_text(sources["cfr"]["sha256"])
+        classic.locator("#togglePlay").click()
+        wait_value(classic.locator("#videoPlayer"),"v=>!v.paused && v.currentTime>0.3")
+        classic.locator("#togglePlay").click()
+        for selector,value in (("startInput","0.2"),("endInput","0.8"),("labelInput","Classic label"),("textInput","Classic cue"),("trackInput","subtitles")):
+            classic.locator("#"+selector).fill(value)
+        classic.locator("#reviewInput").check()
+        classic.locator("#saveSegment").click()
+        expect(classic.locator("#segmentList button")).to_have_count(1)
+        classic.locator("#undo").click();expect(classic.locator("#segmentList button")).to_have_count(0)
+        classic.locator("#redo").click();expect(classic.locator("#segmentList button")).to_have_count(1)
+        classic.locator("#subtitleTrack").select_option("subtitles")
+        files={}
+        for fmt in ("JSON","CSV","SRT","VTT"):
+            with classic.expect_download() as pending:
+                classic.locator("#export"+fmt).click()
+            path=output/("classic-general."+fmt.lower());pending.value.save_as(path);files[fmt]=path
+            summary["downloads"].append({"path":path.name,"sha256":digest(path)})
+        document=json.loads(files["JSON"].read_text(encoding="utf-8"))
+        assert document["media_sha256"] == sources["cfr"]["sha256"]
+        assert len(document["segments"])==1 and document["segments"][0]["review_status"]=="reviewed"
+        assert list(csv.DictReader(io.StringIO(files["CSV"].read_text(encoding="utf-8-sig"))))[0]["text"]=="Classic cue"
+        for fmt in ("SRT","VTT"):
+            value=files[fmt].read_text(encoding="utf-8")
+            assert "Classic cue" in value and ("00:00:00,200 --> 00:00:00,800" if fmt=="SRT" else "00:00:00.200 --> 00:00:00.800") in value
+        classic.locator("#newProject").click()
+        expect(classic.locator("#segmentList button")).to_have_count(0)
+        classic.locator("#jsonInput").set_input_files(str(files["JSON"]))
+        expect(classic.locator("#segmentList button")).to_have_count(1)
+        check("Served original general editor hashes/plays media, edits/reviews/undoes, downloads formats and reopens JSON")
+        classic.goto(server.origin+"/tools/embodied/")
+        classic.locator("#fileInput").set_input_files(sources["cfr"]["path"])
+        expect(classic.locator("#togglePlay")).to_be_enabled(timeout=30000)
+        classic.locator("#togglePlay").click()
+        wait_value(classic.locator("#videoPlayer"),"v=>!v.paused && v.currentTime>0.2")
+        classic.locator("#togglePlay").click()
+        classic.locator("#taskDescription").fill("Synthetic compatibility route check")
+        classic.locator("#expectedSteps").fill("1")
+        for value,button in (("0.2","markStart"),("0.8","markEnd")):
+            classic.locator("#seekSeconds").fill(value);classic.locator("#seekTo").click()
+            wait_value(classic.locator("#videoPlayer"),"(v,t)=>!v.seeking && Math.abs(v.currentTime-t)<0.001",float(value))
+            classic.locator("#"+button).click()
+        classic.locator("#segmentLabel").fill("Synthetic action")
+        classic.locator("#selVerdict").select_option("无法判断")
+        classic.locator("#computeIdle").click()
+        with classic.expect_download() as pending:
+            classic.locator("#exportJSON").click()
+        path=output/"classic-embodied.json";pending.value.save_as(path)
+        data=json.loads(path.read_text(encoding="utf-8"))
+        assert len(data["working"])==1 and data["working"][0]["verdict"]=="无法判断"
+        assert data["working"][0]["start"]==0.2 and data["working"][0]["end"]==0.8
+        assert len(data["idle"])==2 and data["expected_step_count"]==1
+        summary["downloads"].append({"path":path.name,"sha256":digest(path)})
+        classic.close()
+        check("Served original embodied editor plays, marks an unresolved step and exports its explicit Idle complement")
+
     playwright = sync_playwright().start()
     try:
         browser = playwright.chromium.launch(headless=True, **({"channel": channel} if channel else {}))
@@ -275,11 +538,12 @@ def run_browser(output, sources, channel, summary):
         cfr = task_by_name("cfr.mp4")
         duplicate = task_by_name("same-content-renamed.mp4")
         assert cfr != duplicate and store.get_task(cfr)["media_id"] == store.get_task(duplicate)["media_id"]
+        transport_task = next(item["id"] for item in store.get_snapshot()["tasks"]
+                              if item["id"] not in (cfr, duplicate)
+                              and item["media_id"] == store.get_task(cfr)["media_id"])
+        exercise_transport(page, transport_task, cfr)
+        exercise_classic_routes(page)
         select(page, cfr)
-        page.locator("#player").evaluate("async video => {video.muted=true; await video.play();}")
-        wait_value(page.locator("#player"), "video => video.currentTime > 0.3 && video.readyState >= 2")
-        page.locator("#player").evaluate("video => video.pause()")
-        check("Actual browser video decoding and playback")
 
         page.locator("#new-segment").click()
         label = '<img src=x onerror="window.injectionRan=true">'
@@ -594,25 +858,35 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--channel", help="Optional installed browser channel, e.g. chrome")
+    parser.add_argument("--installed-wheel", type=Path,
+                        help="Require -I and verify all installed Python/HTML/JS bytes against this wheel")
     args = parser.parse_args()
     output = args.output.expanduser().resolve()
     try:
         output.mkdir(parents=True, exist_ok=False)
     except OSError as exc:
         parser.error("Output must be a new directory; existing evidence preserved: " + str(exc))
-    source_files = [Path(__file__)] + sorted((SOURCE / "trace_annotate/workspace").glob("*.py"))
-    hashes = {str(path.relative_to(SOURCE)): digest(path) for path in source_files}
+    source_files = [Path(__file__).resolve()] + sorted(path for path in PACKAGE.rglob("*")
+                    if path.is_file() and path.suffix in {".py", ".html", ".js"})
+    def source_key(path):
+        return str(path.relative_to(SOURCE)) if INSTALLED_IDENTITY is None else str(path)
+    hashes = {source_key(path): digest(path) for path in source_files}
     summary = {"status": "RUNNING", "started_utc": datetime.now(timezone.utc).isoformat(),
                "argv": [sys.executable] + sys.argv, "python": sys.version,
-               "source_sha256": hashes, "headless": True, "native_file_picker_tested": False,
-               "scope": "Synthetic multi-video manual editing, persisted commands and displayed-frame identity. "
-                        "Not automatic annotation accuracy, the complete A13 matrix or release readiness."}
+               "source_sha256": hashes, "installed_identity": INSTALLED_IDENTITY,
+               "headless": True, "native_file_picker_tested": False,
+               "scope": "Synthetic click-driven transport, classic editor routes, multi-video manual editing, "
+                        "persisted commands and displayed-frame identity. IME is injected-event coverage and "
+                        "200-percent layout uses an equivalent CSS viewport, not native browser zoom. "
+                        "Not audible-audio quality, automatic annotation accuracy, complete A13 or release readiness."}
     write_json(output / "summary.json", summary)
     try:
         sources = make_sources(output)
         run_browser(output, sources, args.channel, summary)
-        if any(digest(path) != hashes[str(path.relative_to(SOURCE))] for path in source_files):
+        if any(digest(path) != hashes[source_key(path)] for path in source_files):
             raise AssertionError("Implementation changed during acceptance; rerun against fixed source")
+        if INSTALLED_IDENTITY and digest(INSTALLED_WHEEL) != INSTALLED_IDENTITY["wheel_sha256"]:
+            raise AssertionError("Installed acceptance wheel changed during the run")
         summary["status"] = "PASS"
     except Exception as exc:
         summary.update(status="FAIL", error=str(exc))

@@ -24,6 +24,7 @@ from .http_media import (MAX_UPLOAD_BYTES, UPLOAD_TIMEOUT_SECONDS, STREAM_CHUNK_
 from ..temporal.project_server import _byte_range
 from .store import _safe
 from .reporting import export_task, task_report
+from .classic import classic_resource, CLASSIC_DOCUMENTS, HASH_SCRIPT
 
 MAX_COMMAND_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 10
@@ -160,10 +161,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("X-Frame-Options", "DENY")
+        classic = getattr(self, "_classic_document", False)
         self.send_header("Content-Security-Policy", "default-src 'none'; connect-src 'self'; "
                          f"script-src 'nonce-{self.server.nonce}'; style-src 'unsafe-inline'; "
-                         "media-src 'self'; img-src 'self' blob:; "
-                         "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+                         + ("media-src 'self' blob:; worker-src blob:; " if classic else "media-src 'self'; ")
+                         + "img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         for name, value in getattr(self, "_extra_headers", []):
             self.send_header(name, value)
         if status == 405:
@@ -322,13 +324,18 @@ class _Handler(BaseHTTPRequestHandler):
                 if re.search(r"%(?![0-9a-fA-F]{2})", parsed.query):
                     raise ValueError("Malformed percent escape")
                 self._query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True, errors="strict")
-                allowed = {"offset", "limit"} if frame_query else {"format", "track"}
+                allowed = {"offset", "limit"} if frame_query else {"format", "track", "track_id"}
                 if set(self._query) - allowed or any(len(value) != 1 for value in self._query.values()):
                     raise ValueError("Unexpected query parameter")
                 if export_query:
-                    for value in self._query.values():
-                        if any(ord(char) < 32 or ord(char) == 127 for char in value[0]):
-                            raise ValueError("Unsupported query control character")
+                    # A track is an exact stored string, not a filename or
+                    # response header. Encoded tabs/newlines are legal track
+                    # values under the existing annotation contract. Reject
+                    # malformed query framing, but do not make such stored
+                    # tracks impossible to select for a multi-track export.
+                    format_value = self._query.get("format", [""])[0]
+                    if any(ord(char) < 32 or ord(char) == 127 for char in format_value):
+                        raise ValueError("Unsupported format control character")
             except (ValueError, UnicodeError) as exc:
                 raise BadRequest("INVALID_QUERY", "Invalid query parameters") from exc
         return parsed.path
@@ -451,7 +458,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self):
         path = self._path()
-        self._authorize(write=self.command == "POST", bootstrap=self.command == "GET" and path == "/")
+        self._authorize(write=self.command == "POST", bootstrap=self.command == "GET"
+                        and (path == "/" or path in CLASSIC_DOCUMENTS))
+        if path in CLASSIC_DOCUMENTS or path == HASH_SCRIPT:
+            if self.command not in {"GET", "HEAD"}:
+                self._deny("METHOD_NOT_ALLOWED", 405)
+            data, content_type = classic_resource(path, self.server.nonce)
+            self._classic_document = path in CLASSIC_DOCUMENTS
+            self._headers(200, len(data), content_type)
+            if self.command != "HEAD":
+                self.wfile.write(data)
+            return
         if self.command == "GET" and path == "/":
             html = EDITOR_HTML.replace("__TOKEN__", json.dumps(self.server.token)).replace("__NONCE__", self.server.nonce)
             data = html.encode("utf-8")
@@ -488,7 +505,8 @@ class _Handler(BaseHTTPRequestHandler):
                     if "format" not in self._query:
                         raise BadRequest("INVALID_QUERY", "Task export requires an explicit format")
                     item = export_task(store, parts[1], self._query["format"][0],
-                                       track=self._query.get("track", [None])[0])
+                                       track=self._query.get("track", [None])[0],
+                                       track_id=self._query.get("track_id", [None])[0])
                     self._extra_headers = [("Content-Disposition", f'attachment; filename="{item["filename"]}"'),
                                            ("X-TraceAnnotate-Task-Revision", str(item["binding"]["revision"])),
                                            ("X-TraceAnnotate-Content-SHA256", item["binding"]["content_sha256"]),

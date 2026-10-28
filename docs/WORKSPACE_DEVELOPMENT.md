@@ -5,6 +5,28 @@ finished batch annotation product or a release candidate. `workspace serve`
 opens the persistent multi-video segment editor. The existing `video-ui` and
 embodied editor remain separate, compatible annotation interfaces.
 
+The workbench header links to the original general and embodied tools in new
+tabs (`/tools/general/` and `/tools/embodied/`). These use the unchanged packaged
+editors and their independent-file saving workflow. They do not automatically
+import workspace tasks or read drafts from the earlier file-page origin. Select
+the matching media and import its original JSON to continue old work. See
+[the compatibility inventory](EDITOR_COMPATIBILITY.md) for retained features
+and the remaining integration gates.
+
+The main play button resumes continuous playback from the current position;
+it exits any previous segment-only range. Play selected segment starts again
+from that segment's saved start, with optional looping. Exact-frame mode shows
+a static image; its play button returns to video at the displayed frame time.
+
+Task report/export endpoints describe saved structure, not semantic approval.
+Derived coverage is exact within its documented budget of 20,000 segments and
+4,096-bit intermediate rationals. An exceeded budget is reported as unavailable
+statistics, never zero coverage; original JSON/CSV task values remain exportable.
+The report gives each track a stable `track_id` (SHA-256 of the exact UTF-8
+name). For long or special-character names use
+`tasks/TASK/export?format=srt&track_id=ID`; `track` and `track_id` are mutually
+exclusive. Short encoded names remain supported through `track`.
+
 ## What this slice implements
 
 - A project directory containing SQLite WAL/FULL storage and immutable,

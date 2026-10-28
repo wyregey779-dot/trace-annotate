@@ -10,12 +10,56 @@ from collections import Counter, defaultdict
 import copy
 import csv
 from fractions import Fraction
+import hashlib
 import io
 import json
+import re
 
 from ..temporal.formats import _csv_text, _plain_text, _timestamp
 from . import schema as S
 from .errors import NotFound, SchemaInvalid, WorkspaceError
+
+# These are analysis budgets, not restrictions on valid stored annotations or
+# raw exports. Input rational limits cannot be reused here: subtracting two
+# valid 40-digit fractions can itself require an 80-digit denominator.
+MAX_STATISTICS_SEGMENTS = 20_000
+MAX_STATISTICS_BITS = 4096
+
+
+def _track_id(name):
+    # A short selector for exact stored names, including names whose encoded
+    # query would exceed HTTP limits. Do not normalize Unicode or case here.
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
+
+
+class _StatisticsBudgetExceeded(Exception):
+    pass
+
+
+def _bounded_statistic(value):
+    if max(abs(value.numerator).bit_length(), value.denominator.bit_length()) > MAX_STATISTICS_BITS:
+        raise _StatisticsBudgetExceeded
+    return value
+
+
+def _derived_rational(value):
+    value = _bounded_statistic(value)
+    return {"n": str(value.numerator), "d": str(value.denominator)}
+
+
+def _duration(intervals):
+    total = Fraction(0)
+    for start, end in intervals:
+        # Every intermediate sum is bounded. Each added difference derives
+        # from two bounded input rationals; no unbounded big-int accumulation.
+        total = _bounded_statistic(total + (end - start))
+    return _derived_rational(total)
+
+
+def _unavailable_statistics():
+    return {"statistics_status": "budget_exceeded", "covered_seconds": None,
+            "uncovered_seconds": None, "overlap_seconds": None, "max_concurrent_segments": None,
+            "covered_intervals": None, "gaps": None, "overlaps": None}
 
 
 def _read_subject(store, task_id):
@@ -39,7 +83,8 @@ def _binding(task, media):
 
 
 def _interval(start, end):
-    return {"start": S.rational(start), "end": S.rational(end), "duration": S.rational(end - start)}
+    return {"start": _derived_rational(start), "end": _derived_rational(end),
+            "duration": _derived_rational(end - start)}
 
 
 def _merge(intervals):
@@ -53,6 +98,8 @@ def _merge(intervals):
 
 
 def _coverage(intervals, first, endpoint):
+    if len(intervals) > MAX_STATISTICS_SEGMENTS:
+        raise _StatisticsBudgetExceeded
     # Clip only the statistical intersection, never the saved annotations.
     events = defaultdict(int)
     for start, end in intervals:
@@ -79,9 +126,9 @@ def _coverage(intervals, first, endpoint):
         previous = end
     if previous < endpoint:
         gaps.append((previous, endpoint))
-    duration = lambda items: S.rational(sum((end - start for start, end in items), Fraction(0)))
-    return {"covered_seconds": duration(covered), "uncovered_seconds": duration(gaps),
-            "overlap_seconds": duration(overlaps), "max_concurrent_segments": maximum,
+    return {"statistics_status": "complete", "covered_seconds": _duration(covered),
+            "uncovered_seconds": _duration(gaps), "overlap_seconds": _duration(overlaps),
+            "max_concurrent_segments": maximum,
             "covered_intervals": [_interval(*item) for item in covered],
             "gaps": [_interval(*item) for item in gaps],
             "overlaps": [_interval(*item) for item in overlaps]}
@@ -110,17 +157,26 @@ def _report(store, task, media, template):
             errors.append({"code": exc.code, "annotation_id": ident if isinstance(ident, str) else None})
     kinds = Counter(item["type"] for item in valid)
     tags = Counter(tag for item in valid for tag in item["tags"])
+    grouped = defaultdict(list)
+    for item in valid:
+        grouped[item["track"]].append(item)
     tracks = []
-    for name in sorted({item["track"] for item in valid}):
-        selected = [item for item in valid if item["track"] == name]
+    for name in sorted(grouped):
+        selected = grouped[name]
         segments = [item for item in selected if item["type"] == "segment"]
         intervals = [(S.rational_value(item["start"]["seconds"]), S.rational_value(item["end"]["seconds"]))
                      for item in segments]
         for item, (start, end) in zip(segments, intervals):
             if start < first or end > endpoint:
                 warnings.append({"code": "SEGMENT_EXTENDS_OUTSIDE_VIDEO_ACTIVE", "annotation_id": item["id"]})
-        stats = _coverage(intervals, first, endpoint)
-        tracks.append({"track": name, "segment_count": len(segments),
+        try:
+            if kinds["segment"] > MAX_STATISTICS_SEGMENTS:
+                raise _StatisticsBudgetExceeded
+            stats = _coverage(intervals, first, endpoint)
+        except _StatisticsBudgetExceeded:
+            stats = _unavailable_statistics()
+            warnings.append({"code": "STATISTICS_BUDGET_EXCEEDED", "track": name})
+        tracks.append({"track": name, "track_id": _track_id(name), "segment_count": len(segments),
                        "event_count": sum(item["type"] == "event" for item in selected),
                        "whole_clip_count": sum(item["type"] == "whole_clip" for item in selected), **stats})
     if template.get("coverage_policy") != "sparse":
@@ -136,10 +192,15 @@ def _report(store, task, media, template):
                        "tag_occurrences": sum(tags.values()), "unique_tags": len(tags)},
             "tags": [{"tag": tag, "count": count} for tag, count in sorted(tags.items())],
             "checks": {"status": "failed" if errors else "passed", "errors": errors},
+            "statistics_status": "budget_exceeded" if any(
+                track["statistics_status"] == "budget_exceeded" for track in tracks) else "complete",
+            "statistics_budget": {"max_segments": MAX_STATISTICS_SEGMENTS,
+                                  "max_rational_bits": MAX_STATISTICS_BITS},
             "tracks": tracks, "warnings": warnings,
             "limitations": ["No image meaning or label correctness was reviewed.",
                             "Gaps mean unannotated, not Idle; sparse overlaps are not errors.",
                             "Coverage is per track on video_start/video_end only; events and whole-clip labels do not cover intervals.",
+                            "Derived statistics exceeding the declared analysis budget are unavailable, never rounded or replaced with zero; original JSON/CSV exports remain available.",
                             "This report does not create an approval or certify complete-partition delivery."]}
 
 
@@ -179,9 +240,16 @@ def _milliseconds(value):
     return whole + int(remainder * 2 >= denominator)
 
 
-def _srt(task, track):
+def _srt(task, track, track_id=None):
     segments = [item for item in task["annotations"] if item["type"] == "segment"]
     tracks = {item["track"] for item in segments}
+    if track_id is not None:
+        matches = [name for name in tracks if _track_id(name) == track_id]
+        if not matches:
+            raise SchemaInvalid("TRACK_NOT_FOUND", "Selected segment track does not exist")
+        if len(matches) != 1:
+            raise SchemaInvalid("TRACK_ID_AMBIGUOUS", "Track ID does not uniquely identify a segment track")
+        track = matches[0]
     if track is None and len(tracks) > 1:
         raise SchemaInvalid("TRACK_REQUIRED", "Select one track for SRT export")
     if track is not None and (not isinstance(track, str) or track not in tracks):
@@ -202,11 +270,15 @@ def _srt(task, track):
     return "\n\n".join(cues) + ("\n" if cues else "")
 
 
-def export_task(store, task_id, format, *, track=None):
+def export_task(store, task_id, format, *, track=None, track_id=None):
     if format not in {"json", "csv", "srt"}:
         raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT", "Supported task exports are json, csv and srt")
-    if track is not None and format != "srt":
+    if track is not None and track_id is not None:
+        raise SchemaInvalid("TRACK_SELECTION_CONFLICT", "Select a track by either name or ID, not both")
+    if (track is not None or track_id is not None) and format != "srt":
         raise SchemaInvalid("UNSUPPORTED_EXPORT_OPTION", "Track selection applies only to SRT")
+    if track_id is not None and (not isinstance(track_id, str) or re.fullmatch(r"[0-9a-f]{64}", track_id) is None):
+        raise SchemaInvalid("INVALID_TRACK_ID", "Track ID must be a lowercase SHA256 hex digest")
     with store.transaction():
         task, media, template = _read_subject(store, task_id)
         report = _report(store, task, media, template)
@@ -224,7 +296,7 @@ def export_task(store, task_id, format, *, track=None):
             content_type = "text/csv; charset=utf-8"
             losses = "Spreadsheet text is formula-escaped; annotation_json preserves originals; no media or review history."
         else:
-            data = _srt(task, track).encode("utf-8")
+            data = _srt(task, track, track_id).encode("utf-8")
             content_type = "application/x-subrip; charset=utf-8"
             losses = ("One segment track; round-half-up milliseconds; text else label; excludes events, whole-clip labels, "
                       "IDs, tags, anchors, metadata and review history; overlapping cues retained.")

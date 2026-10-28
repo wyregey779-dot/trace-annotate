@@ -53,8 +53,13 @@ assert callable(prepare_media) and callable(make_project_server)
 from trace_annotate.workspace.ui import EDITOR_HTML
 from trace_annotate.workspace.frames import FrameService
 from trace_annotate.workspace.server import make_server
+from trace_annotate.workspace.classic import classic_resource
 assert '<video' in EDITOR_HTML and '__TOKEN__' in EDITOR_HTML and '__NONCE__' in EDITOR_HTML
 assert callable(FrameService) and callable(make_server)
+for route, control in (('/tools/general/', b'jsonInput'), ('/tools/embodied/', b'computeIdle')):
+    html, content_type = classic_resource(route, 'installed-resource-check')
+    assert control in html and b'nonce="installed-resource-check"' in html
+    assert content_type.startswith('text/html')
 assert 'workspace' in result.stdout
 editor = subprocess.run([cli, "video-ui", "--print-path"], check=True, capture_output=True,
                         text=True, encoding="utf-8", env=cli_env)
