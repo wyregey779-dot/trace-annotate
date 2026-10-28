@@ -9,6 +9,7 @@ import math
 import re
 import secrets
 import socket
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 import webbrowser
@@ -19,6 +20,8 @@ from .store import WorkspaceStore
 
 MAX_COMMAND_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 10
+REJECT_DRAIN_MAX_BYTES = 64 * 1024
+REJECT_DRAIN_TIMEOUT_SECONDS = 0.25
 MAX_SAFE_INTEGER = 9007199254740991
 TOKEN_HEADER = "X-TraceAnnotate-Token"
 ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,95}")
@@ -150,6 +153,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._error(exc, "req-" + secrets.token_hex(12))
 
     def _headers(self, status, length, content_type):
+        self._response_started = True
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
@@ -174,6 +178,10 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _error(self, exc, request_id):
+        if getattr(self, "_response_started", False):
+            self.close_connection = True
+            return
+        self._discard_rejected_body()
         # Store errors can contain local paths. Expose stable codes and only
         # public conflict metadata, never an exception or submitted input.
         messages = {
@@ -198,21 +206,79 @@ class _Handler(BaseHTTPRequestHandler):
         }
         status = "unknown" if exc.http_status >= 500 or exc.code == "COMMAND_UNKNOWN" else "not_committed"
         body["error"]["details"]["commit_status"] = "committed" if exc.code == "ALREADY_COMMITTED" else status
-        self._send_json(exc.http_status, body)
+        try:
+            self._send_json(exc.http_status, body)
+        except (ConnectionError, socket.timeout):
+            # A peer that has already left cannot receive an error. In
+            # particular, never append another HTTP response to a partial one.
+            self.close_connection = True
+
+    def _discard_rejected_body(self):
+        """Consume a small, well-framed rejected body before closing the socket.
+
+        Closing a Windows socket with unread incoming data can reset it before
+        the peer receives the JSON error. Draining has a byte cap and one total
+        deadline; it must neither wait for an arbitrary upload nor read a body
+        already consumed (or partially consumed by a timed-out normal read).
+        """
+        if getattr(self, "_body_read_started", False) or not hasattr(self, "headers"):
+            return
+        if self.headers.get_all("Transfer-Encoding", []):
+            return
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or re.fullmatch(r"[0-9]{1,10}", lengths[0]) is None:
+            return
+        remaining = int(lengths[0])
+        if not 0 < remaining <= min(REJECT_DRAIN_MAX_BYTES, self.server.max_command_bytes):
+            return
+        self._body_read_started = True
+        previous_timeout = self.connection.gettimeout()
+        deadline = time.monotonic() + REJECT_DRAIN_TIMEOUT_SECONDS
+        try:
+            while remaining:
+                available_time = deadline - time.monotonic()
+                if available_time <= 0:
+                    break
+                self.connection.settimeout(available_time)
+                chunk = self.rfile.read1(min(remaining, 8192))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            # The rejection stands even when the peer abandons its upload.
+            pass
+        finally:
+            try:
+                self.connection.settimeout(previous_timeout)
+            except OSError:
+                pass
 
     def _deny(self, code, status=403):
         exc = WorkspaceError(code, "Request rejected")
         exc.http_status = status
         raise exc
 
-    def _authorize(self, write=False):
+    def _authorize(self, write=False, bootstrap=False):
         if self.headers.get_all("Host", []) != [self.server.authority]:
             self._deny("FORBIDDEN_ORIGIN")
         origins = self.headers.get_all("Origin", [])
         if (origins and origins != [self.server.origin]) or (write and not origins):
             self._deny("FORBIDDEN_ORIGIN")
         sites = self.headers.get_all("Sec-Fetch-Site", [])
-        if sites and sites not in (["same-origin"], ["none"]):
+        destinations = self.headers.get_all("Sec-Fetch-Dest", [])
+        modes = self.headers.get_all("Sec-Fetch-Mode", [])
+        if bootstrap and destinations and destinations != ["document"]:
+            self._deny("FORBIDDEN_ORIGIN")
+        # Opening a local app from a browser extension or external link is a
+        # cross-site top-level navigation, not a cross-origin API request. Only
+        # the GET / document may bootstrap this way; Host and Origin above still
+        # apply. CSP/X-Frame-Options separately prevent embedding the page.
+        document_navigation = (
+            bootstrap and not write and self.command == "GET"
+            and modes == ["navigate"] and destinations == ["document"]
+            and sites in (["cross-site"], ["same-site"])
+        )
+        if sites and sites not in (["same-origin"], ["none"]) and not document_navigation:
             self._deny("FORBIDDEN_ORIGIN")
 
     def _token(self):
@@ -250,6 +316,7 @@ class _Handler(BaseHTTPRequestHandler):
         if length > self.server.max_command_bytes:
             raise LimitExceeded("LIMIT_EXCEEDED", "Command body is too large")
         try:
+            self._body_read_started = True
             raw = self.rfile.read(length)
             if len(raw) != length:
                 raise ValueError("Incomplete body")
@@ -261,8 +328,8 @@ class _Handler(BaseHTTPRequestHandler):
         return raw, body
 
     def _dispatch(self):
-        self._authorize(write=self.command == "POST")
         path = self._path()
+        self._authorize(write=self.command == "POST", bootstrap=self.command == "GET" and path == "/")
         if self.command == "GET" and path == "/":
             html = EDITOR_HTML.replace("__TOKEN__", json.dumps(self.server.token)).replace("__NONCE__", self.server.nonce)
             data = html.encode("utf-8")
@@ -325,7 +392,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._authorize()
                 self._deny("METHOD_NOT_ALLOWED", 405)
             self._dispatch()
-        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        except (ConnectionError, socket.timeout):
             self.close_connection = True
         except WorkspaceError as exc:
             self._error(exc, request_id)

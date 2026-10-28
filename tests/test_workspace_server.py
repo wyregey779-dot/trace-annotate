@@ -11,10 +11,11 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 
 import pytest
 
-from trace_annotate.workspace.server import make_server, MAX_COMMAND_BYTES, TOKEN_HEADER
+from trace_annotate.workspace.server import make_server, MAX_COMMAND_BYTES, TOKEN_HEADER, REJECT_DRAIN_MAX_BYTES
 from trace_annotate.workspace.store import WorkspaceStore
 
 
@@ -222,6 +223,178 @@ def test_bootstrap_rejects_foreign_host_and_origin(api, headers):
     response = request(server, "GET", "/", headers=headers, authorized=False)
     assert_error(response, 403, "FORBIDDEN_ORIGIN")
     assert server.token not in json.dumps(response[2])
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+def test_bootstrap_accepts_top_level_external_navigation(api, site):
+    server, _ = api
+    # Matches the observed Chrome extension navigation: exact Host, no Origin,
+    # document/navigate/cross-site, and an explicit user navigation marker.
+    headers = {"Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+               "Sec-Fetch-Site": site, "Sec-Fetch-User": "?1"}
+    status, response_headers, html = request(server, "GET", "/", headers=headers, authorized=False)
+    assert status == 200
+    assert json.loads(re.search(rb"const token=(.*?);", html).group(1)) == server.token
+    assert response_headers["X-Frame-Options"] == "DENY"
+    assert "frame-ancestors 'none'" in response_headers["Content-Security-Policy"]
+    assert response_headers["Cross-Origin-Resource-Policy"] == "same-origin"
+    assert "Access-Control-Allow-Origin" not in response_headers
+    # Loading the page then using its token through a same-origin fetch works.
+    status, _, snapshot = request(server, "GET", "/api/v1/projects/current/snapshot",
+                                   headers={"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "same-origin",
+                                            "Sec-Fetch-Dest": "empty"})
+    assert status == 200 and snapshot["project_id"] == server.project_id
+
+
+@pytest.mark.parametrize("destination", ["iframe", "frame", "object", "embed", "image", "empty"])
+@pytest.mark.parametrize("site", ["cross-site", "same-origin"])
+def test_bootstrap_rejects_embedded_and_non_document_requests(api, destination, site):
+    server, _ = api
+    headers = {"Sec-Fetch-Dest": destination, "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": site}
+    response = request(server, "GET", "/", headers=headers, authorized=False)
+    assert_error(response, 403, "FORBIDDEN_ORIGIN")
+    assert server.token not in json.dumps(response[2])
+
+
+@pytest.mark.parametrize("change", [{"Host": "attacker.example"}, {"Origin": "https://attacker.example"},
+                                    {"Origin": "null"}, {"Sec-Fetch-Mode": "cors"},
+                                    {"Sec-Fetch-Mode": "no-cors"}])
+def test_navigation_exception_keeps_host_origin_and_mode_checks(api, change):
+    server, _ = api
+    headers = {"Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "cross-site"}
+    headers.update(change)
+    assert_error(request(server, "GET", "/", headers=headers, authorized=False), 403, "FORBIDDEN_ORIGIN")
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+def test_navigation_headers_never_bypass_api_read_or_write_guard(api, site):
+    server, store = api
+    headers = {"Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+               "Sec-Fetch-Site": site, "Sec-Fetch-User": "?1"}
+    assert_error(request(server, "GET", "/api/v1/projects/current/snapshot", headers=headers),
+                 403, "FORBIDDEN_ORIGIN")
+    path, body = command(store)
+    # Even an otherwise valid token and matching Origin cannot override the
+    # cross-site signal on a write endpoint.
+    assert_error(request(server, "POST", path, body, headers=headers), 403, "FORBIDDEN_ORIGIN")
+    assert store.get_task(store.list_tasks()[0]["task_id"])["revision"] == 0
+
+
+@pytest.mark.parametrize("headers,code", [
+    ({"Sec-Fetch-Site": "cross-site"}, "FORBIDDEN_ORIGIN"),
+    ({"Origin": "https://attacker.example"}, "FORBIDDEN_ORIGIN"),
+    ({TOKEN_HEADER: "incorrect"}, "INVALID_TOKEN"),
+])
+def test_repeated_complete_rejected_posts_deliver_json_without_reset(api, headers, code):
+    server, store = api
+    path, body = command(store)
+    # Repeated real sockets cover the previous Windows close-with-unread-body
+    # race. A transport abort is a failure, never an acceptable rejection.
+    for _ in range(32):
+        assert_error(request(server, "POST", path, body, headers=headers), 403, code)
+    assert store.get_task(store.list_tasks()[0]["task_id"])["revision"] == 0
+
+
+def test_rejected_post_with_headers_and_body_sent_separately_delivers_json(api):
+    server, store = api
+    path, body = command(store)
+    raw = json.dumps(body).encode("utf-8")
+    for _ in range(8):
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            connection.putrequest("POST", path)
+            connection.putheader("Origin", "https://attacker.example")
+            connection.putheader("Content-Length", str(len(raw)))
+            connection.putheader("Content-Type", "application/json")
+            connection.endheaders()
+            connection.send(raw[:1])
+            time.sleep(0.02)
+            connection.send(raw[1:])
+            response = connection.getresponse()
+            data = json.loads(response.read())
+            assert response.status == 403 and data["error"]["code"] == "FORBIDDEN_ORIGIN"
+        finally:
+            connection.close()
+
+
+def test_rejected_partial_body_has_bounded_wait_and_still_returns_json(api):
+    server, store = api
+    path, _ = command(store)
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.putrequest("POST", path)
+        connection.putheader("Origin", "https://attacker.example")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", "512")
+        connection.endheaders(b"{")
+        started = time.monotonic()
+        response = connection.getresponse()
+        data = json.loads(response.read())
+        assert response.status == 403 and data["error"]["code"] == "FORBIDDEN_ORIGIN"
+        assert time.monotonic() - started < 2
+    finally:
+        connection.close()
+    # This connection's short drain timeout must not affect later requests.
+    status, _, snapshot = request(server, "GET", "/api/v1/projects/current/snapshot")
+    assert status == 200 and snapshot["tasks"][0]["revision"] == 0
+
+
+@pytest.mark.parametrize("length", [REJECT_DRAIN_MAX_BYTES + 1, MAX_COMMAND_BYTES + 1, 9999999999])
+def test_rejected_large_declared_body_does_not_wait_for_upload(api, length):
+    server, store = api
+    path, _ = command(store)
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.putrequest("POST", path)
+        connection.putheader("Origin", "https://attacker.example")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(length))
+        connection.endheaders()
+        response = connection.getresponse()
+        data = json.loads(response.read())
+        assert response.status == 403 and data["error"]["code"] == "FORBIDDEN_ORIGIN"
+    finally:
+        connection.close()
+    assert store.get_task(store.list_tasks()[0]["task_id"])["revision"] == 0
+    assert_error(request(server, "GET", "/api/v1/projects/current/commands/cmd-save"), 404, "COMMAND_UNKNOWN")
+
+
+@pytest.mark.parametrize("authorized,status", [(True, 200), (False, 403)])
+def test_connection_abort_after_headers_never_starts_a_second_response(api, monkeypatch, authorized, status):
+    server, _ = api
+    handler = server.RequestHandlerClass
+    original_headers = handler._headers
+    sent_statuses = []
+    finished = threading.Event()
+    original_finish = server.finish_request
+
+    def abort_after_headers(instance, code, length, content_type):
+        original_headers(instance, code, length, content_type)
+        sent_statuses.append(code)
+        raise ConnectionAbortedError("Injected Windows transport abort after response headers")
+
+    def finish_request(*args):
+        try:
+            return original_finish(*args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(handler, "_headers", abort_after_headers)
+    monkeypatch.setattr(server, "finish_request", finish_request)
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request("GET", "/api/v1/projects/current/snapshot",
+                           headers={TOKEN_HEADER: server.token} if authorized else {})
+        response = connection.getresponse()
+        assert response.status == status
+        # This deliberately injected transport failure occurs after headers;
+        # a second JSON/HTTP error cannot repair the incomplete first response.
+        with pytest.raises(http.client.IncompleteRead):
+            response.read()
+        assert finished.wait(timeout=2)
+        assert sent_statuses == [status]
+    finally:
+        connection.close()
 
 
 def test_api_requires_private_header_and_writes_require_origin(api):
