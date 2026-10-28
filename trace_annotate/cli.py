@@ -26,6 +26,7 @@ from trace_annotate.embodied.exporters.action_dataset import export_to_action_se
 from trace_annotate.embodied.qc_report import generate_qc_report
 from trace_annotate.embodied.motion import extract_motion_energy, propose_idle_pauses
 from trace_annotate.temporal.commands import register_video_commands
+from trace_annotate.workspace.commands import register_workspace_commands
 from trace_annotate.embodied.quality_pipeline import (
     add_pipeline_arguments, guarded, idle_command, diff_command, kappa_command,
     validate_command, pipeline_command,
@@ -215,6 +216,7 @@ def main() -> None:
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
     register_video_commands(subparsers)
+    register_workspace_commands(subparsers)
 
     # Asset Verify
     p_verify = subparsers.add_parser("asset-verify", help="Run 21-point verification suite")
