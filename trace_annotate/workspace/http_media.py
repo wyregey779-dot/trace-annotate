@@ -104,19 +104,16 @@ def upload_length(headers, maximum):
     return size
 
 
-def receive_and_import(handler):
-    """One synchronous import; there is deliberately no automatic POST replay.
+def receive_upload_temp(handler):
+    """Receive an upload into a uniquely owned temp file; return (path, name, size).
 
-    A transport interruption before full upload creates no admitted task. A
-    completed upload uses store.import_source, which persists preparation
-    failures. A lost response after admission must be reconciled from intakes
-    and the snapshot before the user explicitly starts a new import.
+    The caller decides what to do with the verified bytes. A transport interruption
+    before all bytes arrive creates no workspace row and the temp file is left for
+    the caller to clean up.
     """
     server = handler.server
     name = upload_name(handler.headers)
     size = upload_length(handler.headers, server.max_upload_bytes)
-    if not server.import_lock.acquire(blocking=False):
-        raise Conflict("IMPORT_BUSY", "Another upload or media preparation is running")
     path = None
     previous_timeout = handler.connection.gettimeout()
     try:
@@ -141,16 +138,41 @@ def receive_and_import(handler):
                 remaining -= len(chunk)
             output.flush()
             os.fsync(output.fileno())
-        return server.store.import_source(path, display_name=name, cancelled=server.closing.is_set)
-    except OSError as exc:
-        if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}:
-            raise StorageFull("STORAGE_FULL", "Upload requires more free storage", retryable=True) from exc
-        if isinstance(exc, TimeoutError):
-            raise BadRequest("UPLOAD_INCOMPLETE", "Upload timed out") from exc
-        raise
+        return path, name, size
+    except BaseException:
+        # A partial upload is never an input: discard it on any failure so the
+        # next import starts clean. The caller owns the file only on success.
+        try:
+            if path is not None:
+                _safe(path.parent)
+                path.unlink(missing_ok=True)
+        finally:
+            raise
     finally:
         try:
             handler.connection.settimeout(previous_timeout)
+        except OSError:
+            pass
+
+
+def receive_and_import(handler):
+    """One synchronous import; there is deliberately no automatic POST replay.
+
+    A transport interruption before full upload creates no admitted task. A
+    completed upload uses store.import_source, which persists preparation
+    failures. A lost response after admission must be reconciled from intakes
+    and the snapshot before the user explicitly starts a new import.
+    """
+    server = handler.server
+    if not server.import_lock.acquire(blocking=False):
+        raise Conflict("IMPORT_BUSY", "Another upload or media preparation is running")
+    path = None
+    try:
+        path, name, _size = receive_upload_temp(handler)
+        return server.store.import_source(path, display_name=name, cancelled=server.closing.is_set)
+    finally:
+        try:
+            handler.connection.settimeout(handler.connection.gettimeout())
         except OSError:
             pass
         try:

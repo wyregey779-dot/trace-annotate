@@ -323,14 +323,20 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.query:
             frame_query = re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/media/[A-Za-z0-9_-]+/frames", parsed.path)
             export_query = re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/tasks/[A-Za-z0-9_-]+/export", parsed.path)
-            if (self.command != "GET" or not (frame_query or export_query)
-                    or len(parsed.query) > (160 if frame_query else 4096)):
+            imports_async = (self.command == "POST" and
+                             re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/imports", parsed.path))
+            max_len = 160 if frame_query else (4096 if export_query else 32)
+            if (self.command != "GET" or not (frame_query or export_query)) and not imports_async:
+                raise NotFound("NOT_FOUND", "Unknown route")
+            if len(parsed.query) > max_len:
                 raise NotFound("NOT_FOUND", "Unknown route")
             try:
                 if re.search(r"%(?![0-9a-fA-F]{2})", parsed.query):
                     raise ValueError("Malformed percent escape")
                 self._query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True, errors="strict")
                 allowed = {"offset", "limit"} if frame_query else {"format", "track", "track_id"}
+                if imports_async:
+                    allowed = {"async"}
                 if set(self._query) - allowed or any(len(value) != 1 for value in self._query.values()):
                     raise ValueError("Unexpected query parameter")
                 if export_query:
@@ -490,6 +496,24 @@ class _Handler(BaseHTTPRequestHandler):
         self._token()
         store = self.server.store
         if self.command == "POST" and parts == ["imports"]:
+            if self._query.get("async", ["0"])[0] == "1":
+                from .http_media import receive_upload_temp
+                path, name, size = receive_upload_temp(self)
+                try:
+                    header_sha = self.headers.get_all("X-TraceAnnotate-SHA256", [])
+                    header_cid = self.headers.get_all("X-TraceAnnotate-Command-Id", [])
+                    result = self.server.async_intakes.enqueue(
+                        path, display_name=name,
+                        expected_sha256=header_sha[0].strip().lower() if len(header_sha) == 1 else None,
+                        expected_size=size,
+                        command_id=header_cid[0].strip() if len(header_cid) == 1 else None)
+                finally:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                self._send_json(202, result)
+                return
             result = receive_and_import(self)
             self._send_json(200, result)
             return
@@ -545,6 +569,9 @@ class _Handler(BaseHTTPRequestHandler):
                     result = {"batches": self.server.queue.list_batches()}
                 elif parts == ["intakes"]:
                     result = {"intakes": store.list_intakes()}
+                elif len(parts) == 2 and parts[0] == "intakes":
+                    _require_id(parts[1], "intake_id")
+                    result = self.server.async_intakes.get(parts[1])
                 elif parts == ["imports"]:
                     result = {"busy": self.server.import_lock.locked(),
                               "max_upload_bytes": str(self.server.max_upload_bytes)}
@@ -558,13 +585,18 @@ class _Handler(BaseHTTPRequestHandler):
             task_command = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "commands"
             task_import_temporal = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "import-temporal"
             control = len(parts) == 3 and parts[0] in ("batches", "jobs") and parts[2] == "control"
-            if not (task_command or task_import_temporal or control or parts in (["batches"], ["drafts"])):
+            intake_control = len(parts) == 3 and parts[0] == "intakes" and parts[2] in {"cancel", "retry"}
+            if not (task_command or task_import_temporal or control or intake_control
+                    or parts in (["batches"], ["drafts"])):
                 raise NotFound("NOT_FOUND", "Unknown route")
             if len(parts) > 1:
                 _require_id(parts[1], "resource_id")
             raw, body = self._read_body()
             with store.transaction():
-                if parts == ["drafts"]:
+                if intake_control:
+                    result = (self.server.async_intakes.request_cancel(parts[1])
+                              if parts[2] == "cancel" else self.server.async_intakes.retry_failed(parts[1]))
+                elif parts == ["drafts"]:
                     expected = {"draft_id", "editor_session_id", "task_id", "media_id", "expected_draft_revision", "body"}
                     if not isinstance(body, dict) or set(body) != expected:
                         raise SchemaInvalid("SCHEMA_INVALID", "Invalid draft save request")
@@ -681,6 +713,18 @@ def make_server(store: WorkspaceStore, host: str = "127.0.0.1", port: int = 0) -
     server.closing = threading.Event()
     from .frames import FrameService
     server.image_service = FrameService(store)
+    from .intake import AsyncIntakes
+    server.async_intakes = AsyncIntakes(store)
+
+    def _drain_intakes() -> None:
+        while not server.closing.wait(1.0):
+            try:
+                server.async_intakes.run_pending(worker_id="intake-worker")
+            except Exception:
+                # One intake failure is already persisted; never kill the drainer.
+                continue
+
+    threading.Thread(target=_drain_intakes, name="intake-drain", daemon=False).start()
     server.authority = f"127.0.0.1:{server.server_port}"
     server.origin = f"http://{server.authority}"
     server.editor_url = server.origin + "/"
