@@ -623,6 +623,7 @@ class _Handler(BaseHTTPRequestHandler):
                         request_body=raw,
                     )["response"]
                     result["imported_count"] = len(import_payload["annotations"])
+                    result["endpoint_adjustments"] = len(import_payload["legacy_document_envelope"].get("endpoint_adjustments", []))
                 elif control:
                     body = _fields(body, {"command_id", "action"})
                     if not isinstance(body["action"], str):

@@ -10,6 +10,7 @@
   - Session-isolated CAS drafts, full rescue download and validated restoration in a fresh tab. Pending requests are queried before explicit resend; rescue remains available while editing is disabled.
   - Quiescent SQLite/object-closure backup and verified restoration to a new directory. Active intake/queue work is refused; external source media and unregistered files remain outside this experimental backup scope.
   - Portable source/installed enhancement regressions with fresh output directories, durable failure evidence and required CI steps; installed checks reject checkout fallback.
+  - Map only hash-bound six-decimal legacy media-end rounding (at most half a microsecond) to the exact admitted endpoint, retaining original numbers and the mapping rule. Reject general out-of-range times. Retry transient Windows CI toolchain installation failures with bounded attempts and require both executable probes.
 
 - Restore continuous playback after selected-segment playback ends. Keep explicit play/pause, speed, segment loop and exact-frame controls; add actual button and task-switch browser regressions.
 - Link the original general and embodied editors from the experimental batch workbench. Serve unchanged packaged editors with page-specific Blob/Worker policies and script nonces, retaining existing file workflows and API authorization.

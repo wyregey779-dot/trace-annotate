@@ -35,7 +35,25 @@ jobs:
 
       - name: Install media test prerequisites on Windows
         if: runner.os == 'Windows'
-        run: choco install ffmpeg --yes --no-progress
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mediaReady = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install ffmpeg --version=9.0.2 --yes --no-progress
+            $installExit = $LASTEXITCODE
+            if ($installExit -eq 0 -and (Get-Command ffmpeg -ErrorAction SilentlyContinue) -and (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+              ffmpeg -version
+              $ffmpegExit = $LASTEXITCODE
+              ffprobe -version
+              if ($ffmpegExit -eq 0 -and $LASTEXITCODE -eq 0) {
+                $mediaReady = $true
+                break
+              }
+            }
+            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+          }
+          if (-not $mediaReady) { throw 'FFmpeg/ffprobe installation or version probe failed after three attempts; media tests must not be skipped.' }
 
       - name: Require FFmpeg and ffprobe before running the test suite
         run: |

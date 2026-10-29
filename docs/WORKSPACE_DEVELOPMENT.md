@@ -115,9 +115,17 @@ an old snapshot. History advances only after a durable receipt.
 `tasks/{id}/import-temporal` requires an explicit command ID, expected revision
 and content hash. The UI captures these before file reading/confirmation and
 retains the original request when its result is unknown. Temporal v2 must match
-the admitted source hash/size. Legacy v1 has no strong media identity: its
-explicit weak-binding migration workflow is still unfinished. Do not treat a
-v1 import or matching duration as verified media identity.
+the admitted source hash/size. Legacy v1 has no strong media identity: workspace
+import refuses it with `MEDIA_BINDING_REQUIRED`. Bind it to the verified source
+in the classic tool and export v2 first. The original independent-file v1 tool
+remains available; an in-workspace weak-binding migration UI is unfinished.
+
+A v2 document whose verified source matches may represent the final exact media
+endpoint with six decimal places. Only an end equal to that declared duration,
+rounded above the exact endpoint by at most half a microsecond, is mapped back
+to the exact rational endpoint. Original numbers and the versioned mapping rule
+remain in the source envelope; export disclosures name this adjustment. Internal
+boundaries, unbound v1 documents and larger out-of-range times are not clipped.
 
 Review binds saved content, media and template to a local record. It does not
 authenticate an independent reviewer or certify semantic correctness. Ordinary

@@ -98,6 +98,7 @@ def validate_assets(dist: Path, expected_tag: str | None = None) -> list[Path]:
                      "scripts/check_enhanced_editor.py", "tests/test_enhanced_editor_runner.py",
                      "tests/test_workspace_history_review.py", "tests/test_workspace_roundtrip_regressions.py",
                      "tests/test_workspace_drafts.py", "tests/test_workspace_backup.py",
+                     "tests/test_workspace_legacy_endpoints.py",
                      "docs/WORKSPACE_DEVELOPMENT.md",
                      "scripts/check_installed_package.py", "scripts/release_assets.py"):
             member = archive.extractfile(prefix + name)

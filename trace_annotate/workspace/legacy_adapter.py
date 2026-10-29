@@ -8,12 +8,36 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List
 
 from ..temporal.schema import validate_document, require_valid_document
 from . import schema as S
 from .errors import SchemaInvalid
+
+
+def _import_end(doc, media, end):
+    """Map only a hash-bound, six-decimal representation of the exact endpoint.
+
+    This is not general clipping: internal boundaries, v1/unbound documents and
+    errors larger than half a microsecond are never adjusted.
+    """
+    value = S.rational(end)
+    actual = S.rational_value(media["duration"])
+    delta = S.rational_value(value) - actual
+    if delta <= 0:
+        return value
+    source = media.get("source", {})
+    if (doc.get("schema_version") == 2 and doc.get("media_sha256") == source.get("sha256")
+            and str(doc.get("media_size")) == str(source.get("size_bytes"))
+            and end == doc.get("duration")
+            and S.rational(doc["duration"]) == S.rational(round(float(actual), 6))
+            and delta <= Fraction(1, 2_000_000)):
+        return S.rational(actual)
+    raise SchemaInvalid("TEMPORAL_ENDPOINT_MISMATCH", "Temporal end exceeds the admitted media endpoint",
+                        details={"declared_end": value, "media_end": S.rational(actual),
+                                 "policy": "no_general_clipping"})
 
 
 def temporal_import_payload(doc, media, *, actor_id="user"):
@@ -35,6 +59,13 @@ def temporal_import_payload(doc, media, *, actor_id="user"):
          "review_status": segment["review_status"]}
         for annotation, segment in zip(annotations, doc["segments"])
     ]
+    adjustments = [{"annotation_id": annotation["id"], "field": "end",
+                    "original": segment["end"], "mapped_seconds": annotation["end"]["seconds"],
+                    "rule": "verified-source-six-decimal-endpoint-v1"}
+                   for annotation, segment in zip(annotations, doc["segments"])
+                   if annotation["end"]["seconds"] != S.rational(segment["end"])]
+    if adjustments:
+        envelope["endpoint_adjustments"] = adjustments
     payload = {"annotations": annotations,
                "legacy_document_metadata": copy.deepcopy(doc.get("metadata", {})),
                "legacy_document_envelope": envelope}
@@ -55,7 +86,7 @@ def validate_temporal_import_payload(payload, media):
                 "media_size_present", "source_reviews"}
     if (not isinstance(annotations, list) or not isinstance(metadata, dict)
             or not isinstance(envelope, dict) or not required <= set(envelope)
-            or set(envelope) - required - {"media_size", "media_sha256"}
+            or set(envelope) - required - {"media_size", "media_sha256", "endpoint_adjustments"}
             or type(envelope["metadata_present"]) is not bool
             or type(envelope["media_size_present"]) is not bool
             or envelope["media_size_present"] != ("media_size" in envelope)
@@ -70,6 +101,16 @@ def validate_temporal_import_payload(payload, media):
     if envelope["metadata_present"]:
         doc["metadata"] = copy.deepcopy(metadata)
     doc["segments"] = []
+    adjustments = envelope.get("endpoint_adjustments", [])
+    if not isinstance(adjustments, list):
+        invalid()
+    adjustment_map = {}
+    for adjustment in adjustments:
+        if (not isinstance(adjustment, dict) or set(adjustment) != {"annotation_id", "field", "original", "mapped_seconds", "rule"}
+                or adjustment["field"] != "end" or adjustment["rule"] != "verified-source-six-decimal-endpoint-v1"
+                or not isinstance(adjustment["annotation_id"], str) or adjustment["annotation_id"] in adjustment_map):
+            invalid()
+        adjustment_map[adjustment["annotation_id"]] = adjustment
     for annotation, review in zip(annotations, reviews):
         if (not isinstance(annotation, dict) or annotation.get("type") != "segment"
                 or not isinstance(review, dict)
@@ -79,15 +120,25 @@ def validate_temporal_import_payload(payload, media):
                 or review["review_status"] != annotation.get("review_status")):
             invalid()
         try:
+            adjustment = adjustment_map.pop(annotation["id"], None)
+            end = float(S.rational_value(annotation["end"]["seconds"]))
+            if adjustment:
+                end = adjustment["original"]
+                if (adjustment["mapped_seconds"] != annotation["end"]["seconds"]
+                        or _import_end(doc, media, end) != annotation["end"]["seconds"]
+                        or S.rational(end) == annotation["end"]["seconds"]):
+                    invalid()
             doc["segments"].append({"id": review["legacy_id"],
                 "start": float(S.rational_value(annotation["start"]["seconds"])),
-                "end": float(S.rational_value(annotation["end"]["seconds"])),
+                "end": end,
                 **{key: copy.deepcopy(annotation[key]) for key in
                    ("label", "text", "tags", "track", "review_status")}})
         except (KeyError, TypeError):
             invalid()
-    if validate_document(doc):
+    if adjustment_map or validate_document(doc):
         invalid()
+    if doc["schema_version"] == 1:
+        raise SchemaInvalid("MEDIA_BINDING_REQUIRED", "Bind legacy v1 to the verified source in the classic tool before importing as v2")
     source = media.get("source", {})
     if doc["schema_version"] == 2:
         if (doc["media_sha256"] != source.get("sha256")
@@ -125,6 +176,9 @@ def temporal_projection_losses(task, media):
     if rounded:
         losses.append(f"Rational times rounded to JSON decimal numbers: {rounded}.")
     source = _source_envelope(task)
+    if source.get("endpoint_adjustments"):
+        losses.append(f"Six-decimal legacy endpoints mapped to verified exact media end: {len(source['endpoint_adjustments'])}; "
+                      "original numbers and mapping rule remain in the workspace source envelope.")
     if source.get("schema_version") == 1:
         losses.append("Original temporal v1 projected as v2 with admitted media identity.")
     if any(item.get("review_status") == "reviewed" for item in source.get("source_reviews", [])):
@@ -178,7 +232,7 @@ def import_temporal_document(
         seen_ids.add(ann_id)
 
         start_rat = S.rational(seg["start"])
-        end_rat = S.rational(seg["end"])
+        end_rat = _import_end(doc, media, seg["end"])
 
         ann: Dict[str, Any] = {
             "id": ann_id,
