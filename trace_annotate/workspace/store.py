@@ -266,6 +266,19 @@ class WorkspaceStore:
                     ("project_id", _new_id("proj")), ("digest_version", "workspace-task-v1"),
                     ("workspace_revision", "0")])
             self.conn.execute("INSERT OR IGNORE INTO meta VALUES('workspace_revision','0')")
+            for statement in (
+                "ALTER TABLE intakes ADD COLUMN staged_path TEXT",
+                "ALTER TABLE intakes ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE intakes ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE intakes ADD COLUMN worker_id TEXT",
+                "ALTER TABLE intakes ADD COLUMN session_id TEXT",
+                "ALTER TABLE intakes ADD COLUMN lease_expires_at REAL",
+                "ALTER TABLE intakes ADD COLUMN request_sha256 TEXT",
+            ):
+                try:
+                    self.conn.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
             self._install_revision_triggers(("tasks", "intakes", "artifacts", "templates", "durable_commits"))
         if self.conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise WorkspaceError("RECOVERY_REQUIRED", "Database integrity check failed")
@@ -448,6 +461,73 @@ class WorkspaceStore:
             if isinstance(exc, InterruptedError):
                 raise WorkspaceError("CANCELLED", "Media admission was cancelled") from exc
             raise
+
+    @_serialized
+    def admit_staged_intake(self, intake, *, cancelled=None):
+        """Prepare a staged async intake and commit its media + task.
+
+        This is the worker side of the async admission route; the request side
+        has already received, fsynced and hash/size-verified the upload and moved
+        it to ``staged_path``. The staged bytes are re-hashed here, preparation
+        runs outside any SQLite write transaction, and at most one task is ever
+        created for the intake row. Raises propagate; the caller owns state.
+        """
+        from .media import prepare_workspace_media
+        if cancelled is not None and not callable(cancelled):
+            raise SchemaInvalid("SCHEMA_INVALID", "Cancellation must be a callback")
+
+        def check_cancelled():
+            if cancelled is not None and cancelled():
+                raise WorkspaceError("CANCELLED", "Media admission was cancelled")
+
+        intake_id = intake["id"]
+        staged = self.root / intake["staged_path"]
+        _safe(staged)
+        if not staged.is_file():
+            raise NotFound("SOURCE_MISSING", "Staged upload is missing")
+        digest = stream_sha256(staged, cancelled=cancelled)
+        size = staged.stat().st_size
+        if digest != intake["source_sha256"] or size != intake["source_size"]:
+            raise Conflict("MEDIA_CHANGED", "Staged upload changed during admission")
+        template_id, template_version = intake["template_id"], intake["template_version"]
+        if not self.conn.execute("SELECT 1 FROM templates WHERE id=? AND version=?",
+                                 (template_id, template_version)).fetchone():
+            raise NotFound("TEMPLATE_NOT_FOUND", "Requested template does not exist")
+        candidates = [json.loads(row[0]) for row in self.conn.execute("SELECT body FROM media")]
+        media = next((value for value in candidates if value["source"]["sha256"] == digest), None)
+        was_reused = media is not None
+        objects = None
+        if media is None:
+            work = self.tmp_dir / intake_id
+            prepared = prepare_workspace_media(staged, work, cancelled=cancelled)
+            if prepared["source_sha256"] != digest or prepared["source_size"] != size:
+                raise Conflict("MEDIA_CHANGED", "Source changed during preparation")
+            objects = {key: self._put_file(prepared[key]) for key in
+                       ("playback_path", "frame_map_path", "manifest_path", "preparation_log_path")}
+            media = dict(prepared["media_fields"])
+            media["source"]["display_name"] = intake["display_name"] or staged.name
+            media["id"] = S.make_id("med", digest)
+            media["frame_map_artifact"] = objects["frame_map_path"]["id"]
+            if objects["playback_path"]["sha256"] != media["playback"]["sha256"]:
+                raise Conflict("MEDIA_CHANGED", "Playback changed during admission")
+        check_cancelled()
+        if stream_sha256(staged, cancelled=cancelled) != digest or staged.stat().st_size != size:
+            raise Conflict("MEDIA_CHANGED", "Staged upload changed before admission commit")
+        task_id = _new_id("tsk")
+        task = {"id": task_id, "media_id": media["id"], "template_id": template_id,
+                "template_version": template_version, "revision": 0, "annotations": [], "extensions": {}}
+        self.conn.execute("INSERT OR IGNORE INTO media VALUES(?,?)", (media["id"], S.canonical_json(media).decode("utf-8")))
+        if objects:
+            self.conn.execute("INSERT OR IGNORE INTO meta VALUES(?,?)",
+                              (f"media_objects:{media['id']}", S.canonical_json(objects).decode("utf-8")))
+        task["content_sha256"] = self.task_digest(task)
+        self.conn.execute("INSERT INTO tasks VALUES(?,?,?,?,?)", (task_id, media["id"], template_id, template_version, 0))
+        self.conn.execute("INSERT INTO task_revisions VALUES(?,?,?,?,?,?,?)",
+                          (_new_id("rev"), task_id, 0, S.canonical_json(task).decode("utf-8"),
+                           task["content_sha256"], None, _now()))
+        return {"intake_id": intake_id, "media_id": media["id"], "task_id": task_id,
+                "duration_seconds": float(S.rational_value(media["duration"])),
+                "frames": media["frame_count"], "reused_existing": was_reused}
 
     @_serialized
     def list_intakes(self):
