@@ -106,7 +106,26 @@ the exact local Origin and JSON Content-Type. Do not publish the token. The
 bootstrap document also creates an HttpOnly SameSite=Strict cookie scoped to
 media resources, so native video/image requests do not put a token in a URL.
 
-Only add/update/delete manual annotations are available in this slice. Unknown
+Manual commands include add/update/delete/replace annotations, conditional
+`revert_command` and explicit `review_annotation`. Undo names an original
+command and only applies to its protected successor/history chain. A newer
+independent edit produces `HISTORY_DIVERGED`; refreshing does not reauthorize
+an old snapshot. History advances only after a durable receipt.
+
+`tasks/{id}/import-temporal` requires an explicit command ID, expected revision
+and content hash. The UI captures these before file reading/confirmation and
+retains the original request when its result is unknown. Temporal v2 must match
+the admitted source hash/size. Legacy v1 has no strong media identity: its
+explicit weak-binding migration workflow is still unfinished. Do not treat a
+v1 import or matching duration as verified media identity.
+
+Review binds saved content, media and template to a local record. It does not
+authenticate an independent reviewer or certify semantic correctness. Ordinary
+writes cannot mint a review by carrying `review_status=reviewed`. Historical
+imported flags remain source metadata; reports distinguish unbound flags from
+content-bound local review actions.
+
+Unknown
 fields, out-of-range times, unsupported evidence and custom
 attributes fail explicitly. The server does not accept arbitrary local file
 paths or run unknown queued processors automatically.
@@ -131,9 +150,29 @@ Select a task, enter a label and interval, then save. An unchanged time field
 retains its original rational value and frame anchor. Editing a time manually
 removes that field's anchor. Another tab's save produces a revision conflict;
 the editor keeps the draft for comparison rather than overwriting the newer
-revision. Unsaved input is guarded during navigation but is not a durable draft;
-save before closing the browser. A committed save is recovered from SQLite after
-the browser or service reopens.
+revision. Unsaved input is guarded during navigation and kept in independently
+identified browser/project drafts. Project drafts have their own CAS revision;
+old annotation bases remain available for explicit conflict comparison. The
+recovery selector lists dirty drafts. Rescue files include complete form/anchor
+state, base identity and any pending request; importing one does not submit
+annotations. Unknown commands are queried before explicit original-request
+resend. Synchronization can fail or be delayed: only confirmed persisted content
+is recoverable after a crash. Committed saves survive browser/service restarts.
+
+Draft routes are `GET /drafts`, `GET /drafts/{id}` and `POST /drafts` under the
+same authenticated project API and request-size limit. Drafts are private
+recovery data, not portable project backups.
+
+The experimental Python APIs `backup_workspace(store, new_directory)` and
+`restore_workspace(backup_directory, new_project_directory)` in
+`trace_annotate.workspace.backup` snapshot SQLite and registered immutable
+objects. They refuse active intakes/queue jobs, existing or overlapping targets,
+corrupt objects and unknown versions. Recovery verifies the snapshot and opens
+the new project without replaying commands or starting jobs. Arbitrary exports,
+logs, temporary files and external original media are not included. A complete
+backup manifest is required; an interrupted directory is not a valid backup.
+This does not implement migration of unsupported older storage versions or a
+portable interchange format, and there is no backup/restore CLI yet.
 
 Use the exact-frame view for frame boundaries. Frames are zero-based, and a
 segment is `[start,end)`: selecting frame N as its end excludes frame N. Use

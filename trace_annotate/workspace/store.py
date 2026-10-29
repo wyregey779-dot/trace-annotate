@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from functools import wraps
 import io
+import copy
 import stat
 import tempfile
 import threading
@@ -572,14 +573,83 @@ class WorkspaceStore:
             raise Conflict("MEDIA_CHANGED", "Task content hash mismatch",
                            details={"expected_sha256": expected_sha256,
                                     "current_sha256": current["content_sha256"]})
-        annotations = [dict(a) for a in current["annotations"]]
-        annotations = self._apply_operation(annotations, operation, payload)
-        new_task = dict(current)
-        new_task["annotations"] = annotations
+        new_task = copy.deepcopy(current)
+        if operation == "revert_command":
+            if set(payload) != {"target_command_id"}:
+                raise SchemaInvalid("SCHEMA_INVALID", "History requires the original command id")
+            target_id = S.require_id(payload["target_command_id"])
+            target = self.get_command_receipt(target_id)
+            original = target.get("response") or {}
+            logical_head = current_rev
+            head_row = self.conn.execute("SELECT c.body FROM task_revisions r JOIN durable_commits c ON c.id=r.commit_id "
+                                         "WHERE r.task_id=? AND r.revision=?", (task_id, current_rev)).fetchone()
+            if head_row:
+                head_commit = json.loads(head_row[0])
+                if head_commit.get("operation") == "revert_command":
+                    logical_head = head_commit["history_parent_revision"]
+            if (target["task_id"] != task_id or target["state"] != "committed"
+                    or original.get("revision") not in {current_rev, logical_head}):
+                raise Conflict("HISTORY_DIVERGED", "Task changed after this command; history was not applied")
+            after_row = self.conn.execute("SELECT body FROM task_revisions WHERE task_id=? AND revision=?",
+                                         (task_id, original["revision"])).fetchone()
+            if after_row is None:
+                raise WorkspaceError("RECOVERY_REQUIRED", "History successor is missing")
+            after = json.loads(after_row[0])
+            if (after["content_sha256"] != original.get("content_sha256")
+                    or self._history_subject(after) != self._history_subject(current)):
+                raise Conflict("HISTORY_DIVERGED", "Task contents differ from the protected history successor")
+            before = self.conn.execute("SELECT body,content_sha256 FROM task_revisions WHERE task_id=? AND revision=?",
+                                       (task_id, original.get("previous_revision"))).fetchone()
+            if before is None:
+                raise WorkspaceError("RECOVERY_REQUIRED", "History revision is missing")
+            new_task = json.loads(before[0])
+            if (new_task.get("id") != task_id or new_task.get("revision") != original.get("previous_revision")
+                    or new_task.get("content_sha256") != before[1] or self.task_digest(new_task) != before[1]):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Historical revision identity or digest is corrupt")
+        elif operation == "import_temporal":
+            from .legacy_adapter import validate_temporal_import_payload
+            validate_temporal_import_payload(payload, self.get_media(current["media_id"]))
+            if set(payload) != {"annotations", "legacy_document_metadata", "legacy_document_envelope"}:
+                raise SchemaInvalid("SCHEMA_INVALID", "Invalid temporal import envelope")
+            if not isinstance(payload["legacy_document_metadata"], dict) or not isinstance(payload["legacy_document_envelope"], dict):
+                raise SchemaInvalid("SCHEMA_INVALID", "Temporal metadata must be an object")
+            new_task["annotations"] = self._apply_operation(
+                copy.deepcopy(current["annotations"]), "replace_annotations", {"annotations": payload["annotations"]})
+            new_task["legacy_document_metadata"] = copy.deepcopy(payload["legacy_document_metadata"])
+            new_task.setdefault("extensions", {})["temporal_source"] = copy.deepcopy(payload["legacy_document_envelope"])
+        elif operation == "review_annotation":
+            if set(payload) != {"annotation_id", "reviewed"} or type(payload["reviewed"]) is not bool:
+                raise SchemaInvalid("SCHEMA_INVALID", "Review requires annotation_id and a boolean")
+            S.require_id(payload["annotation_id"], "annotation_id")
+            if not any(a["id"] == payload["annotation_id"] for a in new_task["annotations"]):
+                raise NotFound("ANNOTATION_NOT_FOUND", "Annotation to review is missing")
+        else:
+            new_task["annotations"] = self._apply_operation(copy.deepcopy(current["annotations"]), operation, payload)
         new_task["revision"] = current_rev + 1
         template = next(value for value in self.list_templates() if value["id"] == current["template_id"] and value["version"] == current["template_version"])
         for annotation in new_task["annotations"]:
             self._validate_annotation(annotation, self.get_media(current["media_id"]), template)
+        previous = {a["id"]: a for a in current["annotations"]}
+        for annotation in new_task["annotations"]:
+            prior = previous.get(annotation["id"])
+            subject = self.annotation_review_digest(annotation, new_task)
+            # Review is a separate explicit action. Normal commands cannot forge,
+            # inherit or resurrect a review by carrying a stale reviewed flag.
+            valid = (annotation.get("review_status") == "reviewed"
+                     and prior is not None and prior.get("review_status") == "reviewed"
+                     and isinstance(prior.get("review_binding"), dict)
+                     and prior["review_binding"].get("content_sha256") == subject)
+            annotation.pop("review_binding", None)
+            annotation["review_status"] = "reviewed" if valid else "unreviewed"
+            if valid:
+                annotation["review_binding"] = copy.deepcopy(prior["review_binding"])
+            if operation == "review_annotation" and annotation["id"] == payload["annotation_id"]:
+                annotation["review_status"] = "reviewed" if payload["reviewed"] else "unreviewed"
+                annotation.pop("review_binding", None)
+                if payload["reviewed"]:
+                    annotation["review_binding"] = {"content_sha256": subject, "actor_id": "local-user",
+                                                   "command_id": command_id, "reviewed_at": _now(),
+                                                   "task_revision": new_task["revision"]}
         new_task["content_sha256"] = self.task_digest(new_task)
         new_rev_id = S.make_id("rev", task_id + str(new_task["revision"]))
         commit_id = S.make_id("cmt", command_id)
@@ -600,13 +670,31 @@ class WorkspaceStore:
             self.conn.execute(
                 "INSERT INTO durable_commits(id,body) VALUES(?,?)",
                 (commit_id, json.dumps({"id": commit_id, "task_id": task_id,
-                                        "revision": new_task["revision"]}, ensure_ascii=False)))
+                                        "revision": new_task["revision"], "operation": operation,
+                                        **({"history_parent_revision": original["previous_revision"],
+                                            "target_command_id": target_id} if operation == "revert_command" else {})}, ensure_ascii=False)))
             self.conn.execute(
                 "INSERT INTO command_receipts(command_id,task_id,request_sha256,state,response,created_at)"
                 " VALUES(?,?,?,?,?,?)",
                 (command_id, task_id, request_sha, "committed",
                  json.dumps(response, ensure_ascii=False), ts))
         return {"applied": True, "idempotent_replay": False, "response": response}
+
+    @staticmethod
+    def _history_subject(task):
+        subject = copy.deepcopy(S.task_subject(task))
+        subject.pop("revision")
+        for annotation in subject["annotations"]:
+            annotation.pop("review_status", None)
+            annotation.pop("review_binding", None)
+        return subject
+
+    @staticmethod
+    def annotation_review_digest(annotation, task):
+        subject = {key: value for key, value in annotation.items()
+                   if key not in {"review_status", "review_binding"}}
+        return S.sha256_text({"annotation": subject, "media_id": task["media_id"],
+                              "template_id": task["template_id"], "template_version": task["template_version"]})
 
     def _apply_operation(self, annotations: List[Dict[str, Any]], operation: str,
                          payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -667,7 +755,7 @@ class WorkspaceStore:
         return annotations
 
     def _validate_annotation(self, ann, media, template):
-        allowed = {"id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids", "provenance", "start", "end", "at", "legacy_id", "review_status"}
+        allowed = {"id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids", "provenance", "start", "end", "at", "legacy_id", "review_status", "review_binding"}
         if set(ann) - allowed:
             raise SchemaInvalid("SCHEMA_INVALID", "Annotation contains unknown fields")
         S.require_id(ann.get("id"))

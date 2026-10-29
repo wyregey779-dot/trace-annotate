@@ -91,6 +91,9 @@ def _command(body):
         "update_annotation": {"annotation_id", "changes"},
         "delete_annotation": {"annotation_id"},
         "replace_annotations": {"annotations"},
+        "revert_command": {"target_command_id"},
+        "review_annotation": {"annotation_id", "reviewed"},
+        "import_temporal": {"annotations", "legacy_document_metadata", "legacy_document_envelope"},
     }.get(body["operation"])
     if required is None:
         raise SchemaInvalid("UNSUPPORTED_OPERATION", "Operation is not implemented in this slice")
@@ -500,6 +503,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, snapshot)
             return
         if self.command == "GET":
+            if parts == ["drafts"]:
+                self._send_json(200, {"drafts": self.server.drafts.list()})
+                return
+            if len(parts) == 2 and parts[0] == "drafts":
+                _require_id(parts[1], "draft_id")
+                self._send_json(200, self.server.drafts.get(parts[1]))
+                return
             if len(parts) == 3 and parts[0] == "tasks" and parts[2] in {"report", "export"}:
                 _require_id(parts[1], "task_id")
                 if parts[2] == "report":
@@ -548,19 +558,26 @@ class _Handler(BaseHTTPRequestHandler):
             task_command = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "commands"
             task_import_temporal = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "import-temporal"
             control = len(parts) == 3 and parts[0] in ("batches", "jobs") and parts[2] == "control"
-            if not (task_command or task_import_temporal or control or parts == ["batches"]):
+            if not (task_command or task_import_temporal or control or parts in (["batches"], ["drafts"])):
                 raise NotFound("NOT_FOUND", "Unknown route")
             if len(parts) > 1:
                 _require_id(parts[1], "resource_id")
             raw, body = self._read_body()
             with store.transaction():
-                if task_command:
+                if parts == ["drafts"]:
+                    expected = {"draft_id", "editor_session_id", "task_id", "media_id", "expected_draft_revision", "body"}
+                    if not isinstance(body, dict) or set(body) != expected:
+                        raise SchemaInvalid("SCHEMA_INVALID", "Invalid draft save request")
+                    result = self.server.drafts.save(**body)
+                elif task_command:
                     body = _command(body)
                     result = store.apply_task_command(task_id=parts[1], request_body=raw, **body)["response"]
                 elif task_import_temporal:
                     task = store.get_task(parts[1])
                     media = store.get_media(task["media_id"])
                     doc = body.get("document", body)
+                    if not isinstance(doc, dict):
+                        raise SchemaInvalid("SCHEMA_INVALID", "Temporal document must be an object")
                     # D00/D04 stopgap: the client must pin the command identity and the
                     # exact base revision it saw. The server must not invent a fresh
                     # command id or silently replay against the current revision, or a
@@ -594,18 +611,18 @@ class _Handler(BaseHTTPRequestHandler):
                         except (TypeError, ValueError) as exc:
                             raise SchemaInvalid("MEDIA_IDENTITY_MISMATCH",
                                                 "Invalid media_size") from exc
-                    from .legacy_adapter import import_temporal_document
-                    annotations = import_temporal_document(doc, media)
+                    from .legacy_adapter import temporal_import_payload
+                    import_payload = temporal_import_payload(doc, media)
                     result = store.apply_task_command(
                         command_id=cmd_id,
                         task_id=task["id"],
                         expected_revision=exp_rev,
                         expected_sha256=exp_sha,
-                        operation="replace_annotations",
-                        payload={"annotations": annotations},
+                        operation="import_temporal",
+                        payload=import_payload,
                         request_body=raw,
                     )["response"]
-                    result["imported_count"] = len(annotations)
+                    result["imported_count"] = len(import_payload["annotations"])
                 elif control:
                     body = _fields(body, {"command_id", "action"})
                     if not isinstance(body["action"], str):
@@ -648,6 +665,8 @@ def make_server(store: WorkspaceStore, host: str = "127.0.0.1", port: int = 0) -
         project_id = store.get_snapshot()["project_id"]
     server = WorkspaceHTTPServer((host, port), _Handler)
     server.store = store
+    from .drafts import WorkspaceDrafts
+    server.drafts = WorkspaceDrafts(store)
     server.queue = queue
     server.project_id = project_id
     server.token = secrets.token_urlsafe(32)

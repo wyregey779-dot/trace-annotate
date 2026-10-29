@@ -4,10 +4,12 @@
 
 - Add progressive enhancements to the unified workspace editor while preserving classic tools:
   - Multi-track visual timeline with sub-lane interval scheduling for overlapping segment clips, review state markers, and interactive click-to-seek navigation.
-  - Task-isolated undo and redo history stack (Undo/Redo buttons, Ctrl+Z, Ctrl+Y/Ctrl+Shift+Z) backed by server replace_annotations commands.
-  - Form-level manual review toggle with strict automatic invalidation on any content or timing modification.
-  - Bidirectional lossless adapter and endpoints (export format=temporal, import-temporal) for seamless round-trips with temporal v1/v2 schema documents, preserving legacy IDs, tracks, tags, text, and review states.
-  - Emergency in-memory draft rescue export to download uncommitted drafts and task states as local JSON snapshots.
+  - Conditional undo/redo commands bound to the original durable receipt and protected history successor. Divergent cross-tab history is rejected without overwriting saved annotations; failed or unknown saves do not advance history.
+  - Explicit local review actions bound to annotation content, media and template. Content changes invalidate review; imported flags and reverted content do not create a new approval. Local review is not independent semantic certification.
+  - Temporal import pins task/base identity before asynchronous reading, retains a stable pending command, checks v2 media identity and stores metadata/source envelope atomically. Projections disclose omitted types, anchors, history and precision losses.
+  - Session-isolated CAS drafts, full rescue download and validated restoration in a fresh tab. Pending requests are queried before explicit resend; rescue remains available while editing is disabled.
+  - Quiescent SQLite/object-closure backup and verified restoration to a new directory. Active intake/queue work is refused; external source media and unregistered files remain outside this experimental backup scope.
+  - Portable source/installed enhancement regressions with fresh output directories, durable failure evidence and required CI steps; installed checks reject checkout fallback.
 
 - Restore continuous playback after selected-segment playback ends. Keep explicit play/pause, speed, segment loop and exact-frame controls; add actual button and task-switch browser regressions.
 - Link the original general and embodied editors from the experimental batch workbench. Serve unchanged packaged editors with page-specific Blob/Worker policies and script nonces, retaining existing file workflows and API authorization.

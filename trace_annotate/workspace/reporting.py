@@ -134,6 +134,25 @@ def _coverage(intervals, first, endpoint):
             "overlaps": [_interval(*item) for item in overlaps]}
 
 
+def _review_qualification(store, task, annotations):
+    """Describe effective local review without rewriting historical task bytes."""
+    current, historical, unreviewed = 0, 0, 0
+    for annotation in annotations:
+        if annotation.get("review_status") != "reviewed":
+            unreviewed += 1
+            continue
+        binding = annotation.get("review_binding")
+        if (isinstance(binding, dict)
+                and binding.get("content_sha256") == store.annotation_review_digest(annotation, task)):
+            current += 1
+        else:
+            historical += 1
+    return {"scope": "local_content_binding_only_not_independent_semantic_certification",
+            "content_bound_reviewed": current, "historical_or_unbound_reviewed": historical,
+            "unreviewed": unreviewed,
+            "limitations": "Unbound historical flags do not constitute current approval; local actor identity is not independent verification."}
+
+
 def _report(store, task, media, template):
     first, endpoint = S.rational_value(media["video_start"]), S.rational_value(media["video_end"])
     if not 0 <= first < endpoint <= S.rational_value(media["duration"]):
@@ -191,6 +210,7 @@ def _report(store, task, media, template):
                        "segments": kinds["segment"], "events": kinds["event"], "whole_clip": kinds["whole_clip"],
                        "tag_occurrences": sum(tags.values()), "unique_tags": len(tags)},
             "tags": [{"tag": tag, "count": count} for tag, count in sorted(tags.items())],
+            "review_qualification": _review_qualification(store, task, valid),
             "checks": {"status": "failed" if errors else "passed", "errors": errors},
             "statistics_status": "budget_exceeded" if any(
                 track["statistics_status"] == "budget_exceeded" for track in tracks) else "complete",
@@ -272,7 +292,7 @@ def _srt(task, track, track_id=None):
 
 def export_task(store, task_id, format, *, track=None, track_id=None):
     if format not in {"json", "csv", "srt", "temporal"}:
-        raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT", "Supported task exports are json, csv and srt")
+        raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT", "Supported task exports are json, csv, srt and temporal")
     if track is not None and track_id is not None:
         raise SchemaInvalid("TRACK_SELECTION_CONFLICT", "Select a track by either name or ID, not both")
     if (track is not None or track_id is not None) and format != "srt":
@@ -294,13 +314,17 @@ def export_task(store, task_id, format, *, track=None, track_id=None):
         elif format == "csv":
             data = _csv(task).encode("utf-8-sig")
             content_type = "text/csv; charset=utf-8"
-            losses = "Spreadsheet text is formula-escaped; annotation_json preserves originals; no media or review history."
+            losses = ("Spreadsheet text is formula-escaped; annotation_json preserves original annotations; "
+                      "excludes task/document metadata, source envelope, template, media, receipts and review history.")
         elif format == "temporal":
-            from .legacy_adapter import export_temporal_document
+            from .legacy_adapter import export_temporal_document, temporal_projection_losses
             doc = export_temporal_document(task, media, schema_version=2)
             data = json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
             content_type = "application/json; charset=utf-8"
-            losses = "Lossless temporal v2 projection: preserves segments, labels, tracks, review statuses, metadata; excludes workspace-only revisions."
+            disclosures = temporal_projection_losses(task, media)
+            if report["review_qualification"]["historical_or_unbound_reviewed"]:
+                disclosures.append("Unbound historical review flags are legacy states, not current content-bound approval.")
+            losses = " ".join(disclosures)
         else:
             data = _srt(task, track, track_id).encode("utf-8")
             content_type = "application/x-subrip; charset=utf-8"

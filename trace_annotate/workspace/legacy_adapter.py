@@ -1,17 +1,141 @@
-"""Lossless bidirectional adapter between temporal v1/v2 format and workspace schema.
+"""Temporal adapters with persisted source metadata and explicit projection loss.
 
-Guarantees byte-for-byte or semantic roundtrip of segments, tags, Unicode text,
-labels, tracks, review status, and metadata without silent field loss.
+Temporal documents describe segments only. They cannot carry workspace events,
+frame anchors, command history or independent review evidence. The full task
+snapshot remains authoritative for those fields.
 """
 from __future__ import annotations
 
-import math
+import copy
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from ..temporal.schema import validate_document, require_valid_document
 from . import schema as S
 from .errors import SchemaInvalid
+
+
+def temporal_import_payload(doc, media, *, actor_id="user"):
+    """Build the atomic import payload, including the original source envelope.
+
+    The store persists ``legacy_document_metadata`` and the envelope under
+    ``extensions.temporal_source`` in the same revision as the annotations.
+    Both locations already participate in the task digest. No caller should
+    reconstruct metadata after saving the annotations.
+    """
+    annotations = import_temporal_document(doc, media, actor_id=actor_id)
+    envelope = {key: copy.deepcopy(doc[key]) for key in
+                ("kind", "schema_version", "clip", "duration", "media_size", "media_sha256")
+                if key in doc}
+    envelope["metadata_present"] = "metadata" in doc
+    envelope["media_size_present"] = "media_size" in doc
+    envelope["source_reviews"] = [
+        {"annotation_id": annotation["id"], "legacy_id": segment["id"],
+         "review_status": segment["review_status"]}
+        for annotation, segment in zip(annotations, doc["segments"])
+    ]
+    payload = {"annotations": annotations,
+               "legacy_document_metadata": copy.deepcopy(doc.get("metadata", {})),
+               "legacy_document_envelope": envelope}
+    validate_temporal_import_payload(payload, media)
+    return payload
+
+
+def validate_temporal_import_payload(payload, media):
+    """Validate direct command callers as strictly as the HTTP document route."""
+    def invalid():
+        raise SchemaInvalid("INVALID_TEMPORAL_ENVELOPE", "Invalid persisted temporal source envelope")
+    if (not isinstance(payload, dict) or set(payload) != {
+            "annotations", "legacy_document_metadata", "legacy_document_envelope"}):
+        invalid()
+    annotations, metadata, envelope = [payload[key] for key in
+        ("annotations", "legacy_document_metadata", "legacy_document_envelope")]
+    required = {"kind", "schema_version", "clip", "duration", "metadata_present",
+                "media_size_present", "source_reviews"}
+    if (not isinstance(annotations, list) or not isinstance(metadata, dict)
+            or not isinstance(envelope, dict) or not required <= set(envelope)
+            or set(envelope) - required - {"media_size", "media_sha256"}
+            or type(envelope["metadata_present"]) is not bool
+            or type(envelope["media_size_present"]) is not bool
+            or envelope["media_size_present"] != ("media_size" in envelope)
+            or (not envelope["metadata_present"] and metadata)):
+        invalid()
+    reviews = envelope["source_reviews"]
+    if not isinstance(reviews, list) or len(reviews) != len(annotations):
+        invalid()
+    doc = {key: copy.deepcopy(envelope[key]) for key in
+           ("kind", "schema_version", "clip", "duration", "media_size", "media_sha256")
+           if key in envelope}
+    if envelope["metadata_present"]:
+        doc["metadata"] = copy.deepcopy(metadata)
+    doc["segments"] = []
+    for annotation, review in zip(annotations, reviews):
+        if (not isinstance(annotation, dict) or annotation.get("type") != "segment"
+                or not isinstance(review, dict)
+                or set(review) != {"annotation_id", "legacy_id", "review_status"}
+                or review["annotation_id"] != annotation.get("id")
+                or review["legacy_id"] != (annotation.get("legacy_id") or annotation.get("id"))
+                or review["review_status"] != annotation.get("review_status")):
+            invalid()
+        try:
+            doc["segments"].append({"id": review["legacy_id"],
+                "start": float(S.rational_value(annotation["start"]["seconds"])),
+                "end": float(S.rational_value(annotation["end"]["seconds"])),
+                **{key: copy.deepcopy(annotation[key]) for key in
+                   ("label", "text", "tags", "track", "review_status")}})
+        except (KeyError, TypeError):
+            invalid()
+    if validate_document(doc):
+        invalid()
+    source = media.get("source", {})
+    if doc["schema_version"] == 2:
+        if (doc["media_sha256"] != source.get("sha256")
+                or str(doc["media_size"]) != str(source.get("size_bytes"))):
+            raise SchemaInvalid("MEDIA_IDENTITY_MISMATCH", "Temporal source envelope does not match admitted media")
+
+
+def _source_envelope(task):
+    extensions = task.get("extensions", {})
+    source = extensions.get("temporal_source", {}) if isinstance(extensions, dict) else {}
+    return source if isinstance(source, dict) else {}
+
+
+def temporal_projection_losses(task, media):
+    """Return ASCII HTTP-header-safe disclosures for the actual projection."""
+    losses = ["Temporal v2 segment projection; excludes workspace revisions, receipts, "
+              "template, evidence, content-bound review records and provenance; not a complete workspace backup."]
+    omitted = Counter(ann.get("type", "unknown") for ann in task.get("annotations", [])
+                      if ann.get("type") != "segment")
+    if omitted:
+        # Validated annotation kinds are a finite ASCII vocabulary. Do not put
+        # arbitrary labels, metadata or track names into an HTTP header.
+        losses.append("Omitted annotation types: " + ", ".join(
+            f"{kind}={omitted[kind]}" for kind in ("event", "whole_clip") if omitted[kind]) + ".")
+    segments = [ann for ann in task.get("annotations", []) if ann.get("type") == "segment"]
+    anchors = sum("anchor" in ann.get(key, {}) for ann in segments for key in ("start", "end"))
+    if anchors:
+        losses.append(f"Omitted frame anchors: {anchors}.")
+    rounded = 0
+    for ann in segments:
+        for key in ("start", "end"):
+            value = S.rational_value(ann[key]["seconds"])
+            if S.rational_value(S.rational(float(value))) != value:
+                rounded += 1
+    if rounded:
+        losses.append(f"Rational times rounded to JSON decimal numbers: {rounded}.")
+    source = _source_envelope(task)
+    if source.get("schema_version") == 1:
+        losses.append("Original temporal v1 projected as v2 with admitted media identity.")
+    if any(item.get("review_status") == "reviewed" for item in source.get("source_reviews", [])):
+        losses.append("Historical review provenance remains in the workspace source envelope; "
+                      "exported review statuses are current states, not a new independent approval.")
+    declared = source.get("duration")
+    if declared is not None and any(
+            S.rational_value(ann["end"]["seconds"]) > S.rational_value(S.rational(declared))
+            for ann in segments):
+        losses.append("Original declared duration extended to admitted duration for current segments.")
+    return losses
 
 
 def import_temporal_document(
@@ -92,7 +216,8 @@ def export_temporal_document(
     if schema_version not in (1, 2):
         raise SchemaInvalid("UNSUPPORTED_VERSION", "Only temporal schema version 1 and 2 are supported")
 
-    clip_name = Path(media.get("source", {}).get("display_name") or "video.mp4").name
+    source = _source_envelope(task)
+    clip_name = source.get("clip") or Path(media.get("source", {}).get("display_name") or "video.mp4").name
     duration = float(S.rational_value(media["duration"]))
 
     segments: List[Dict[str, Any]] = []
@@ -116,6 +241,14 @@ def export_temporal_document(
         }
         segments.append(segment_obj)
 
+    # Preserve the imported declaration when it still contains every segment.
+    # A later edit extending beyond it uses the admitted duration, with the
+    # corresponding loss disclosure instead of silently exporting invalid JSON.
+    declared_duration = source.get("duration")
+    if declared_duration is not None and all(
+            S.rational_value(ann["end"]["seconds"]) <= S.rational_value(S.rational(declared_duration))
+            for ann in task.get("annotations", []) if ann.get("type") == "segment"):
+        duration = copy.deepcopy(declared_duration)
 
     doc: Dict[str, Any] = {
         "kind": "temporal",
@@ -130,8 +263,23 @@ def export_temporal_document(
         doc["media_size"] = int(raw_size)
         doc["media_sha256"] = media.get("source", {}).get("sha256") or media.get("sha256", "")
 
-    if "metadata" in task and isinstance(task["metadata"], dict):
-        doc["metadata"] = dict(task["metadata"])
+    if "legacy_document_metadata" in task:
+        metadata = task["legacy_document_metadata"]
+        if not isinstance(metadata, dict):
+            raise SchemaInvalid("INVALID_TEMPORAL_METADATA", "Stored temporal metadata is not an object")
+        if source.get("metadata_present", True) or metadata:
+            doc["metadata"] = copy.deepcopy(metadata)
+    elif "metadata" in task and isinstance(task["metadata"], dict):
+        # Compatibility for callers predating persisted workspace imports.
+        doc["metadata"] = copy.deepcopy(task["metadata"])
 
-    require_valid_document(doc)
+    if schema_version == 1 and source.get("media_size_present"):
+        doc["media_size"] = int(media.get("source", {}).get("size_bytes") or media.get("size_bytes", 0))
+
+    try:
+        require_valid_document(doc)
+    except ValueError as exc:
+        raise SchemaInvalid("TEMPORAL_PROJECTION_UNSUPPORTED",
+                            "Current task cannot be represented by the temporal format; use the complete task snapshot",
+                            details={"violations": validate_document(doc)}) from exc
     return doc

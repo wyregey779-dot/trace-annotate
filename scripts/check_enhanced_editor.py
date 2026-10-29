@@ -1,62 +1,73 @@
-"""Exercise progressive enhancements in an isolated Chromium browser:
-1. Multi-track visual timeline with sub-lanes and interactive clips.
-2. Manual review toggle with automatic invalidation on input modification.
-3. Undo and Redo operations via replace_annotations command.
-4. Lossless Temporal JSON export and import endpoints.
-5. Emergency draft rescue snapshot export.
+"""Run enhancement browser regressions against source or an isolated installed wheel.
+
+Requires a NEW --output directory. Generates only synthetic media, preserves
+failure evidence, and never removes prior output. Installed mode requires -I
+and reuses the workspace acceptance resource/fixture identity checks.
+This is headless workflow evidence, not human listening or semantic accuracy.
 """
+import argparse
+from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
-import shutil
 import sys
 import threading
-import time
+import traceback
 
 SOURCE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SOURCE))
-
-from trace_annotate.workspace.server import make_server
-from trace_annotate.workspace.store import WorkspaceStore
-from playwright.sync_api import sync_playwright, expect
 
 
 def digest(path):
     h = hashlib.sha256()
-    with Path(path).open("rb") as s:
-        for chunk in iter(lambda: s.read(1024 * 1024), b""):
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def run_checks(output_dir):
-    output = Path(output_dir)
-    if output.exists():
-        shutil.rmtree(output)
-    output.mkdir(parents=True)
+def write_json(path, body):
+    Path(path).write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    fixtures = Path(r"D:\099\TraceAnnotate-implementation\runs\test_ui_run_01\media")
-    media_file = fixtures / "cfr.mp4"
-    if not media_file.is_file():
-        raise RuntimeError("cfr.mp4 fixture missing from test_ui_run_01/media")
 
-    store = WorkspaceStore(output / "workspace")
-    store.create()
-    server = make_server(store)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+def load_harness(installed_wheel):
+    # Load test support by file, never the product from the checkout in installed
+    # mode. The shared harness verifies site-packages and every wheel resource.
+    if installed_wheel is not None and not sys.flags.isolated:
+        raise RuntimeError("Installed acceptance requires the target venv Python with -I")
+    support = SOURCE / "scripts" / "check_workspace_editor.py"
+    spec = importlib.util.spec_from_file_location("traceannotate_workspace_acceptance", support)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    summary = {"checks": [], "page_errors": []}
+
+def run_checks(output, media_file, harness, channel, summary):
+    from playwright.sync_api import sync_playwright, expect
+    store = harness.WorkspaceStore(output / "workspace")
+    server = thread = playwright = browser = context = page = None
+    summary.update(checks=[], page_errors=[], external_requests=[], cleanup_errors=[])
 
     def check(name):
         summary["checks"].append(name)
-        print(f"[CHECK] {name}: PASS", flush=True)
+        print("[CHECK] " + name + ": PASS", flush=True)
+        write_json(output / "summary.json", summary)
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+    try:
+        store.create()
+        server = harness.make_server(store)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        playwright = sync_playwright().start()
+        launch = {"headless": True}
+        if channel:
+            launch["channel"] = channel
+        browser = playwright.chromium.launch(**launch)
         context = browser.new_context(accept_downloads=True, viewport={"width": 1500, "height": 1060})
         page = context.new_page()
         page.on("pageerror", lambda err: summary["page_errors"].append(str(err)))
+        page.on("request", lambda request: summary["external_requests"].append(request.url)
+                if request.url.startswith(("http:", "https:")) and not request.url.startswith(server.origin + "/") else None)
 
         page.goto(server.editor_url)
         expect(page.locator("#file-input")).to_be_enabled()
@@ -95,6 +106,14 @@ def run_checks(output_dir):
         clip1_id = task["annotations"][0]["id"]
         page.locator(f'#segments tbody button[data-annotation-id="{clip1_id}"]').click()
         expect(page.locator("#segment-reviewed")).to_be_checked()
+
+        # A programmatic button change must invalidate review, too. Returning
+        # to the old time does not constitute a new independent review action.
+        page.locator("#use-video-end").click()
+        expect(page.locator("#segment-reviewed")).not_to_be_checked()
+        page.locator("#segment-end").fill("0.5")
+        expect(page.locator("#segment-reviewed")).not_to_be_checked()
+        check("Video-end button invalidates review and restoring a boundary does not revive it")
 
         # Modify label -> check that review checkbox automatically unchecks and warns
         page.locator("#segment-label").fill("Clip A: Modified")
@@ -164,7 +183,7 @@ def run_checks(output_dir):
         expect(page.locator("#redo-btn")).to_be_enabled(timeout=10000)
         assert len(store.get_task(task_id)["annotations"]) == 2
         expect(page.locator("#timeline-tracks .track-section")).to_have_count(1)
-        check("Undo button reverts last annotation change via replace_annotations")
+        check("Undo button conditionally reverts the last annotation change")
 
         # Click Redo -> should restore Clip C
         with page.expect_response(lambda r: r.request.method == "POST" and r.url.endswith(f"/tasks/{task_id}/commands")):
@@ -205,7 +224,9 @@ def run_checks(output_dir):
         # -------------------------------------------------------------
         # Feature 5: Emergency Draft Rescue
         # -------------------------------------------------------------
-        page.locator("#segment-label").fill("Uncommitted Emergency Note")
+        with page.expect_response(lambda r: r.request.method == "POST" and r.url.endswith("/drafts")) as draft_saved:
+            page.locator("#segment-label").fill("Uncommitted Emergency Note")
+        assert draft_saved.value.status == 200, draft_saved.value.text()
         with page.expect_download() as dl_info:
             page.locator("#rescue-draft-btn").click()
         rescue_path = output / "draft_rescue.json"
@@ -214,6 +235,17 @@ def run_checks(output_dir):
         assert rescue_data["task_id"] == task_id
         assert rescue_data["current_form"]["label"] == "Uncommitted Emergency Note"
         check("Emergency Draft Rescue exports uncommitted in-memory form and task snapshot")
+        unchanged_task = store.get_task(task_id)
+        recovered_draft = context.new_page()
+        recovered_draft.goto(server.editor_url)
+        expect(recovered_draft.locator("#restore-saved-draft")).to_be_enabled()
+        recovered_draft.locator("#restore-saved-draft").click()
+        expect(recovered_draft.locator("#confirm-dialog")).to_be_visible()
+        recovered_draft.locator("#confirm-accept").click()
+        expect(recovered_draft.locator("#segment-label")).to_have_value("Uncommitted Emergency Note")
+        assert store.get_task(task_id) == unchanged_task
+        recovered_draft.close()
+        check("Acknowledged project draft restores in a fresh tab without applying an annotation command")
 
         # -------------------------------------------------------------
         # Feature 6: Temporal JSON Import
@@ -259,27 +291,214 @@ def run_checks(output_dir):
             page.locator("#confirm-accept").click()
 
         # Wait for task reload and notice
-        expect(page.locator("#status.success")).to_contain_text("成功导入", timeout=15000)
+        expect(page.locator("#status.success")).to_contain_text("导入已确认保存", timeout=15000)
         task_after = store.get_task(task_id)
         assert len(task_after["annotations"]) == 2
         assert task_after["annotations"][0]["label"] == "Imported Shot 1"
-        assert task_after["annotations"][0]["review_status"] == "reviewed"
+        assert task_after["annotations"][0]["review_status"] == "unreviewed"
         assert task_after["annotations"][0]["id"] == "imported-seg-1"
         assert task_after["annotations"][1]["label"] == "Imported Shot 2"
-        check("Temporal JSON import endpoint seamlessly imports and replaces task annotations preserving legacy IDs")
+        check("Temporal import preserves legacy IDs and marks historical reviews unreviewed for current work")
+
+        # Hold actual File.text() completion, then try to select another task.
+        # The import must retain its original task/base before any await.
+        second_id = store.import_source(media_file)["task_id"]
+        untouched_second = store.get_task(second_id)
+        page.locator("#refresh-workspace").click()
+        expect(page.locator("#save-segment")).to_be_enabled()
+        page.evaluate("""() => {
+            const original = File.prototype.text;
+            window.traceReadEntered = false;
+            File.prototype.text = function() {
+                window.traceReadEntered = true;
+                return new Promise(resolve => {window.traceReleaseRead = async () => resolve(await original.call(this));});
+            };
+            window.traceOriginalFileText = original;
+        }""")
+        page.locator("#import-temporal-file").set_input_files(str(import_path))
+        expect(page.locator("#confirm-dialog")).to_be_visible()
+        page.locator("#confirm-accept").click()
+        page.wait_for_function("() => window.traceReadEntered === true")
+        page.locator(f'#task-list button[data-task-id="{second_id}"]').click()
+        expect(page.locator(f'#task-list button[data-task-id="{task_id}"]')).to_have_attribute("aria-current", "true")
+        with page.expect_response(lambda r: r.request.method == "POST" and r.url.endswith(f"/tasks/{task_id}/import-temporal")):
+            page.evaluate("() => {File.prototype.text = window.traceOriginalFileText; window.traceReleaseRead();}")
+        expect(page.locator("#save-segment")).to_be_enabled()
+        assert store.get_task(second_id) == untouched_second
+        check("File-read barrier and attempted task switch cannot redirect an import to another task")
+
+        # Reproduce the destructive old sequence using actual tabs and a
+        # refresh; a fresh task revision must not reauthorize old snapshots.
+        page.locator('#segments tbody button[data-annotation-id="imported-seg-1"]').click()
+        page.locator("#segment-label").fill("A saved change before B")
+        with page.expect_response(lambda r: r.request.method == "POST" and r.url.endswith(f"/tasks/{task_id}/commands")):
+            page.locator("#save-segment").click()
+        expect(page.locator("#save-segment")).to_be_enabled(timeout=10000)
+        other = context.new_page()
+        other.on("pageerror", lambda error: summary["page_errors"].append(str(error)))
+        other.goto(server.editor_url)
+        other.locator(f'#task-list button[data-task-id="{task_id}"]').click()
+        expect(other.locator("#new-segment")).to_be_enabled(timeout=15000)
+        other.locator("#new-segment").click()
+        other.locator("#segment-label").fill("B independently saved annotation")
+        other.locator("#segment-start").fill("1.1")
+        other.locator("#segment-end").fill("1.8")
+        with other.expect_response(lambda r: r.request.method == "POST" and r.url.endswith(f"/tasks/{task_id}/commands")):
+            other.locator("#save-segment").click()
+        expect(other.locator("#save-segment")).to_be_enabled(timeout=10000)
+        before_undo = store.get_task(task_id)
+        assert len(before_undo["annotations"]) == 3
+        page.locator("#refresh-workspace").click()
+        expect(page.locator("#save-segment")).to_be_enabled(timeout=10000)
+        with page.expect_response(lambda r: r.request.method == "POST" and r.url.endswith(f"/tasks/{task_id}/commands")) as rejected:
+            page.locator("#undo-btn").click()
+        assert rejected.value.status == 409
+        rejection = rejected.value.json()
+        assert rejection["error"]["code"] == "HISTORY_DIVERGED"
+        expect(page.locator("#status.success")).to_have_count(0)
+        assert store.get_task(task_id) == before_undo
+        write_json(output / "cross-tab-history-conflict.json", {
+            "response_status": rejected.value.status, "response": rejection,
+            "before": before_undo, "after": store.get_task(task_id)})
+        page.screenshot(path=str(output / "cross-tab-history-conflict.png"), full_page=True)
+        other.close()
+        check("Stale cross-tab undo after refresh is rejected without removing B's saved annotation")
+
+        # Force an unknown save outcome and failed receipt lookup. Rescue must
+        # remain actionable outside the disabled editing fieldset.
+        page.locator("#refresh-workspace").click()
+        expect(page.locator("#save-segment")).to_be_enabled(timeout=10000)
+        page.locator('#segments tbody button[data-annotation-id="imported-seg-1"]').click()
+        page.locator("#segment-label").fill("Unconfirmed offline rescue form")
+        page.route("**/commands/*", lambda route: route.abort("failed"))
+        page.route("**/tasks/" + task_id + "/commands", lambda route: route.abort("failed"), times=1)
+        page.locator("#save-segment").click()
+        expect(page.locator("#pending-retry")).to_be_visible(timeout=15000)
+        expect(page.locator("#save-segment")).to_be_disabled()
+        expect(page.locator("#rescue-draft-btn")).to_be_enabled()
+        with page.expect_download() as rescued:
+            page.locator("#rescue-draft-btn").click()
+        pending_rescue = output / "pending-draft-rescue.json"
+        rescued.value.save_as(pending_rescue)
+        pending_data = json.loads(pending_rescue.read_text(encoding="utf-8"))
+        assert pending_data["task_id"] == task_id
+        assert pending_data["current_form"]["label"] == "Unconfirmed offline rescue form"
+        assert pending_data["pending_command"]
+        page.screenshot(path=str(output / "pending-save-rescue.png"), full_page=True)
+        check("Unknown-save rescue remains enabled and downloads the original pending command and form")
+
+        # Restore the actual downloaded rescue into a fresh tab. The blocked
+        # command never committed; restore may query it but must not submit it.
+        unchanged = store.get_task(task_id)
+        restored = context.new_page()
+        restored.goto(server.editor_url)
+        expect(restored.locator("#save-segment")).to_be_enabled(timeout=15000)
+        restored.locator("#restore-draft-file").set_input_files(str(pending_rescue))
+        expect(restored.locator("#confirm-dialog")).to_be_visible()
+        restored.locator("#confirm-accept").click()
+        expect(restored.locator("#segment-label")).to_have_value("Unconfirmed offline rescue form")
+        expect(restored.locator("#pending-retry")).to_be_visible()
+        assert store.get_task(task_id) == unchanged
+        # Explicit receipt recovery is the only step that may resend the exact
+        # original request; the rescue import above did not automatically do it.
+        with restored.expect_response(lambda r: r.request.method == "POST" and r.url.endswith(f"/tasks/{task_id}/commands")):
+            restored.locator("#pending-retry").click()
+        expect(restored.locator("#save-segment")).to_be_enabled(timeout=15000)
+        assert store.get_task(task_id)["annotations"][0]["label"] == "Unconfirmed offline rescue form"
+        assert store.get_command_receipt(pending_data["pending_command"]["command"]["command_id"])["state"] == "committed"
+        restored.screenshot(path=str(output / "restored-rescue-explicit-save.png"), full_page=True)
+        restored.close()
+        check("Downloaded pending rescue restores in a fresh tab without writing until explicit original-command recovery")
 
         if summary["page_errors"]:
             raise AssertionError(f"Browser had unexpected page errors: {summary['page_errors']}")
 
-        browser.close()
+        if summary["external_requests"]:
+            raise AssertionError("Unexpected external browser requests")
+    except BaseException:
+        if page is not None:
+            try:
+                page.screenshot(path=str(output / "failure.png"), full_page=True)
+                redacted = page.content().replace(server.token, "REDACTED_EPHEMERAL_TOKEN")
+                (output / "failure-dom.html").write_text(redacted, encoding="utf-8")
+            except Exception as error:
+                summary["failure_capture_error"] = str(error)
+        raise
+    finally:
+        cleanups = []
+        if context is not None:
+            cleanups.append(("browser-context", context.close))
+        if browser is not None:
+            cleanups.append(("browser", browser.close))
+        if playwright is not None:
+            cleanups.append(("playwright", playwright.stop))
+        if server is not None:
+            if thread is not None and thread.is_alive():
+                cleanups.append(("server-shutdown", server.shutdown))
+            cleanups.append(("server-close", server.server_close))
+        if thread is not None:
+            cleanups.append(("server-thread", lambda: thread.join(timeout=5)))
+        cleanups.append(("workspace-store", store.close))
+        for name, action in cleanups:
+            try:
+                action()
+            except Exception as error:
+                summary["cleanup_errors"].append({"resource": name, "error": str(error)})
+        if thread is not None and thread.is_alive():
+            summary["cleanup_errors"].append({"resource": "server-thread", "error": "Still alive after shutdown"})
+    if summary["cleanup_errors"]:
+        raise RuntimeError("Acceptance resource cleanup failed; see summary")
 
-    server.shutdown()
-    server.server_close()
-    thread.join(timeout=5)
-    store.close()
-    print("\nALL PROGRESSIVE ENHANCEMENT CHECKS PASSED SUCCESSFULLY!\n")
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--channel", help="Optional browser channel; still headless")
+    parser.add_argument("--installed-wheel", type=Path,
+                        help="Require -I and site-packages bytes identical to this wheel")
+    args = parser.parse_args()
+    output = args.output.expanduser().resolve()
+    try:
+        output.mkdir(parents=True, exist_ok=False)
+    except OSError as error:
+        parser.error("Output must be a new directory; existing evidence preserved: " + str(error))
+    summary = {"status": "RUNNING", "started_utc": datetime.now(timezone.utc).isoformat(),
+               "argv": [sys.executable] + sys.argv, "python": sys.version,
+               "headless": True, "native_file_picker_tested": False,
+               "installed_identity": None,
+               "scope": "Synthetic enhancement workflow and persistence checks. Not native user Chrome, "
+                        "human listening, semantic annotation accuracy or release readiness."}
+    write_json(output / "summary.json", summary)
+    try:
+        harness = load_harness(args.installed_wheel)
+        files = [Path(__file__).resolve(), SOURCE / "scripts" / "check_workspace_editor.py"] + sorted(
+            path for path in harness.PACKAGE.rglob("*")
+            if path.is_file() and path.suffix in {".py", ".html", ".js"})
+        identities = {str(path): digest(path) for path in files}
+        summary.update(source_sha256=identities, installed_identity=harness.INSTALLED_IDENTITY)
+        write_json(output / "summary.json", summary)
+        sources = harness.make_sources(output)
+        summary["fixtures"] = sources
+        write_json(output / "summary.json", summary)
+        run_checks(output, Path(sources["cfr"]["path"]), harness, args.channel, summary)
+        if any(digest(path) != expected for path, expected in identities.items()):
+            raise AssertionError("Implementation changed during acceptance; rerun against fixed bytes")
+        if any(digest(item["path"]) != item["sha256"] for item in sources.values()):
+            raise AssertionError("A source fixture changed during acceptance")
+        identity = harness.INSTALLED_IDENTITY
+        if identity and digest(identity["wheel"]) != identity["wheel_sha256"]:
+            raise AssertionError("Installed acceptance wheel changed during acceptance")
+        summary["status"] = "PASS"
+    except BaseException as error:
+        description = str(error) or type(error).__name__
+        summary.update(status="INCOMPLETE" if isinstance(error, KeyboardInterrupt) else "FAIL", error=description)
+        (output / "failure.log").write_text(traceback.format_exc(), encoding="utf-8")
+        print("Error: " + description + "; evidence: " + str(output), file=sys.stderr)
+    finally:
+        summary["finished_utc"] = datetime.now(timezone.utc).isoformat()
+        write_json(output / "summary.json", summary)
+    return 0 if summary["status"] == "PASS" else 1
 
 
 if __name__ == "__main__":
-    output_target = Path(r"D:\099\TraceAnnotate-implementation\runs\test_enhanced_ui_run")
-    run_checks(output_target)
+    raise SystemExit(main())

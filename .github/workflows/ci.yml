@@ -126,6 +126,9 @@ jobs:
       - name: Verify persistent multi-video workspace and displayed frame identity
         run: python scripts/check_workspace_editor.py --output output/workspace-editor-ci
 
+      - name: Verify enhancement persistence, history, review and recovery workflows
+        run: python scripts/check_enhanced_editor.py --output output/enhanced-editor-ci
+
       - name: Verify installed wheel editors without checkout imports
         run: |
           python -m pip install build
@@ -135,6 +138,7 @@ jobs:
           candidate_wheels=(output/workspace-dist/*.whl)
           test "${#candidate_wheels[@]}" -eq 1
           "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_editor.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-workspace-ci
+          "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_enhanced_editor.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-enhanced-ci
 
       - name: Upload browser acceptance evidence
         if: always()
@@ -149,5 +153,7 @@ jobs:
             output/prepared-editor-ci
             output/embodied-editor-ci
             output/workspace-editor-ci
+            output/enhanced-editor-ci
             output/installed-workspace-ci
+            output/installed-enhanced-ci
           if-no-files-found: warn

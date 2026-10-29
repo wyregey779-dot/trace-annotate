@@ -167,7 +167,15 @@ def test_replace_annotations_in_store(api):
     assert task_after["revision"] == task_before["revision"] + 1
     assert len(task_after["annotations"]) == 1
     assert task_after["annotations"][0]["id"] == "seg-alpha"
-    assert task_after["annotations"][0]["review_status"] == "reviewed"
+    # Carrying a reviewed flag in an ordinary replacement is not a new review.
+    assert task_after["annotations"][0]["review_status"] == "unreviewed"
+    review_path, review_body = command(store, "cmd-review-replaced-segment")
+    review_body.update(operation="review_annotation", payload={"annotation_id": "seg-alpha", "reviewed": True})
+    status, _, review_receipt = request(server, "POST", review_path, review_body)
+    assert status == 200, review_receipt
+    reviewed = store.get_task(task_id)["annotations"][0]
+    assert reviewed["review_status"] == "reviewed"
+    assert reviewed["review_binding"]["command_id"] == "cmd-review-replaced-segment"
 
     # Export as temporal format via server route
     export_url = f"/api/v1/projects/current/tasks/{task_id}/export?format=temporal"
@@ -255,7 +263,18 @@ def test_post_import_temporal_endpoint(api):
     task_after = store.get_task(task_id)
     assert len(task_after["annotations"]) == 1
     assert task_after["annotations"][0]["id"] == "imported-seg-1"
-    assert task_after["annotations"][0]["review_status"] == "reviewed"
+    assert task_after["annotations"][0]["review_status"] == "unreviewed"
+    assert task_after["extensions"]["temporal_source"]["source_reviews"] == [
+        {"annotation_id": "imported-seg-1", "legacy_id": "imported-seg-1", "review_status": "reviewed"}]
+    # Imported source approval is retained as history. A current approval needs
+    # an explicit action bound to this task's current annotation content.
+    review_path, review_body = command(store, "cmd-review-imported-segment")
+    review_body.update(operation="review_annotation", payload={"annotation_id": "imported-seg-1", "reviewed": True})
+    status, _, review_receipt = request(server, "POST", review_path, review_body)
+    assert status == 200, review_receipt
+    reviewed = store.get_task(task_id)["annotations"][0]
+    assert reviewed["review_status"] == "reviewed"
+    assert reviewed["review_binding"]["command_id"] == "cmd-review-imported-segment"
 
 
 def _doc(media, **over):
