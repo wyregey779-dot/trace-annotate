@@ -223,10 +223,15 @@ def import_temporal_document(
             ann_id = raw_id
             legacy_id = None
         else:
-            ann_id = S.make_id("seg", raw_id)
-            # Ensure unique in case of hash collisions
+            base_id = S.make_id("seg", raw_id)
+            ann_id = base_id
+            suffix = 1
+            # Raw ASCII IDs can deliberately equal generated IDs. Advance a
+            # distinct candidate on every collision; a fixed hash retry can
+            # otherwise loop forever while the HTTP import holds the store.
             while ann_id in seen_ids:
-                ann_id = S.make_id("seg", raw_id + str(len(seen_ids)))
+                ann_id = f"{base_id}-{suffix}"
+                suffix += 1
             legacy_id = raw_id
 
         seen_ids.add(ann_id)

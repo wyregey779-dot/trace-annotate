@@ -1,7 +1,9 @@
 """Test bidirectional adapter between temporal format and workspace schema."""
 from fractions import Fraction
+import copy
 import json
 from pathlib import Path
+import sys
 import pytest
 
 from tests.test_workspace_server import api, command, http_video, request
@@ -9,6 +11,7 @@ from trace_annotate.temporal.schema import validate_document, require_valid_docu
 from trace_annotate.workspace.legacy_adapter import import_temporal_document, export_temporal_document
 from trace_annotate.workspace.reporting import export_task
 from trace_annotate.workspace.schema import rational, rational_value
+from trace_annotate.workspace import schema as S
 
 
 SAMPLE_TEMPORAL_V2 = {
@@ -344,4 +347,39 @@ def test_import_temporal_replay_is_idempotent(api):
     assert s2 == 200, r2
     assert store.get_task(task_id)["revision"] == rev_after_first
     assert len(store.get_task(task_id)["annotations"]) == 1
+
+
+@pytest.mark.parametrize("reserve_suffixes", [False, True])
+def test_legacy_id_collisions_terminate_and_preserve_original_ids(reserve_suffixes):
+    """Valid user IDs must not hold the import transaction in an endless loop."""
+    raw = "非ASCII标注"
+    base = S.make_id("seg", raw)
+    ids = ([base, base + "-1", base + "-2", raw] if reserve_suffixes else
+           [base, S.make_id("seg", raw + "2"), raw])
+    doc = copy.deepcopy(SAMPLE_TEMPORAL_V2)
+    doc["segments"] = [dict(doc["segments"][0], id=ident) for ident in ids]
+    assert validate_document(doc) == []
+    media = {"duration": rational(10), "source": {"display_name": doc["clip"],
+             "sha256": doc["media_sha256"], "size_bytes": str(doc["media_size"])}}
+    # A bounded diagnostic makes the old endless-loop regression fail without
+    # stranding a test thread or requiring the runner to kill a child process.
+    previous_trace = sys.gettrace()
+    remaining = 20_000
+    def bounded_import(frame, event, arg):
+        nonlocal remaining
+        if event == "line" and frame.f_code is import_temporal_document.__code__:
+            remaining -= 1
+            if remaining <= 0:
+                raise AssertionError("Valid legacy ID collision import did not terminate")
+        return bounded_import
+    try:
+        sys.settrace(bounded_import)
+        annotations = import_temporal_document(doc, media)
+    finally:
+        sys.settrace(previous_trace)
+    assert len({ann["id"] for ann in annotations}) == len(ids)
+    assert all(S.ID_RE.fullmatch(ann["id"]) for ann in annotations)
+    assert import_temporal_document(doc, media) == annotations
+    exported = export_temporal_document({"annotations": annotations}, media)
+    assert [seg["id"] for seg in exported["segments"]] == ids
 

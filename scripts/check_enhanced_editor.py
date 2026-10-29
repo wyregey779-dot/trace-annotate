@@ -208,7 +208,7 @@ def run_checks(output, media_file, harness, channel, summary):
         check("Ctrl+Y keyboard shortcut triggers Redo")
 
         # -------------------------------------------------------------
-        # Feature 4: Lossless Temporal JSON Export
+        # Feature 4: Temporal segment projection (not a full workspace backup)
         # -------------------------------------------------------------
         with page.expect_download() as dl_info:
             page.locator("#export-temporal-btn").click()
