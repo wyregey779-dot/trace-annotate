@@ -561,11 +561,41 @@ class _Handler(BaseHTTPRequestHandler):
                     task = store.get_task(parts[1])
                     media = store.get_media(task["media_id"])
                     doc = body.get("document", body)
+                    # D00/D04 stopgap: the client must pin the command identity and the
+                    # exact base revision it saw. The server must not invent a fresh
+                    # command id or silently replay against the current revision, or a
+                    # repeated import would overwrite later human edits.
+                    cmd_id = body.get("command_id")
+                    if not isinstance(cmd_id, str) or not cmd_id:
+                        raise SchemaInvalid("IMPORT_REQUIRES_COMMAND_ID",
+                                            "Temporal import requires an explicit command_id")
+                    exp_rev = body.get("expected_revision")
+                    exp_sha = body.get("expected_sha256")
+                    if type(exp_rev) is not int or not isinstance(exp_sha, str) or not exp_sha:
+                        raise SchemaInvalid("IMPORT_REQUIRES_BASE_REVISION",
+                                            "Temporal import requires expected_revision and expected_sha256")
+                    # D00/D03 stopgap: a v2 document pins the source media by hash and
+                    # size. Never replace task annotations when those do not match the
+                    # media this task actually references; name and duration are hints only.
+                    declared_sha = doc.get("media_sha256")
+                    if declared_sha is not None:
+                        source_sha = (media.get("source") or {}).get("sha256")
+                        if (not isinstance(declared_sha, str) or not declared_sha
+                                or source_sha is None or source_sha != declared_sha.lower()):
+                            raise SchemaInvalid("MEDIA_IDENTITY_MISMATCH",
+                                                "Document media_sha256 does not match the task media")
+                    declared_size = doc.get("media_size")
+                    if declared_size is not None:
+                        source_size = (media.get("source") or {}).get("size_bytes")
+                        try:
+                            if source_size is None or int(source_size) != int(declared_size):
+                                raise SchemaInvalid("MEDIA_IDENTITY_MISMATCH",
+                                                    "Document media_size does not match the task media")
+                        except (TypeError, ValueError) as exc:
+                            raise SchemaInvalid("MEDIA_IDENTITY_MISMATCH",
+                                                "Invalid media_size") from exc
                     from .legacy_adapter import import_temporal_document
                     annotations = import_temporal_document(doc, media)
-                    cmd_id = body.get("command_id") or ("cmd-imp-" + secrets.token_hex(8))
-                    exp_rev = body.get("expected_revision", task["revision"])
-                    exp_sha = body.get("expected_sha256", task["content_sha256"])
                     result = store.apply_task_command(
                         command_id=cmd_id,
                         task_id=task["id"],

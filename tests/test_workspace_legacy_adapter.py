@@ -241,7 +241,13 @@ def test_post_import_temporal_endpoint(api):
     }
 
     url = f"/api/v1/projects/current/tasks/{task_id}/import-temporal"
-    status, _, res = request(server, "POST", url, doc)
+    task_before = store.get_task(task_id)
+    status, _, res = request(server, "POST", url, {
+        "document": doc,
+        "command_id": "cmd-import-1",
+        "expected_revision": task_before["revision"],
+        "expected_sha256": task_before["content_sha256"],
+    })
     assert status == 200, res
     assert res["applied"] is True
     assert res["imported_count"] == 1
@@ -250,3 +256,73 @@ def test_post_import_temporal_endpoint(api):
     assert len(task_after["annotations"]) == 1
     assert task_after["annotations"][0]["id"] == "imported-seg-1"
     assert task_after["annotations"][0]["review_status"] == "reviewed"
+
+
+def _doc(media, **over):
+    doc = {
+        "kind": "temporal", "schema_version": 2,
+        "clip": media["source"]["display_name"],
+        "duration": float(rational_value(media["duration"])),
+        "media_size": int(media["source"]["size_bytes"]),
+        "media_sha256": media["source"]["sha256"],
+        "segments": [{"id": "seg-a", "start": 0.1, "end": 0.9, "label": "A",
+                      "text": "t", "tags": [], "track": "main",
+                      "review_status": "unreviewed"}],
+    }
+    doc.update(over)
+    return doc
+
+
+def test_import_temporal_rejects_missing_command_identity(api):
+    server, store = api
+    task_id = store.list_tasks()[0]["task_id"]
+    media = store.get_media(store.get_task(task_id)["media_id"])
+    doc = _doc(media)
+    url = f"/api/v1/projects/current/tasks/{task_id}/import-temporal"
+    # No command_id at all -> rejected (no invented idempotency key).
+    status, _, res = request(server, "POST", url, doc)
+    assert status == 422, res
+    assert res["error"]["code"] == "IMPORT_REQUIRES_COMMAND_ID"
+    task_before = store.get_task(task_id)
+    # Declared hash does not match this task's media -> rejected, task untouched.
+    bad = _doc(media, media_sha256="0" * 64)
+    status, _, res = request(server, "POST", url, {
+        "document": bad, "command_id": "cmd-bad-hash",
+        "expected_revision": task_before["revision"],
+        "expected_sha256": task_before["content_sha256"],
+    })
+    assert status == 422, res
+    assert res["error"]["code"] == "MEDIA_IDENTITY_MISMATCH"
+    assert len(store.get_task(task_id)["annotations"]) == len(task_before["annotations"])
+    # Declared size mismatch -> rejected.
+    badsize = _doc(media, media_size=int(media["source"]["size_bytes"]) + 999)
+    status, _, res = request(server, "POST", url, {
+        "document": badsize, "command_id": "cmd-bad-size",
+        "expected_revision": task_before["revision"],
+        "expected_sha256": task_before["content_sha256"],
+    })
+    assert status == 422, res
+    assert res["error"]["code"] == "MEDIA_IDENTITY_MISMATCH"
+
+
+def test_import_temporal_replay_is_idempotent(api):
+    server, store = api
+    task_id = store.list_tasks()[0]["task_id"]
+    media = store.get_media(store.get_task(task_id)["media_id"])
+    doc = _doc(media)
+    url = f"/api/v1/projects/current/tasks/{task_id}/import-temporal"
+    task_before = store.get_task(task_id)
+    body = {
+        "document": doc, "command_id": "cmd-replay-1",
+        "expected_revision": task_before["revision"],
+        "expected_sha256": task_before["content_sha256"],
+    }
+    s1, _, r1 = request(server, "POST", url, body)
+    assert s1 == 200, r1
+    rev_after_first = store.get_task(task_id)["revision"]
+    # Re-post the SAME command id (e.g. response lost) -> same receipt, no second apply.
+    s2, _, r2 = request(server, "POST", url, body)
+    assert s2 == 200, r2
+    assert store.get_task(task_id)["revision"] == rev_after_first
+    assert len(store.get_task(task_id)["annotations"]) == 1
+
