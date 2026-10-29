@@ -92,3 +92,51 @@ def test_sync_import_still_returns_task_immediately(server):
     status, body = _upload(httpd, media, async_flag=False)
     assert status == 200, body
     assert body["task_id"] and int(body["frames"]) >= 1
+
+
+def _post_json(httpd, path):
+    conn = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=10)
+    conn.request("POST", path, body=b"{}",
+                 headers={TOKEN_HEADER: httpd.token, "Origin": httpd.origin,
+                          "Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    return resp.status, data
+
+
+def test_enqueue_then_cancel_and_retry_through_http(server, tmp_path):
+    httpd, store, media = server
+    # A tiny corrupt upload fails fast so we can exercise retry over HTTP.
+    bad = tmp_path / "bad.mp4"
+    bad.write_bytes(b"not media" * 16)
+    conn = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=10)
+    conn.request("POST", "/api/v1/projects/current/imports?async=1", body=bad.read_bytes(),
+                 headers={TOKEN_HEADER: httpd.token, "Origin": httpd.origin,
+                          "Content-Type": "application/octet-stream",
+                          "Content-Length": str(bad.stat().st_size),
+                          "X-TraceAnnotate-Filename": "bad.mp4"})
+    resp = conn.getresponse()
+    queued = json.loads(resp.read())
+    conn.close()
+    assert resp.status == 202 and queued["state"] == "queued"
+    intake_id = queued["id"]
+    # Wait for the drainer to fail it.
+    for _ in range(40):
+        _, row = _get(httpd, f"/api/v1/projects/current/intakes/{intake_id}")
+        if row["state"] == "failed":
+            break
+        time.sleep(0.25)
+    assert row["state"] == "failed"
+    # Retry moves it back to the queue; it fails again deterministically.
+    status, row = _post_json(httpd, f"/api/v1/projects/current/intakes/{intake_id}/retry")
+    assert status == 200 and row["state"] == "queued", row
+    for _ in range(40):
+        _, row = _get(httpd, f"/api/v1/projects/current/intakes/{intake_id}")
+        if row["state"] == "failed":
+            break
+        time.sleep(0.25)
+    assert row["state"] == "failed"
+    # Cancel on a terminal row is a no-op that returns the row.
+    status, row = _post_json(httpd, f"/api/v1/projects/current/intakes/{intake_id}/cancel")
+    assert status == 200 and row["state"] == "failed"
