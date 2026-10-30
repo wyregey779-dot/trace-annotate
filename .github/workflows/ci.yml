@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # A missing FFmpeg/ffprobe must fail CI instead of skipping media coverage.
+  TRACEANNOTATE_REQUIRE_MEDIA_TOOLS: "1"
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -147,6 +151,18 @@ jobs:
       - name: Verify intake cancel/retry buttons post JSON command receipts
         run: python scripts/check_workspace_intake_controls.py --output output/intake-controls-ci
 
+      - name: Verify the batch upload engine accepts, reconciles, resumes and stops
+        run: python scripts/check_workspace_batch_upload.py --output output/batch-upload-ci
+
+      - name: Check the required browser control case sets are complete
+        run: |
+          python scripts/check_workspace_intake_controls.py --check-cases
+          python scripts/check_workspace_intake_controls.py --check-cases --fault missing-control
+          python scripts/check_workspace_intake_controls.py --check-cases --fault no-effect
+          python scripts/check_workspace_batch_upload.py --check-cases
+          python scripts/check_workspace_batch_upload.py --check-cases --fault missing-control
+          python scripts/check_workspace_batch_upload.py --check-cases --fault no-effect
+
       - name: Verify enhancement persistence, history, review and recovery workflows
         run: python scripts/check_enhanced_editor.py --output output/enhanced-editor-ci
 
@@ -160,6 +176,8 @@ jobs:
           test "${#candidate_wheels[@]}" -eq 1
           "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_editor.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-workspace-ci
           "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_enhanced_editor.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-enhanced-ci
+          "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_intake_controls.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-intake-controls-ci
+          "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_batch_upload.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-batch-upload-ci
 
       - name: Upload browser acceptance evidence
         if: always()
@@ -175,7 +193,10 @@ jobs:
             output/embodied-editor-ci
             output/workspace-editor-ci
             output/intake-controls-ci
+            output/batch-upload-ci
             output/enhanced-editor-ci
             output/installed-workspace-ci
             output/installed-enhanced-ci
+            output/installed-intake-controls-ci
+            output/installed-batch-upload-ci
           if-no-files-found: warn

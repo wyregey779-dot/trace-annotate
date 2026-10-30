@@ -504,7 +504,9 @@ class Harness:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="P09 real-browser intake controls")
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--check-cases", action="store_true",
+                        help="print the required case set and exit without a browser")
     parser.add_argument("--installed-wheel", type=Path, default=None)
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--headed", dest="headless", action="store_false")
@@ -512,6 +514,16 @@ def main() -> int:
     parser.add_argument("--slow-media-seconds", type=float, default=90.0)
     parser.add_argument("--slow-media-size", default="854x480")
     args = parser.parse_args()
+
+    if args.check_cases:
+        expected = (["UI_CANCEL_MISSING_CONTROL_NEGATIVE"] if args.fault == "missing-control"
+                    else ["UI_CANCEL_NO_EFFECT_NEGATIVE"] if args.fault == "no-effect"
+                    else REQUIRED_CASES)
+        print(json.dumps({"document_type": "INTAKE_CONTROL_GATE_CASES", "cases": expected,
+                          "count": len(expected)}, ensure_ascii=False))
+        return 0
+    if args.output is None:
+        parser.error("--output is required unless --check-cases is used")
 
     out = args.output.expanduser().resolve()
     if out.exists():
