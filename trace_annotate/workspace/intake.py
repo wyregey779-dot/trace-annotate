@@ -110,7 +110,14 @@ class _LeaseHeartbeat:
                 self.lease_lost = True
                 return
             if not renewed:
-                self.lease_lost = True
+                # A renewal that fails *because the attempt deadline passed* is
+                # not a lost lease: the lease can never outlive the deadline, so
+                # reporting LEASE_LOST here would send an operator looking for a
+                # competing worker that does not exist.
+                if self._owner.clock() >= self._deadline_at:
+                    self.deadline_exceeded = True
+                else:
+                    self.lease_lost = True
                 return
             self.renewals += 1
 
@@ -493,10 +500,13 @@ class AsyncIntakes:
                 # interrupted, the staged source is kept and the row becomes a
                 # retryable failure instead of a settled cancellation.
                 return _stop("closing")
-            if heartbeat.lease_lost:
-                return _stop("lease_lost")
+            # The deadline is checked before the lease: an overrun also makes
+            # the next renewal fail, so checking the lease first would relabel
+            # every deadline abort as a lost lease.
             if heartbeat.deadline_exceeded or self.clock() >= deadline_at:
                 return _stop("deadline")
+            if heartbeat.lease_lost:
+                return _stop("lease_lost")
             with self.store.transaction():
                 row = _row(self.store.conn.execute(
                     "SELECT state,generation,worker_id,lease_expires_at FROM intakes WHERE id=?",

@@ -26,7 +26,7 @@ import pytest
 from trace_annotate.temporal import preparation
 from trace_annotate.workspace import media as media_module
 from trace_annotate.workspace.errors import Conflict, WorkspaceError
-from trace_annotate.workspace.intake import AsyncIntakes
+from trace_annotate.workspace.intake import AsyncIntakes, _LeaseHeartbeat
 from trace_annotate.workspace.slots import PrepareSlot, SlotClosed, SlotTimeout, get_prepare_slot
 from trace_annotate.workspace.store import WorkspaceStore
 
@@ -583,3 +583,58 @@ def test_http_import_and_async_worker_share_one_slot(store, upload, process_coun
     assert payload["task_id"]
     assert process_counter["peak"] == 1, process_counter
     assert get_prepare_slot(store.root).stats()["peak"] == 1
+
+
+def test_a_renewal_that_fails_after_the_deadline_is_a_deadline_not_a_lost_lease():
+    """The heartbeat must not blame a competing worker for its own overrun.
+
+    ``renew_lease`` refuses to extend a lease past the attempt deadline, so a
+    late renewal always fails. Reporting that as LEASE_LOST would send an
+    operator looking for a second worker that never existed, and would persist
+    the wrong ``error_code`` on the intake row.
+    """
+    class Owner:
+        now = 0.0
+
+        def clock(self):
+            return self.now
+
+        def renew_lease(self, *args, **kwargs):
+            return False
+
+    owner = Owner()
+    heartbeat = _LeaseHeartbeat(owner, "int-deadline", 1, "worker-1",
+                                deadline_at=0.5, interval=0.01)
+    owner.now = 0.9  # the clock is already past the deadline on the first tick
+    with heartbeat:
+        deadline = time.monotonic() + 5
+        while not (heartbeat.deadline_exceeded or heartbeat.lease_lost):
+            if time.monotonic() > deadline:
+                raise AssertionError("the heartbeat never classified the renewal")
+            time.sleep(0.01)
+    assert heartbeat.deadline_exceeded is True
+    assert heartbeat.lease_lost is False
+
+
+def test_a_renewal_that_fails_before_the_deadline_is_a_lost_lease():
+    """The opposite direction must stay true, or the fix would just hide bugs."""
+    class Owner:
+        now = 0.0
+
+        def clock(self):
+            return self.now
+
+        def renew_lease(self, *args, **kwargs):
+            return False
+
+    owner = Owner()
+    heartbeat = _LeaseHeartbeat(owner, "int-lost", 1, "worker-1",
+                                deadline_at=600.0, interval=0.01)
+    with heartbeat:
+        deadline = time.monotonic() + 5
+        while not (heartbeat.deadline_exceeded or heartbeat.lease_lost):
+            if time.monotonic() > deadline:
+                raise AssertionError("the heartbeat never classified the renewal")
+            time.sleep(0.01)
+    assert heartbeat.lease_lost is True
+    assert heartbeat.deadline_exceeded is False

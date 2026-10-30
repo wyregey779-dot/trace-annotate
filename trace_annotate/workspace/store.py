@@ -422,7 +422,7 @@ class WorkspaceStore:
             check_cancelled()
             if not source.is_file():
                 raise NotFound("SOURCE_MISSING", "Source file does not exist")
-            digest = stream_sha256(source, cancelled=cancelled)
+            digest = stream_sha256(source, cancelled=check_cancelled)
             size = source.stat().st_size
             with self.transaction():
                 self.conn.execute("UPDATE intakes SET source_sha256=?,source_size=? WHERE id=?", (digest, size, intake_id))

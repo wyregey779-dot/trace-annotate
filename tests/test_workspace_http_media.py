@@ -264,6 +264,13 @@ def test_snapshot_export_contains_saved_revision_and_no_source_paths(api):
 
 
 def test_server_close_cancels_preparation_before_store_is_closed(tmp_path, http_video, monkeypatch):
+    """Shutdown must interrupt preparation, and it must not look like a cancel.
+
+    A user cancellation is a settled terminal state; a shutdown is an
+    interruption that the next run has to be able to retry. Persisting the
+    second as the first would quietly tell an operator "the user cancelled"
+    about work that never reached a decision.
+    """
     from trace_annotate.workspace import media
     from trace_annotate.workspace.errors import WorkspaceError
 
@@ -271,17 +278,28 @@ def test_server_close_cancels_preparation_before_store_is_closed(tmp_path, http_
     store.create()
     server = make_server(store)
     serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
-    entered, cancelled_seen = threading.Event(), threading.Event()
+    entered, interrupted_seen = threading.Event(), threading.Event()
 
-    def cancellable_preparation(source, output_dir, *, cancelled=None):
+    def cancellable_preparation(source, output_dir, *, cancelled=None, slot_key=None):
         assert callable(cancelled)
+        # The synchronous path must also declare which workspace owns the single
+        # prepare slot, otherwise it would bypass the serialisation silently.
+        assert slot_key == store.root, (slot_key, store.root)
         entered.set()
         deadline = time.monotonic() + 5
-        while not cancelled():
+        while True:
+            try:
+                stopped = cancelled()
+            except WorkspaceError as exc:
+                # The shutdown signal arrives as a typed error, not as a flag.
+                assert exc.code == "INTERRUPTED", exc.code
+                interrupted_seen.set()
+                raise
+            if stopped:
+                break
             if time.monotonic() > deadline:
                 raise AssertionError("Shutdown never reached the preparation callback")
             time.sleep(0.01)
-        cancelled_seen.set()
         raise WorkspaceError("CANCELLED", "Controlled preparation stopped")
 
     monkeypatch.setattr(media, "prepare_workspace_media", cancellable_preparation)
@@ -295,10 +313,11 @@ def test_server_close_cancels_preparation_before_store_is_closed(tmp_path, http_
             started = time.monotonic()
             server.server_close()
             assert time.monotonic() - started < 3
-            assert cancelled_seen.is_set() and not server.import_lock.locked()
-            assert future.result(timeout=5)[2]["error"]["code"] == "CANCELLED"
+            assert interrupted_seen.is_set() and not server.import_lock.locked()
+            assert future.result(timeout=5)[2]["error"]["code"] == "INTERRUPTED"
             assert store.list_tasks() == []
-            assert store.list_intakes()[-1]["state"] == "cancelled"
+            row = store.list_intakes()[-1]
+            assert (row["state"], row["error_code"]) == ("failed", "INTERRUPTED")
     finally:
         if serving.is_alive():
             server.shutdown()
