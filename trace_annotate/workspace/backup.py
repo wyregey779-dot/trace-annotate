@@ -161,6 +161,40 @@ def _source_path(root: Path, declaration: Dict[str, Any]) -> Path:
     return target
 
 
+def _compare_retryable_closure(declared, db_records) -> None:
+    """Compare manifest closure to the DB closure as an order-independent set.
+
+    Order of entries is not part of the semantics, but duplicates, missing or
+    extra IDs, and any per-entry identity mismatch must be rejected.
+    """
+    if not isinstance(declared, list) or not isinstance(db_records, list):
+        _fail("BACKUP_INTEGRITY_FAILED", "Retryable source closure has wrong shape")
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for entry in declared:
+        if not isinstance(entry, dict):
+            _fail("BACKUP_INTEGRITY_FAILED", "Retryable source entry has wrong shape")
+        ident = entry.get("intake_id")
+        try:
+            S.require_id(ident, "intake_id")
+        except WorkspaceError as exc:
+            raise WorkspaceError("BACKUP_INTEGRITY_FAILED", "Retryable source ID is invalid") from exc
+        if ident in by_id:
+            _fail("BACKUP_INTEGRITY_FAILED", "Duplicate retryable source intake_id in manifest")
+        # Re-run the lexical path guard so a forged relative_path cannot slip.
+        if entry.get("relative_path") != f"tmp/intakes/{ident}/source":
+            _fail("BACKUP_INTEGRITY_FAILED", "Retryable source path is invalid")
+        by_id[ident] = {key: entry.get(key) for key in ("intake_id", "relative_path", "sha256", "size_bytes")}
+    db_by_id: Dict[str, Dict[str, Any]] = {}
+    for entry in db_records:
+        ident = entry["intake_id"]
+        db_by_id[ident] = {key: entry.get(key) for key in ("intake_id", "relative_path", "sha256", "size_bytes")}
+    if set(by_id) != set(db_by_id):
+        _fail("BACKUP_INTEGRITY_FAILED", "Manifest retryable source set differs from database closure")
+    for ident, declared_row in by_id.items():
+        if declared_row != db_by_id[ident]:
+            _fail("BACKUP_INTEGRITY_FAILED", "Manifest retryable source identity differs from database")
+
+
 def _inspect(connection: sqlite3.Connection) -> Dict[str, Any]:
     if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
         _fail("BACKUP_INTEGRITY_FAILED", "Snapshot database integrity check failed")
@@ -307,10 +341,7 @@ def _load_backup(root: Path) -> Tuple[Dict[str, Any], str]:
     if description["metadata"] != manifest.get("metadata") or description["artifacts"] != manifest.get("artifacts"):
         _fail("BACKUP_INTEGRITY_FAILED", "Manifest differs from its database object closure")
     declarations = manifest.get("retryable_sources", [])
-    # Exact equality also rejects duplicates, extras, bad types, unsafe paths
-    # and forged hashes, without joining any untrusted manifest path.
-    if declarations != description["retryable_sources"]:
-        _fail("BACKUP_INTEGRITY_FAILED", "Manifest differs from its database retryable-source closure")
+    _compare_retryable_closure(declarations, description["retryable_sources"])
     for source in declarations:
         _check_file(_source_path(root, source), source)
     for artifact in description["artifacts"]:
@@ -353,8 +384,12 @@ def restore_workspace(backup: Path, target: Path) -> Dict[str, Any]:
         recovered.open()
         with recovered._mutex:
             description = _inspect(recovered.conn)
-        if (description["metadata"] != manifest["metadata"] or description["artifacts"] != manifest["artifacts"]
-                or description["retryable_sources"] != manifest.get("retryable_sources", [])):
+        if description["metadata"] != manifest["metadata"] or description["artifacts"] != manifest["artifacts"]:
+            _fail("BACKUP_INTEGRITY_FAILED", "Opening the recovered project changed its snapshot identity")
+        try:
+            _compare_retryable_closure(description["retryable_sources"],
+                                       manifest.get("retryable_sources", []))
+        except WorkspaceError:
             _fail("BACKUP_INTEGRITY_FAILED", "Opening the recovered project changed its snapshot identity")
     finally:
         recovered.close()

@@ -99,3 +99,36 @@ def test_valid_backup_restore_roundtrip_keeps_failed_source(tmp_path, source_vid
     again = q.retry_failed(rec)
     assert again["state"] == "queued"
     reopened.close()
+
+
+def test_reordering_retryable_sources_in_manifest_still_restores(tmp_path, source_video):
+    """P01: entry order is not part of the closure semantics."""
+    # Build a project with TWO failed intakes.
+    store = WorkspaceStore(tmp_path / "proj")
+    store.create()
+    q = AsyncIntakes(store)
+    for name in ("broken1.bin", "broken2.bin"):
+        bad = tmp_path / name
+        bad.write_bytes(b"not media " + name.encode())
+        upload = store.tmp_dir / (name + ".tmp")
+        shutil.copy2(bad, upload)
+        q.enqueue(upload, display_name=name)
+    q.run_pending()
+    rows = store.list_intakes()
+    assert len(rows) == 2 and all(r["state"] == "failed" for r in rows)
+    manifest = backup_workspace(store, tmp_path / "backup")
+    store.close()
+    assert len(manifest["retryable_sources"]) == 2
+
+    # Reverse the order of retryable_sources in a copy of the backup.
+    shutil.copytree(tmp_path / "backup", tmp_path / "reordered")
+    data = json.loads((tmp_path / "reordered" / BACKUP_MANIFEST).read_text(encoding="utf-8"))
+    data["retryable_sources"] = list(reversed(data["retryable_sources"]))
+    (tmp_path / "reordered" / BACKUP_MANIFEST).write_text(json.dumps(data), encoding="utf-8")
+
+    receipt = restore_workspace(tmp_path / "reordered", tmp_path / "restored")
+    assert receipt["state"] == "complete"
+    reopened = WorkspaceStore(tmp_path / "restored")
+    reopened.open()
+    assert len(reopened.list_intakes()) == 2
+    reopened.close()
