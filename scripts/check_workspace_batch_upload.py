@@ -642,7 +642,15 @@ class Harness:
         require(stop.is_enabled(), "the stop control is disabled while an upload is running")
         detail["screenshot_before"] = self.shot("BATCH_STOP_UPLOAD_AND_QUEUED-before")
         if self.no_effect:
-            self.page.evaluate("() => { window.stopBatchUploads = () => {}; }")
+            # Reassigning the global would not touch the listener that bind()
+            # already registered, so replace the node and attach a no-op.
+            self.page.evaluate(
+                """() => {
+                     const button = document.getElementById('stop-import');
+                     const clone = button.cloneNode(true);
+                     clone.addEventListener('click', () => {});
+                     button.replaceWith(clone);
+                   }""")
         stop.click()
         try:
             held["route"].abort()
@@ -743,7 +751,13 @@ class Harness:
         require(cancel.count() == 1, "the batch cancel control is missing")
         require(cancel.is_enabled(), "the batch cancel control is disabled")
         if self.no_effect:
-            self.page.evaluate("() => { window.cancelOwnedBatchIntakes = async () => 0; }")
+            self.page.evaluate(
+                """() => {
+                     const button = document.getElementById('cancel-batch-queued');
+                     const clone = button.cloneNode(true);
+                     clone.addEventListener('click', () => {});
+                     button.replaceWith(clone);
+                   }""")
         cancel.click()
 
         wait_for(lambda: (self.db_intake(slow_id) or {}).get("state") == "cancelled",
