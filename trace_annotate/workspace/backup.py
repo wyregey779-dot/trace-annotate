@@ -110,6 +110,57 @@ def _quiescent(connection: sqlite3.Connection) -> None:
         raise Conflict("BACKUP_ACTIVE_WORK", "Snapshot has an unresolved command state")
 
 
+def _retryable_sources(connection: sqlite3.Connection) -> list:
+    """Describe the exact failed-upload closure using database identities only.
+
+    Legacy synchronous failures have no workspace-owned upload. They remain
+    nonretryable external-source records; an async failure may not silently
+    lose its staged source and still be called a complete backup.
+    """
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(intakes)")}
+    if "staged_path" not in columns:
+        return []  # Supported pre-async snapshots contain only legacy intakes.
+    request_column = "request_sha256" if "request_sha256" in columns else "NULL"
+    result = []
+    for ident, relative, digest, size, request_sha in connection.execute(
+            "SELECT id,staged_path,source_sha256,source_size," + request_column +
+            " FROM intakes WHERE state='failed' ORDER BY id"):
+        if relative is None and request_sha is None:
+            continue
+        try:
+            S.require_id(ident, "intake_id")
+            S.require_hash(digest)
+        except WorkspaceError as exc:
+            raise WorkspaceError("BACKUP_INTEGRITY_FAILED", "Retryable intake identity is invalid") from exc
+        if relative != f"tmp/intakes/{ident}/source" or type(size) is not int or size < 0:
+            _fail("BACKUP_INTEGRITY_FAILED", "Retryable intake path or size is invalid")
+        result.append({"intake_id": ident, "relative_path": relative,
+                       "sha256": digest, "size_bytes": str(size)})
+    return result
+
+
+def _source_path(root: Path, declaration: Dict[str, Any]) -> Path:
+    """Bind a retry source to its sole supported lexical path before any I/O."""
+    ident = declaration.get("intake_id")
+    try:
+        S.require_id(ident, "intake_id")
+    except WorkspaceError as exc:
+        raise WorkspaceError("BACKUP_INTEGRITY_FAILED", "Retryable source ID is invalid") from exc
+    relative = declaration.get("relative_path")
+    if relative != f"tmp/intakes/{ident}/source":
+        _fail("BACKUP_INTEGRITY_FAILED", "Retryable source path is invalid")
+    root = Path(root).absolute()
+    target = root / relative
+    _safe(root)
+    _safe(target)
+    try:
+        target.relative_to(root)
+        target.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise WorkspaceError("UNSAFE_PATH", "Retryable source escapes its workspace") from exc
+    return target
+
+
 def _inspect(connection: sqlite3.Connection) -> Dict[str, Any]:
     if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
         _fail("BACKUP_INTEGRITY_FAILED", "Snapshot database integrity check failed")
@@ -134,7 +185,8 @@ def _inspect(connection: sqlite3.Connection) -> Dict[str, Any]:
             _fail("BACKUP_INTEGRITY_FAILED", "Snapshot artifact identity is invalid")
         artifacts.append({"id": ident, "relative_path": relative,
                           "sha256": digest, "size_bytes": str(size)})
-    return {"metadata": {key: meta[key] for key in _META_KEYS}, "artifacts": artifacts}
+    return {"metadata": {key: meta[key] for key in _META_KEYS}, "artifacts": artifacts,
+            "retryable_sources": _retryable_sources(connection)}
 
 
 def _write_manifest(path: Path, value: Dict[str, Any]) -> None:
@@ -171,6 +223,10 @@ def backup_workspace(store: WorkspaceStore, target: Path) -> Dict[str, Any]:
         # _check_artifacts has completed its own transaction before backup.
         if store._depth or connection.in_transaction:
             raise Conflict("BACKUP_IN_TRANSACTION", "Workspace validation left an active transaction")
+        # Reject missing/corrupt staged inputs before creating a destination.
+        retryable_sources = _retryable_sources(connection)
+        for declaration in retryable_sources:
+            _check_file(_source_path(store.root, declaration), declaration)
         output = _destination(target, store.root)
         database = output / SNAPSHOT_DB
         snapshot = sqlite3.connect(str(database), isolation_level=None)
@@ -193,28 +249,16 @@ def backup_workspace(store: WorkspaceStore, target: Path) -> Dict[str, Any]:
         _sync_directory(output / "objects")
         # Retryable (failed) staged uploads are part of the closure: without
         # them restore can never re-run the intake. Verified against the DB.
-        retryable_sources = []
-        for intake_id, staged_path, sha, size in connection.execute(
-                "SELECT id,staged_path,source_sha256,source_size FROM intakes WHERE state='failed'"):
-            if not staged_path:
-                continue
-            source_path = store.root / staged_path
-            if not source_path.is_file():
-                continue
-            declaration = _fingerprint(source_path)
-            if declaration["sha256"] != sha or int(declaration["size_bytes"]) != size:
-                _fail("BACKUP_INTEGRITY_FAILED", "Retryable intake source does not match its recorded identity")
-            relative = Path("tmp") / "intakes" / intake_id / "source"
-            (output / relative).parent.mkdir(parents=True, exist_ok=True)
-            _copy_verified(source_path, output / relative, declaration)
-            retryable_sources.append({"intake_id": intake_id,
-                                      "relative_path": str(relative).replace("\\", "/"),
-                                      **declaration})
+        for declaration in description["retryable_sources"]:
+            source_path = _source_path(store.root, declaration)
+            destination = _source_path(output, declaration)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _copy_verified(source_path, destination, declaration)
+            _sync_directory(destination.parent)
         manifest = {"kind": "traceannotate-workspace-backup", "backup_version": 1,
                     "state": "complete", "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "scope": "quiescent-sqlite-and-registered-objects",
                     "excluded": ["unregistered-files", "tmp-other", "exports", "logs", "external-source-media"],
-                    "retryable_sources": retryable_sources,
                     "database": {"relative_path": SNAPSHOT_DB, **_fingerprint(database)}, **description}
         _write_manifest(output / BACKUP_MANIFEST, manifest)
         return manifest
@@ -262,6 +306,13 @@ def _load_backup(root: Path) -> Tuple[Dict[str, Any], str]:
         raise WorkspaceError("BACKUP_INTEGRITY_FAILED", "Snapshot database cannot be read") from exc
     if description["metadata"] != manifest.get("metadata") or description["artifacts"] != manifest.get("artifacts"):
         _fail("BACKUP_INTEGRITY_FAILED", "Manifest differs from its database object closure")
+    declarations = manifest.get("retryable_sources", [])
+    # Exact equality also rejects duplicates, extras, bad types, unsafe paths
+    # and forged hashes, without joining any untrusted manifest path.
+    if declarations != description["retryable_sources"]:
+        _fail("BACKUP_INTEGRITY_FAILED", "Manifest differs from its database retryable-source closure")
+    for source in declarations:
+        _check_file(_source_path(root, source), source)
     for artifact in description["artifacts"]:
         _check_file(root / artifact["relative_path"], artifact)
     return manifest, hashlib.sha256(manifest_bytes).hexdigest()
@@ -293,15 +344,17 @@ def restore_workspace(backup: Path, target: Path) -> Dict[str, Any]:
     _copy_verified(backup / SNAPSHOT_DB, output / DB_FILE, manifest["database"])
     # Restore retryable staged sources so failed intakes can be retried.
     for source in manifest.get("retryable_sources", []):
-        target = output / source["relative_path"]
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _copy_verified(backup / source["relative_path"], target, source)
+        destination = _source_path(output, source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _copy_verified(_source_path(backup, source), destination, source)
+        _sync_directory(destination.parent)
     recovered = WorkspaceStore(output)
     try:
         recovered.open()
         with recovered._mutex:
             description = _inspect(recovered.conn)
-        if description["metadata"] != manifest["metadata"] or description["artifacts"] != manifest["artifacts"]:
+        if (description["metadata"] != manifest["metadata"] or description["artifacts"] != manifest["artifacts"]
+                or description["retryable_sources"] != manifest.get("retryable_sources", [])):
             _fail("BACKUP_INTEGRITY_FAILED", "Opening the recovered project changed its snapshot identity")
     finally:
         recovered.close()

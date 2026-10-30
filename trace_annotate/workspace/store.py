@@ -548,6 +548,12 @@ class WorkspaceStore:
             conn.execute("INSERT INTO task_revisions VALUES(?,?,?,?,?,?,?)",
                          (_new_id("rev"), task_id, 0, S.canonical_json(task).decode("utf-8"),
                           task["content_sha256"], None, _now()))
+            # Atomic with task creation: a crash now leaves neither a task whose
+            # intake is still preparing nor an intake whose task vanished.
+            conn.execute(
+                "UPDATE intakes SET state='succeeded', media_id=?, task_id=?, error_code=NULL, "
+                "worker_id=NULL, session_id=NULL, lease_expires_at=NULL WHERE id=?",
+                (media["id"], task_id, intake_id))
         return {"intake_id": intake_id, "media_id": media["id"], "task_id": task_id,
                 "duration_seconds": float(S.rational_value(media["duration"])),
                 "frames": media["frame_count"], "reused_existing": was_reused}

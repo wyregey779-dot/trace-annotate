@@ -175,7 +175,14 @@ class AsyncIntakes:
             if row is None:
                 raise NotFound("INTAKE_NOT_FOUND", "Intake not found")
             if row["state"] in TERMINAL:
-                return self.get(intake_id)
+                response = self.get(intake_id)
+                if command_id:
+                    req_sha = S.sha256_bytes(S.canonical_json(request))
+                    self.store.conn.execute(
+                        "INSERT INTO command_receipts(command_id,task_id,request_sha256,state,response,created_at) "
+                        "VALUES(?,NULL,?,'committed',?,?)",
+                        (command_id, req_sha, S.canonical_json(response).decode("utf-8"), _now()))
+                return response
             if row["state"] == "queued":
                 self.store.conn.execute("UPDATE intakes SET state='cancelled',error_code='CANCELLED' WHERE id=?",
                                         (intake_id,))
