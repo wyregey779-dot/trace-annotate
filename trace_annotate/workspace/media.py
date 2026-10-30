@@ -12,18 +12,19 @@ import json
 import os
 from pathlib import Path
 import shutil
-import threading
 from typing import Any, Callable, Dict, Optional
 
 from ..temporal.media import stream_sha256
 from ..temporal.preparation import MediaPreparationError, prepare_media
 from .errors import Conflict, DependencyUnavailable, NotFound, SchemaInvalid, StorageFull, WorkspaceError
 from .schema import rational
+from .slots import SlotClosed, SlotTimeout, get_prepare_slot
 
 # Process-wide single physical decode slot: synchronous CLI/HTTP import and the
 # async drainer both funnel through prepare_workspace_media, so this is the one
-# place that guarantees at most one ffmpeg decode per workspace process.
-_PREPARE_SLOT = threading.Lock()
+# place that guarantees at most one ffmpeg decode per workspace process. The
+# slot object is shared with the async worker, which reserves it *before* it
+# claims an intake so a queued row never burns its lease while waiting.
 
 
 def _integer(value: Any, name: str, *, positive: bool = False) -> int:
@@ -96,7 +97,9 @@ def _workspace_map(source: Path, destination: Path, expected_count: int,
 
 
 def prepare_workspace_media(source: Path, output_dir: Path, *,
-                            cancelled: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
+                            cancelled: Optional[Callable[[], bool]] = None,
+                            closing: Optional[Callable[[], bool]] = None,
+                            slot_timeout: Optional[float] = None) -> Dict[str, Any]:
     """Return verified media fields and paths, without assigning workspace IDs.
 
     ``output_dir`` must not exist and its parent must exist. The caller binds
@@ -123,8 +126,17 @@ def prepare_workspace_media(source: Path, output_dir: Path, *,
         if missing:
             raise DependencyUnavailable("DEPENDENCY_UNAVAILABLE", "Media preparation tools are unavailable",
                                         details={"tools": missing})
-        with _PREPARE_SLOT:
+        slot = get_prepare_slot()
+        try:
+            slot.acquire(cancelled=cancelled, closing=closing, timeout=slot_timeout)
+        except InterruptedError as exc:
+            raise WorkspaceError("CANCELLED", "Media preparation was cancelled while waiting") from exc
+        except Exception:
+            raise
+        try:
             manifest = prepare_media(source, target, cancelled=cancelled)
+        finally:
+            slot.release()
         manifest_path = target / "project.json"
         preparation_log_path = target / "preparation-log.json"
         log = json.loads(preparation_log_path.read_text(encoding="utf-8"))
@@ -193,6 +205,13 @@ def prepare_workspace_media(source: Path, output_dir: Path, *,
         }
     except WorkspaceError:
         raise
+    except SlotClosed as exc:
+        raise WorkspaceError("CLOSING", "Workspace is closing; preparation was not started") from exc
+    except SlotTimeout as exc:
+        raise Conflict("PREPARE_SLOT_TIMEOUT",
+                       "Timed out waiting for the single prepare slot",
+                       retryable=True,
+                       details={"waited_seconds": round(exc.waited_seconds, 3)}) from exc
     except InterruptedError as exc:
         raise WorkspaceError("CANCELLED", "Media preparation was cancelled") from exc
     except FileExistsError as exc:

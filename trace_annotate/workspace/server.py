@@ -30,6 +30,10 @@ MAX_COMMAND_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 10
 REJECT_DRAIN_MAX_BYTES = 64 * 1024
 REJECT_DRAIN_TIMEOUT_SECONDS = 0.25
+# Frozen shutdown budget: how long close waits for the async worker to stop.
+# A worker that is still alive after this must be reported, not silently left
+# holding the database open (instruction 053/054).
+CLOSE_WORKER_SECONDS = 60.0
 MAX_SAFE_INTEGER = 9007199254740991
 TOKEN_HEADER = "X-TraceAnnotate-Token"
 ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,95}")
@@ -129,23 +133,29 @@ class WorkspaceHTTPServer(ThreadingHTTPServer):
         return connection, address
 
     def server_close(self):
+        # Ordering matters (P06): stop new admission and new claims first, let
+        # the active prepare abort cooperatively, confirm the worker is really
+        # gone, and only then close the listening socket, the frame service and
+        # (by the caller) SQLite. Queued rows are deliberately left queued so a
+        # restart can still prepare them; only the in-flight attempt becomes a
+        # retryable INTERRUPTED failure.
         if hasattr(self, "closing"):
             self.closing.set()
-        # Cooperatively stop any in-flight async preparation before joining.
+        report = {"closing_set": hasattr(self, "closing"), "worker_stopped": None,
+                  "active_intake": None, "drain_alive": None}
         ai = getattr(self, "async_intakes", None)
         if ai is not None:
-            try:
-                for row in ai.list():
-                    if row.get("state") in ("queued", "preparing", "cancel_requested"):
-                        try:
-                            ai.request_cancel(row["id"])
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            close_report = ai.close(timeout=CLOSE_WORKER_SECONDS)
+            report["worker_stopped"] = close_report.get("stopped")
+            report["active_intake"] = close_report.get("active_intake")
         drainer = getattr(self, "drain_thread", None)
-        if drainer is not None and drainer.is_alive():
-            drainer.join(timeout=60)
+        if drainer is not None:
+            if drainer.is_alive():
+                drainer.join(timeout=CLOSE_WORKER_SECONDS)
+            report["drain_alive"] = drainer.is_alive()
+            if report["worker_stopped"] is None:
+                report["worker_stopped"] = not report["drain_alive"]
+        self.shutdown_report = report
         super().server_close()
         if hasattr(self, "image_service"):
             self.image_service.close()
@@ -730,7 +740,7 @@ def make_server(store: WorkspaceStore, host: str = "127.0.0.1", port: int = 0) -
     from .frames import FrameService
     server.image_service = FrameService(store)
     from .intake import AsyncIntakes
-    server.async_intakes = AsyncIntakes(store)
+    server.async_intakes = AsyncIntakes(store, closing=server.closing)
 
     def _drain_intakes() -> None:
         while not server.closing.wait(1.0):

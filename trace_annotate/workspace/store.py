@@ -465,7 +465,7 @@ class WorkspaceStore:
             raise
 
     def admit_staged_intake(self, intake, *, cancelled=None, generation=None,
-                             worker_id=None, session_id=None):
+                             worker_id=None, session_id=None, clock=None, deadline_at=None):
         """Prepare a staged async intake and commit its media + task.
 
         Long-running ffmpeg preparation runs OUTSIDE any SQLite transaction and
@@ -473,8 +473,14 @@ class WorkspaceStore:
         fenced transaction that re-checks the intake generation, worker and
         cancellation state, so a stale or cancelled worker can never leave an
         orphan task row.
+
+        ``clock`` is the caller's monotonic lease clock (never ``time.time``)
+        so lease expiry, heartbeat renewal and the attempt deadline all agree.
+        Each attempt gets its own work directory keyed by attempt+generation so
+        a retry never deletes the previous attempt's failure evidence.
         """
         from .media import prepare_workspace_media
+        now_fn = clock if clock is not None else time.time
         if cancelled is not None and not callable(cancelled):
             raise SchemaInvalid("SCHEMA_INVALID", "Cancellation must be a callback")
 
@@ -503,9 +509,17 @@ class WorkspaceStore:
         was_reused = media is not None
         objects = None
         if media is None:
-            work = self.tmp_dir / intake_id
-            if work.exists():
-                shutil.rmtree(work, ignore_errors=True)
+            attempt = intake.get("attempt", 0) or 0
+            gen = generation if generation is not None else intake.get("generation", 0)
+            work = self.tmp_dir / f"{intake_id}-a{attempt}-g{gen}"
+            # Never mask a cleanup failure: a stale work dir would make the
+            # next prepare fail with OUTPUT_EXISTS and hide the real cause.
+            if os.path.lexists(work):
+                if work.is_symlink() or not work.is_dir():
+                    raise Conflict("WORKDIR_CONFLICT",
+                                   "Prepare work directory is not a plain directory")
+                _safe(work)
+                shutil.rmtree(work)
             prepared = prepare_workspace_media(staged, work, cancelled=cancelled)
             if prepared["source_sha256"] != digest or prepared["source_size"] != size:
                 raise Conflict("MEDIA_CHANGED", "Source changed during preparation")
@@ -531,8 +545,10 @@ class WorkspaceStore:
             if generation is not None and (gen_now != generation or worker_now != worker_id
                                            or sess_now != session_id):
                 raise Conflict("STALE_LEASE", "Intake lease is no longer valid")
-            if (lease or 0) <= time.time():
+            if (lease or 0) <= now_fn():
                 raise Conflict("STALE_LEASE", "Intake lease expired before admission committed")
+            if deadline_at is not None and now_fn() >= deadline_at:
+                raise Conflict("DEADLINE_EXCEEDED", "Admission deadline passed before commit")
             conn.execute("INSERT OR IGNORE INTO media VALUES(?,?)",
                          (media["id"], S.canonical_json(media).decode("utf-8")))
             if objects:

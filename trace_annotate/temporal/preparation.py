@@ -14,6 +14,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Callable, Dict, Iterator, Optional
 
@@ -21,6 +22,39 @@ from .media import stream_sha256
 from .schema import require_valid_document
 
 _MAX_PACKET_VERIFICATION_FRAMES = 2_000_000
+
+# Real child processes this process currently owns. Shutdown must terminate
+# only these, never anything matched by image name, and an operator needs the
+# pid/parent/creation triple to prove a prepare was actually running.
+_LIVE_LOCK = threading.Lock()
+_LIVE_CHILDREN: Dict[int, Dict[str, Any]] = {}
+
+
+def live_media_processes() -> list:
+    """Snapshot of media child processes owned by this process."""
+    with _LIVE_LOCK:
+        return [dict(record) for record in _LIVE_CHILDREN.values()]
+
+
+def _register_child(process: "subprocess.Popen", name: str, command: list) -> Dict[str, Any]:
+    record = {
+        "pid": process.pid,
+        "parent_pid": os.getpid(),
+        "name": name,
+        "tool": Path(command[0]).name if command else "",
+        "argv": list(command),
+        "created_at": time.time(),
+        "created_monotonic": time.monotonic(),
+    }
+    with _LIVE_LOCK:
+        _LIVE_CHILDREN[process.pid] = record
+    return record
+
+
+def _unregister_child(pid: int) -> None:
+    with _LIVE_LOCK:
+        _LIVE_CHILDREN.pop(pid, None)
+
 
 class MediaPreparationError(ValueError):
     """The source cannot be prepared without breaking the declared contract."""
@@ -52,6 +86,7 @@ def _run(command: list, directory: Path, name: str,
     with stdout.open("xb") as output, stderr.open("xb") as errors:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=errors)
+        child = _register_child(process, name, command)
         try:
             while process.poll() is None:
                 _cancel(cancelled)
@@ -68,10 +103,14 @@ def _run(command: list, directory: Path, name: str,
                     process.wait()
             raise
         finally:
+            _unregister_child(process.pid)
             output.flush()
             errors.flush()
             with (directory / "commands.jsonl").open("a", encoding="utf-8") as log:
-                log.write(json.dumps({"name": name, "args": command, "exit_code": process.returncode,
+                log.write(json.dumps({"name": name, "args": command, "pid": child["pid"],
+                                      "parent_pid": child["parent_pid"],
+                                      "created_at": child["created_at"],
+                                      "exit_code": process.returncode,
                                       "elapsed_seconds": time.monotonic() - started,
                                       "cancelled_or_interrupted": was_cancelled,
                                       "stdout_file": stdout.name, "stderr_file": stderr.name}) + "\n")
