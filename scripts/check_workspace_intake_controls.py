@@ -284,7 +284,7 @@ class Harness:
         detail["request"] = request
         detail["response"] = reply
         require(reply["status"] == 200, f"cancel returned HTTP {reply['status']}")
-        require(reply["body"].get("state") == "cancelled",
+        require(reply["body"].get("state") in ("cancel_requested", "cancelled"),
                 f"cancel response state is {reply['body'].get('state')!r}")
 
         command = self.last_command()
@@ -329,7 +329,12 @@ class Harness:
         detail["trace"].append({"db": "preparing", "at": time.time()})
 
         def children_for_intake():
-            return [item for item in self.live() if intake_id in " ".join(item.get("argv") or [])]
+            # Only the decoder is long-lived; ffprobe children come and go, so a
+            # snapshot can name one that has already finished.
+            return [item for item in self.live()
+                    if intake_id in " ".join(item.get("argv") or [])
+                    and str(item.get("tool", "")).lower().startswith("ffmpeg")
+                    and pid_alive(item["pid"])]
 
         child = wait_for(lambda: children_for_intake() or None, budget=PREPARE_START_BUDGET,
                          message="no live media child was associated with the intake")
@@ -555,7 +560,9 @@ def main() -> int:
     store.create()
     harness.store = store
 
-    slot = get_prepare_slot()
+    # The prepare slot is per workspace root: hold this workspace's slot so the
+    # drainer cannot claim until a case asks it to.
+    slot = get_prepare_slot(store.root)
     harness.slot = slot
     slot.acquire()  # keep the drainer from claiming until a case asks for it
 
