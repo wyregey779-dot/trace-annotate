@@ -35,6 +35,7 @@ import secrets
 import shutil
 import threading
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -54,6 +55,18 @@ DEFAULT_LEASE_RENEW_FRACTION = 3.0   # renew every lease/3 seconds
 DEFAULT_PREPARE_DEADLINE = 1800.0    # seconds of total prepare work per attempt
 DEFAULT_SLOT_WAIT_SECONDS = 900.0    # seconds a worker may wait for the decode slot
 DEFAULT_CLOSE_SECONDS = 60.0         # seconds shutdown waits for the worker to stop
+
+# Sessions of runners that are alive in this process. A second runner on the
+# same workspace must not mistake a live attempt for a dead one: only sessions
+# that are absent from this registry belong to a process that really died.
+_LIVE_RUNNERS: "weakref.WeakSet[AsyncIntakes]" = weakref.WeakSet()
+_LIVE_LOCK = threading.Lock()
+
+
+def _live_sessions(root_key: str) -> List[str]:
+    with _LIVE_LOCK:
+        return [item.session_id for item in _LIVE_RUNNERS
+                if item.root_key == root_key and not item._closed]
 
 
 def _row(cursor: Any) -> Optional[Dict[str, Any]]:
@@ -163,19 +176,33 @@ class AsyncIntakes:
         self._active_intake: Optional[str] = None
         self._closed = False
         self._last_heartbeat: Dict[str, Any] = {}
+        self.root_key = str(store.root).lower() if os.name == "nt" else str(store.root)
+        live = _live_sessions(self.root_key)
         with store.transaction():
             self.staged_root.mkdir(parents=True, exist_ok=True)
             _safe(self.staged_root)
             # A previous process that died mid-preparation must not silently
             # re-run; the input is preserved and marked interrupted for review.
-            store.conn.execute(
-                "UPDATE intakes SET state='failed', error_code='INTERRUPTED', worker_id=NULL, "
-                "session_id=NULL, lease_expires_at=NULL WHERE state='preparing' AND task_id IS NULL")
+            # A runner that is alive in this process keeps its row: a second
+            # instance must not interrupt a real preparation.
+            self._recover_dead_sessions(store, live, "preparing", "failed", "INTERRUPTED")
             # A row left in cancel_requested by a dead process is a settled
             # cancellation, not something a new worker should resume.
+            self._recover_dead_sessions(store, live, "cancel_requested", "cancelled", "CANCELLED")
+        with _LIVE_LOCK:
+            _LIVE_RUNNERS.add(self)
+
+    def _recover_dead_sessions(self, store, live, state: str, new_state: str, code: str) -> None:
+        """Settle rows left by a dead session, never a live one."""
+        rows = store.conn.execute(
+            "SELECT id,session_id FROM intakes WHERE state=? AND task_id IS NULL",
+            (state,)).fetchall()
+        for ident, session in rows:
+            if session and session in live:
+                continue
             store.conn.execute(
-                "UPDATE intakes SET state='cancelled', error_code='CANCELLED', worker_id=NULL, "
-                "session_id=NULL, lease_expires_at=NULL WHERE state='cancel_requested'")
+                "UPDATE intakes SET state=?, error_code=?, worker_id=NULL, session_id=NULL, "
+                "lease_expires_at=NULL WHERE id=?", (new_state, code, ident))
 
     # -- closing -----------------------------------------------------------
     def is_closing(self) -> bool:
@@ -210,6 +237,7 @@ class AsyncIntakes:
             if row is None:
                 raise NotFound("INTAKE_NOT_FOUND", "Intake not found")
             row["staged_present"] = (self.staged_root / intake_id / "source").is_file()
+            row["completion"] = self.store.get_completion(intake_id)
             return row
 
     def list(self) -> List[Dict[str, Any]]:
@@ -421,15 +449,43 @@ class AsyncIntakes:
             if row is None:
                 raise NotFound("INTAKE_NOT_FOUND", "Intake not found")
             if row["state"] == "succeeded" and row["task_id"]:
+                # An idempotent double commit may only confirm the binding that
+                # already exists; a different result would be a fake success.
+                if (result.get("task_id"), result.get("media_id")) != (row["task_id"], row["media_id"]):
+                    raise Conflict("FINISH_BINDING_MISMATCH",
+                                   "A succeeded intake cannot be rebound to another task")
                 return self.get(intake_id)  # idempotent double-commit
             self._assert_lease(row, generation, worker_id)
             if row["state"] == "cancel_requested":
                 raise Conflict("CANCELLED", "Cancellation was requested before admission committed")
+            self._validate_finish_binding(row, result)
             self.store.conn.execute(
                 "UPDATE intakes SET state='succeeded', media_id=?, task_id=?, error_code=NULL, "
                 "worker_id=NULL, session_id=NULL, lease_expires_at=NULL WHERE id=?",
                 (result["media_id"], result["task_id"], intake_id))
             return self.get(intake_id)
+
+    def _validate_finish_binding(self, row: Dict[str, Any], result: Dict[str, Any]) -> None:
+        """Refuse a success that does not name a real task for this intake.
+
+        ``finish`` is the only path that can turn an attempt into a committed
+        intake, so it must not trust a caller-supplied pair of ids: the task has
+        to exist, has to point at the named media, and that media has to be the
+        one this intake's source produced.
+        """
+        task_id = S.require_id(result.get("task_id"), "task_id")
+        media_id = S.require_id(result.get("media_id"), "media_id")
+        task = self.store.conn.execute("SELECT media_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            raise NotFound("TASK_NOT_FOUND", "Finish refers to a task that does not exist")
+        if task[0] != media_id:
+            raise Conflict("FINISH_BINDING_MISMATCH", "Task does not belong to the named media")
+        body = self.store.conn.execute("SELECT body FROM media WHERE id=?", (media_id,)).fetchone()
+        if body is None:
+            raise NotFound("MEDIA_NOT_FOUND", "Finish refers to media that does not exist")
+        source_sha = (json.loads(body[0]).get("source") or {}).get("sha256")
+        if row.get("source_sha256") and source_sha != row["source_sha256"]:
+            raise Conflict("FINISH_BINDING_MISMATCH", "Media source differs from this intake")
 
     def fail(self, intake_id: str, generation: int, worker_id: str, error_code: str) -> Dict[str, Any]:
         if not (isinstance(error_code, str) and error_code.replace("_", "").isalnum() and error_code.isupper()):

@@ -63,11 +63,17 @@ def test_idempotent_finish_does_not_create_second_task(store, source_video):
     done = q.run_pending()[0]
     # Simulate the worker calling finish() again after a restart / duplicate loop.
     again = q.finish(rec["id"], 0, "no-such-worker", {
-        "media_id": "med-fake", "task_id": "tsk-fake"})
+        "media_id": done["media_id"], "task_id": done["task_id"]})
     assert again["task_id"] == done["task_id"]
     tasks = store.list_tasks()
     assert len(tasks) == 1
     assert store.get_task(done["task_id"]) is not None
+    # A fake result is refused instead of being accepted as a second success.
+    with pytest.raises(Conflict) as excinfo:
+        q.finish(rec["id"], 0, "no-such-worker", {"media_id": "med-fake", "task_id": "tsk-fake"})
+    assert excinfo.value.code == "FINISH_BINDING_MISMATCH"
+    assert q.get(rec["id"])["task_id"] == done["task_id"]
+    assert len(store.list_tasks()) == 1
 
 
 def test_interrupted_preparing_has_no_orphan_task(store, source_video):

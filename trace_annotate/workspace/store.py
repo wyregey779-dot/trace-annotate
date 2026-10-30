@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS command_receipts(command_id TEXT PRIMARY KEY, task_id
     request_sha256 TEXT NOT NULL, state TEXT NOT NULL, response TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY, rel_path TEXT NOT NULL,
     sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL);
+-- One durable completion per admitted intake. The UNIQUE intake_id is the
+-- database-level guarantee that an intake can never own two tasks, even if two
+-- workers race after a crash. Its id lives in the "adm" namespace, so it can
+-- never collide with a user command id (which always hashes into "cmt").
+CREATE TABLE IF NOT EXISTS admission_completions(id TEXT PRIMARY KEY,
+    intake_id TEXT NOT NULL UNIQUE, generation INTEGER NOT NULL, task_id TEXT NOT NULL,
+    media_id TEXT NOT NULL, source_sha256 TEXT NOT NULL, source_size INTEGER NOT NULL,
+    task_content_sha256 TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS intakes(id TEXT PRIMARY KEY, group_id TEXT NOT NULL,
     state TEXT NOT NULL, display_name TEXT, source_sha256 TEXT, source_size INTEGER,
     media_id TEXT, task_id TEXT, error_code TEXT, created_at TEXT NOT NULL, job_id TEXT, template_id TEXT, template_version INTEGER);
@@ -515,9 +523,11 @@ class WorkspaceStore:
             media = next((value for value in candidates if value["source"]["sha256"] == digest), None)
         was_reused = media is not None
         objects = None
+        # The generation names this attempt's completion identity; it is needed
+        # on both the prepared and the reused path.
+        gen = generation if generation is not None else intake.get("generation", 0)
         if media is None:
             attempt = intake.get("attempt", 0) or 0
-            gen = generation if generation is not None else intake.get("generation", 0)
             work = self.tmp_dir / f"{intake_id}-a{attempt}-g{gen}"
             # Never mask a cleanup failure: a stale work dir would make the
             # next prepare fail with OUTPUT_EXISTS and hide the real cause.
@@ -572,6 +582,15 @@ class WorkspaceStore:
             conn.execute("INSERT INTO task_revisions VALUES(?,?,?,?,?,?,?)",
                          (_new_id("rev"), task_id, 0, S.canonical_json(task).decode("utf-8"),
                           task["content_sha256"], None, _now()))
+            # A stable, queryable completion record commits with the rows it
+            # describes. Its identity is derived from the intake (never from a
+            # client command id), so a confirmation after a restart finds the
+            # same record instead of inventing a second task.
+            conn.execute(
+                "INSERT INTO admission_completions(id,intake_id,generation,task_id,media_id,"
+                "source_sha256,source_size,task_content_sha256,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (S.make_id("adm", f"{intake_id}:{gen}"), intake_id, gen, task_id, media["id"],
+                 digest, size, task["content_sha256"], _now()))
             # Atomic with task creation: a crash now leaves neither a task whose
             # intake is still preparing nor an intake whose task vanished.
             conn.execute(
@@ -626,6 +645,75 @@ class WorkspaceStore:
         if row is None:
             raise NotFound("MEDIA_NOT_FOUND", f"No such media {media_id}")
         return json.loads(row[0])
+
+    @_serialized
+    def get_completion(self, intake_id: str) -> Optional[Dict[str, Any]]:
+        """Return the durable completion record of an admitted intake, if any."""
+        cursor = self.conn.execute("SELECT * FROM admission_completions WHERE intake_id=?", (intake_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        record = dict(zip([column[0] for column in cursor.description], row))
+        record["source_size"] = str(record["source_size"])
+        return record
+
+    @_serialized
+    def unbound_artifacts(self) -> Dict[str, Any]:
+        """Measure content-addressed objects no media record binds.
+
+        A crash between publishing objects and committing the admission leaves
+        such objects behind. They are immutable and harmless, but they must be
+        countable before anything is removed.
+        """
+        referenced = set()
+        for (body,) in self.conn.execute("SELECT value FROM meta WHERE key LIKE 'media_objects:%'"):
+            try:
+                bindings = json.loads(body)
+            except ValueError:
+                continue
+            if isinstance(bindings, dict):
+                for reference in bindings.values():
+                    if isinstance(reference, dict) and isinstance(reference.get("id"), str):
+                        referenced.add(reference["id"])
+        items = [{"id": ident, "relative_path": rel, "size_bytes": str(size)}
+                 for ident, rel, size in self.conn.execute(
+                     "SELECT id,rel_path,size_bytes FROM artifacts ORDER BY id")
+                 if ident not in referenced]
+        return {"count": len(items), "artifacts": items,
+                "total_bytes": str(sum(int(item["size_bytes"]) for item in items))}
+
+    def sweep_unbound_artifacts(self, *, apply: bool = False) -> Dict[str, Any]:
+        """Remove measured unbound objects, re-checking each one under the lock.
+
+        Dry run by default. A row is deleted only when it is still unbound at
+        deletion time, so a concurrent admission that just bound the object is
+        never damaged.
+        """
+        measured = self.unbound_artifacts()
+        if not apply:
+            return {**measured, "applied": False, "removed": 0}
+        removed = 0
+        with self._mutex, self.transaction() as conn:
+            for item in measured["artifacts"]:
+                referenced = False
+                for (body,) in conn.execute("SELECT value FROM meta WHERE key LIKE 'media_objects:%'"):
+                    try:
+                        bindings = json.loads(body)
+                    except ValueError:
+                        continue
+                    if isinstance(bindings, dict) and any(
+                            isinstance(reference, dict) and reference.get("id") == item["id"]
+                            for reference in bindings.values()):
+                        referenced = True
+                        break
+                if referenced:
+                    continue
+                conn.execute("DELETE FROM artifacts WHERE id=?", (item["id"],))
+                path = self.root / item["relative_path"]
+                _safe(path)
+                path.unlink(missing_ok=True)
+                removed += 1
+        return {**self.unbound_artifacts(), "applied": True, "removed": removed}
 
     @_serialized
     def get_snapshot(self) -> Dict[str, Any]:
