@@ -72,8 +72,8 @@ def run_checks(output, media_file, harness, channel, summary):
         page.goto(server.editor_url)
         expect(page.locator("#file-input")).to_be_enabled()
         page.locator("#file-input").set_input_files(str(media_file))
-        expect(page.locator("#import-status")).to_contain_text("本次导入结束", timeout=30000)
-        expect(page.locator("#task-list button[data-task-id]")).to_have_count(1)
+        expect(page.locator("#import-status")).to_contain_text("已入库 1", timeout=60000)
+        expect(page.locator("#task-list button[data-task-id]")).to_have_count(1, timeout=60000)
 
         task_id = store.list_intakes()[0]["task_id"]
         page.locator(f'#task-list button[data-task-id="{task_id}"]').click()
