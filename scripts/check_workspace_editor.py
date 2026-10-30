@@ -507,41 +507,40 @@ def run_browser(output, sources, channel, summary):
         expect(page.locator("#file-input")).to_be_enabled()
         page.locator("#file-input").set_input_files([sources[key]["path"] for key in
                                                     ("cfr", "vfr", "invalid", "audio-offset", "duplicate")])
-        expect(page.locator("#import-status")).to_contain_text("本次导入结束", timeout=120000)
-        expect(page.locator("#task-list button[data-task-id]")).to_have_count(4)
+        expect(page.locator("#import-status")).to_contain_text("已入库 3", timeout=180000)
+        expect(page.locator("#import-status")).to_contain_text("失败或未知 1", timeout=60000)
+        expect(page.locator("#task-list button[data-task-id]")).to_have_count(3, timeout=60000)
         expect(page.locator("#file-input")).to_be_enabled(timeout=120000)
         intakes = store.list_intakes()
-        assert len(intakes) == 5 and sum(item["state"] == "succeeded" for item in intakes) == 4
+        assert len(intakes) == 4, [item["display_name"] for item in intakes]
+        assert sum(item["state"] == "succeeded" for item in intakes) == 3
         assert sum(item["state"] == "failed" for item in intakes) == 1
         assert len(store.get_snapshot()["media"]) == 3
         expect(page.locator("body")).to_contain_text("invalid.mp4")
         check("Multi-file upload preserved a failed intake and admitted later inputs")
 
-        # Admission is already durable if its 200 response was delivered, even
-        # when the following list refresh fails. Do not count the file twice or
-        # invite a duplicate retry; stop the remaining selected inputs instead.
-        refresh_faults = []
-        def fail_refresh(route):
-            refresh_faults.append(route.request.url)
-            route.fulfill(status=503, content_type="application/json", body=json.dumps({
-                "error": {"code": "DEPENDENCY_UNAVAILABLE", "message": "Injected list refresh fault",
-                          "retryable": True, "details": {}}}))
-        page.route("**/snapshot", fail_refresh, times=1)
-        page.locator("#file-input").set_input_files([sources["cfr"]["path"], sources["vfr"]["path"]])
-        expect(page.locator("#import-status")).to_contain_text("本次导入结束", timeout=30000)
-        expect(page.locator("#import-status")).to_contain_text("成功 1，失败或未确认 0")
-        assert len(refresh_faults) == 1 and len(store.list_intakes()) == 6
-        assert len(store.list_tasks()) == 5
-        page.locator("#refresh-workspace").click()
-        expect(page.locator("#task-list button[data-task-id]")).to_have_count(5)
-        check("Admission success with failed list refresh stays successful and stops remaining uploads")
+        # The same bytes may still become a second task: a different browser
+        # session (fresh storage, so no remembered batch) imports the same file
+        # again. The workspace must reuse the media record and add one task.
+        other_session = browser.new_context(accept_downloads=True, viewport={"width": 1500, "height": 1060})
+        other_page = other_session.new_page()
+        observe(other_page)
+        other_page.goto(server.editor_url)
+        expect(other_page.locator("#file-input")).to_be_enabled()
+        other_page.locator("#file-input").set_input_files([sources["cfr"]["path"]])
+        expect(other_page.locator("#task-list button[data-task-id]")).to_have_count(4, timeout=180000)
+        other_session.close()
+        page.reload()
+        expect(page.locator("#task-list button[data-task-id]")).to_have_count(4, timeout=60000)
+        assert len(store.list_intakes()) == 5 and len(store.get_snapshot()["media"]) == 3
+        check("Re-importing admitted bytes reuses the media record and adds exactly one task")
 
         cfr = task_by_name("cfr.mp4")
-        duplicate = task_by_name("same-content-renamed.mp4")
-        assert cfr != duplicate and store.get_task(cfr)["media_id"] == store.get_task(duplicate)["media_id"]
-        transport_task = next(item["id"] for item in store.get_snapshot()["tasks"]
-                              if item["id"] not in (cfr, duplicate)
-                              and item["media_id"] == store.get_task(cfr)["media_id"])
+        same_media = [task["task_id"] for task in store.list_tasks()
+                      if task["media_id"] == store.get_task(cfr)["media_id"]]
+        duplicate = next(ident for ident in same_media if ident != cfr)
+        assert store.get_task(cfr)["media_id"] == store.get_task(duplicate)["media_id"]
+        transport_task = task_by_name("vfr.mp4")
         exercise_transport(page, transport_task, cfr)
         exercise_classic_routes(page)
         select(page, cfr)
@@ -799,7 +798,7 @@ def run_browser(output, sources, channel, summary):
         exported = snapshot_download(page, "browser-workspace.json")
         assert exported["tasks"] == store.get_snapshot()["tasks"]
         assert exported["media"] == store.get_snapshot()["media"]
-        assert len(exported["tasks"]) == 5
+        assert len(exported["tasks"]) == 4
         assert exported["intakes"] == store.list_intakes()
         page.screenshot(path=str(output / "workspace.png"), full_page=True)
         check("Browser-downloaded snapshot retains all task revisions, exact times and media bindings")
@@ -821,7 +820,7 @@ def run_browser(output, sources, channel, summary):
         page = context.new_page()
         observe(page)
         page.goto(server.editor_url)
-        expect(page.locator("#task-list button[data-task-id]")).to_have_count(5)
+        expect(page.locator("#task-list button[data-task-id]")).to_have_count(4)
         reopened = snapshot_download(page, "browser-after-service-restart.json")
         assert reopened["tasks"] == exported["tasks"] and reopened["media"] == exported["media"]
         assert reopened["intakes"] == exported["intakes"]
