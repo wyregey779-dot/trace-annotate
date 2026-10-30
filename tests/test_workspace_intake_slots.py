@@ -179,7 +179,7 @@ def test_queued_intake_keeps_no_lease_while_the_slot_is_busy(store):
     bad.write_bytes(b"not media" * 64)
     rec = q.enqueue(bad, display_name="waiting.mp4")
 
-    slot = get_prepare_slot()
+    slot = get_prepare_slot(store.root)
     slot.acquire()
     outcome = {}
 
@@ -217,7 +217,7 @@ def test_two_runners_never_overlap_media_processes(store, upload, process_counte
         q.enqueue(upload(f"clip{index}", pattern=pattern, seconds=1.0),
                   display_name=f"clip{index}.mp4")
 
-    get_prepare_slot().reset_stats()
+    get_prepare_slot(store.root).reset_stats()
     results = []
     guard = threading.Lock()
 
@@ -237,7 +237,7 @@ def test_two_runners_never_overlap_media_processes(store, upload, process_counte
     assert {row["state"] for row in results} == {"succeeded"}
     # Real evidence: at most one ffmpeg/ffprobe child existed at any instant.
     assert process_counter["peak"] == 1, process_counter
-    assert get_prepare_slot().stats()["peak"] == 1
+    assert get_prepare_slot(store.root).stats()["peak"] == 1
 
 
 def test_sync_and_async_prepare_share_one_slot(store, upload, process_counter):
@@ -246,7 +246,7 @@ def test_sync_and_async_prepare_share_one_slot(store, upload, process_counter):
 
     q = AsyncIntakes(store)
     q.enqueue(upload("async", pattern="testsrc", seconds=1.0), display_name="async.mp4")
-    get_prepare_slot().reset_stats()
+    get_prepare_slot(store.root).reset_stats()
 
     errors = []
 
@@ -267,7 +267,7 @@ def test_sync_and_async_prepare_share_one_slot(store, upload, process_counter):
 
     assert not errors, errors
     assert process_counter["peak"] == 1, process_counter
-    assert get_prepare_slot().stats()["peak"] == 1
+    assert get_prepare_slot(store.root).stats()["peak"] == 1
 
 
 # -- P05: fenced renewal and a hard attempt deadline -----------------------
@@ -418,7 +418,7 @@ def test_close_refuses_new_admission_and_claims(store, upload):
 def test_close_interrupts_a_slot_wait_promptly(store):
     closing = threading.Event()
     q = AsyncIntakes(store, closing=closing)
-    slot = get_prepare_slot()
+    slot = get_prepare_slot(store.root)
     slot.acquire()
     started = time.monotonic()
     outcome = {}
@@ -465,3 +465,121 @@ def test_close_reports_a_worker_that_does_not_stop(store, upload, monkeypatch):
         release.set()
         thread.join(timeout=30)
     assert q.close(timeout=5)["stopped"] is True
+
+
+# -- P04: every real entry point shares the workspace slot -----------------
+def test_error_path_releases_the_slot(store, upload, monkeypatch):
+    """A prepare that raises must not keep the workspace slot."""
+    q = AsyncIntakes(store)
+    q.enqueue(upload("boom", pattern="testsrc", seconds=1.0), display_name="boom.mp4")
+
+    def explode(source, output_dir, **kwargs):
+        raise WorkspaceError("ADMISSION_FAILED", "synthetic failure")
+
+    monkeypatch.setattr(media_module, "prepare_workspace_media", explode)
+    results = q.run_pending(worker_id="w1")
+    assert results[0]["state"] == "failed"
+    slot = get_prepare_slot(store.root)
+    assert slot.depth == 0
+    assert slot.stats()["held"] is False
+    # A later unit of work must still be able to take the slot.
+    monkeypatch.undo()
+    q.retry_failed(results[0]["id"])
+    again = q.run_pending(worker_id="w1")
+    assert again[0]["state"] == "succeeded", again[0]
+
+
+def test_two_workspaces_prepare_independently(tmp_path, process_counter):
+    """An unrelated workspace must not be blocked by another workspace's decode."""
+    first = WorkspaceStore(tmp_path / "ws-a")
+    second = WorkspaceStore(tmp_path / "ws-b")
+    first.create()
+    second.create()
+    try:
+        slot_a = get_prepare_slot(first.root)
+        slot_a.acquire()
+        started = time.monotonic()
+        target = second.tmp_dir / "independent-work"
+        source = _make_video(tmp_path / "independent.mp4", seconds=1.0, pattern="testsrc")
+        from trace_annotate.workspace.media import prepare_workspace_media
+        prepare_workspace_media(source, target, slot_key=second.root, slot_timeout=30)
+        elapsed = time.monotonic() - started
+        # The second workspace completed while the first workspace's slot was held.
+        assert elapsed < 30.0, elapsed
+        assert (target / "project.json").is_file()
+        assert slot_a.stats()["held"] is True
+        slot_a.release()
+    finally:
+        first.close()
+        second.close()
+
+
+def test_cli_import_and_async_worker_share_one_slot(store, upload, process_counter):
+    """store.import_source (CLI) and the async drainer must not decode together."""
+    q = AsyncIntakes(store)
+    q.enqueue(upload("async2", pattern="smptebars", seconds=1.0), display_name="async2.mp4")
+    get_prepare_slot(store.root).reset_stats()
+    errors = []
+
+    def async_side():
+        try:
+            q.run_pending(worker_id="async-worker")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=async_side)
+    thread.start()
+    try:
+        store.import_source(upload("cli", pattern="rgbtestsrc", seconds=1.0),
+                            display_name="cli.mp4")
+    finally:
+        thread.join(timeout=180)
+    assert not errors, errors
+    assert process_counter["peak"] == 1, process_counter
+    assert get_prepare_slot(store.root).stats()["peak"] == 1
+
+
+def test_http_import_and_async_worker_share_one_slot(store, upload, process_counter):
+    """The synchronous HTTP upload path funnels through the same workspace slot."""
+    import http.client
+    import json as _json
+    from trace_annotate.workspace.server import TOKEN_HEADER, make_server
+
+    q = AsyncIntakes(store)
+    q.enqueue(upload("async3", pattern="testsrc", seconds=1.0), display_name="async3.mp4")
+    httpd = make_server(store)
+    thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01},
+                              daemon=True)
+    thread.start()
+    get_prepare_slot(store.root).reset_stats()
+    errors = []
+
+    def async_side():
+        try:
+            httpd.async_intakes.run_pending(worker_id="async-worker")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    drain = threading.Thread(target=async_side)
+    drain.start()
+    try:
+        raw = upload("http", pattern="smptebars", seconds=1.0).read_bytes()
+        conn = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=120)
+        conn.request("POST", "/api/v1/projects/current/imports", body=raw,
+                     headers={TOKEN_HEADER: httpd.token, "Origin": httpd.origin,
+                              "Content-Type": "application/octet-stream",
+                              "Content-Length": str(len(raw)),
+                              "X-TraceAnnotate-Filename": "http.mp4"})
+        response = conn.getresponse()
+        payload = _json.loads(response.read())
+        conn.close()
+    finally:
+        drain.join(timeout=180)
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+    assert not errors, errors
+    assert response.status == 200, payload
+    assert payload["task_id"]
+    assert process_counter["peak"] == 1, process_counter
+    assert get_prepare_slot(store.root).stats()["peak"] == 1

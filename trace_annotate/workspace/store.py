@@ -391,11 +391,17 @@ class WorkspaceStore:
         return [json.loads(r[0]) for r in rows]
 
     # -- intake / admission -------------------------------------------------
-    def import_source(self, source, *, display_name=None, template_id="generic-segment", template_version=1, cancelled=None):
+    def import_source(self, source, *, display_name=None, template_id="generic-segment", template_version=1, cancelled=None, closing=None):
         from .media import prepare_workspace_media
         if cancelled is not None and not callable(cancelled):
             raise SchemaInvalid("SCHEMA_INVALID", "Cancellation must be a callback")
+        if closing is not None and not callable(closing):
+            raise SchemaInvalid("SCHEMA_INVALID", "closing must be a callback")
         def check_cancelled():
+            # A shutdown is not a user cancellation: it must persist as an
+            # interrupted, retryable failure instead of a settled cancellation.
+            if closing is not None and closing():
+                raise WorkspaceError("INTERRUPTED", "Workspace is shutting down")
             if cancelled is not None and cancelled():
                 raise WorkspaceError("CANCELLED", "Media admission was cancelled")
         source = Path(source)
@@ -427,7 +433,8 @@ class WorkspaceStore:
             if reused:
                 self._check_artifacts()
             if media is None:
-                prepared = prepare_workspace_media(source, self.tmp_dir / job_id, cancelled=cancelled)
+                prepared = prepare_workspace_media(source, self.tmp_dir / job_id,
+                                                   cancelled=check_cancelled, slot_key=self.root)
                 if prepared["source_sha256"] != digest or prepared["source_size"] != size:
                     raise Conflict("MEDIA_CHANGED", "Source changed during preparation")
                 objects = {key: self._put_file(prepared[key]) for key in
@@ -438,7 +445,7 @@ class WorkspaceStore:
                 media["frame_map_artifact"] = objects["frame_map_path"]["id"]
                 if objects["playback_path"]["sha256"] != media["playback"]["sha256"]:
                     raise Conflict("MEDIA_CHANGED", "Playback changed during admission")
-            if stream_sha256(source, cancelled=cancelled) != digest or source.stat().st_size != size:
+            if stream_sha256(source, cancelled=check_cancelled) != digest or source.stat().st_size != size:
                 raise Conflict("MEDIA_CHANGED", "Source changed before admission commit")
             task_id = _new_id("tsk")
             task = {"id": task_id, "media_id": media["id"], "template_id": template_id,
@@ -520,7 +527,8 @@ class WorkspaceStore:
                                    "Prepare work directory is not a plain directory")
                 _safe(work)
                 shutil.rmtree(work)
-            prepared = prepare_workspace_media(staged, work, cancelled=cancelled)
+            prepared = prepare_workspace_media(staged, work, cancelled=cancelled,
+                                               slot_key=self.root)
             if prepared["source_sha256"] != digest or prepared["source_size"] != size:
                 raise Conflict("MEDIA_CHANGED", "Source changed during preparation")
             objects = {key: self._put_file(prepared[key]) for key in

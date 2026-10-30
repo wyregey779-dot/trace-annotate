@@ -96,10 +96,25 @@ def _workspace_map(source: Path, destination: Path, expected_count: int,
     return count, first_proxy, last_proxy
 
 
+def _derive_slot_key(output_dir: Path) -> Optional[Path]:
+    """Find the workspace root that owns ``output_dir``, if there is one.
+
+    Preparation output always lives under ``<workspace>/tmp/...``. Deriving the
+    key here means a caller cannot silently bypass the workspace's single
+    prepare slot by forgetting to pass ``slot_key``.
+    """
+    from .store import DB_FILE
+    for candidate in [output_dir, *output_dir.parents]:
+        if (candidate / DB_FILE).is_file():
+            return candidate
+    return None
+
+
 def prepare_workspace_media(source: Path, output_dir: Path, *,
                             cancelled: Optional[Callable[[], bool]] = None,
                             closing: Optional[Callable[[], bool]] = None,
-                            slot_timeout: Optional[float] = None) -> Dict[str, Any]:
+                            slot_timeout: Optional[float] = None,
+                            slot_key: Optional[Any] = None) -> Dict[str, Any]:
     """Return verified media fields and paths, without assigning workspace IDs.
 
     ``output_dir`` must not exist and its parent must exist. The caller binds
@@ -126,7 +141,7 @@ def prepare_workspace_media(source: Path, output_dir: Path, *,
         if missing:
             raise DependencyUnavailable("DEPENDENCY_UNAVAILABLE", "Media preparation tools are unavailable",
                                         details={"tools": missing})
-        slot = get_prepare_slot()
+        slot = get_prepare_slot(slot_key if slot_key is not None else _derive_slot_key(target))
         try:
             slot.acquire(cancelled=cancelled, closing=closing, timeout=slot_timeout)
         except InterruptedError as exc:

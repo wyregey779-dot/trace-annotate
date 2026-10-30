@@ -164,12 +164,17 @@ def receive_and_import(handler):
     and the snapshot before the user explicitly starts a new import.
     """
     server = handler.server
+    if server.closing.is_set():
+        # Close forbids new admission before a byte of body is accepted, so a
+        # request that arrives during shutdown never creates an intake row.
+        raise Conflict("WORKSPACE_CLOSING", "Workspace is shutting down and accepts no new uploads")
     if not server.import_lock.acquire(blocking=False):
         raise Conflict("IMPORT_BUSY", "Another upload or media preparation is running")
     path = None
     try:
         path, name, _size = receive_upload_temp(handler)
-        return server.store.import_source(path, display_name=name, cancelled=server.closing.is_set)
+        return server.store.import_source(path, display_name=name,
+                                          closing=server.closing.is_set)
     finally:
         try:
             handler.connection.settimeout(handler.connection.gettimeout())

@@ -21,9 +21,11 @@ diagnostic evidence, not a substitute for observing real child processes.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Optional
 
 # A short poll keeps cancel/close latency well below any human-visible budget
@@ -172,9 +174,32 @@ class PrepareSlot:
             self.release()
 
 
-# The single instance every workspace entry point shares.
-PREPARE_SLOT = PrepareSlot()
+# One slot per workspace root, not one per interpreter. Two independent
+# workspaces opened in the same process must be able to prepare concurrently;
+# only a shared workspace is serialised. The key is the resolved absolute root
+# so the same workspace always maps to the same slot.
+_SLOTS: Dict[str, PrepareSlot] = {}
+_SLOTS_LOCK = threading.Lock()
+_PROCESS_KEY = "<process>"
 
 
-def get_prepare_slot() -> PrepareSlot:
-    return PREPARE_SLOT
+def get_prepare_slot(workspace_root: Any = None) -> PrepareSlot:
+    """Return the single prepare slot for a workspace root."""
+    if workspace_root is None:
+        key = _PROCESS_KEY
+    else:
+        key = str(Path(workspace_root).absolute())
+        if os.name == "nt":
+            key = key.lower()
+    with _SLOTS_LOCK:
+        slot = _SLOTS.get(key)
+        if slot is None:
+            slot = PrepareSlot()
+            _SLOTS[key] = slot
+        return slot
+
+
+def reset_prepare_slots() -> None:
+    """Drop the registry (tests only; never called by product code)."""
+    with _SLOTS_LOCK:
+        _SLOTS.clear()

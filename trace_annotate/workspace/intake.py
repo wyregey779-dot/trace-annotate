@@ -446,7 +446,7 @@ class AsyncIntakes:
 
     def run_once(self, worker_id: str = "intake-local") -> Optional[Dict[str, Any]]:
         """Reserve the decode slot, then claim and prepare exactly one intake."""
-        slot = get_prepare_slot()
+        slot = get_prepare_slot(self.store.root)
         # Reserve the single physical prepare slot BEFORE claiming so a row that
         # is still waiting for the decoder stays ``queued`` and keeps no lease.
         try:
