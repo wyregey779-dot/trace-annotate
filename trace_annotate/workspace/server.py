@@ -609,8 +609,9 @@ class _Handler(BaseHTTPRequestHandler):
             raw, body = self._read_body()
             with store.transaction():
                 if intake_control:
-                    result = (self.server.async_intakes.request_cancel(parts[1])
-                              if parts[2] == "cancel" else self.server.async_intakes.retry_failed(parts[1]))
+                    cid = body.get("command_id") if isinstance(body, dict) else None
+                    result = (self.server.async_intakes.request_cancel(parts[1], command_id=cid)
+                              if parts[2] == "cancel" else self.server.async_intakes.retry_failed(parts[1], command_id=cid))
                 elif parts == ["drafts"]:
                     expected = {"draft_id", "editor_session_id", "task_id", "media_id", "expected_draft_revision", "body"}
                     if not isinstance(body, dict) or set(body) != expected:

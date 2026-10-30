@@ -190,8 +190,18 @@ class AsyncIntakes:
                     (command_id, req_sha, S.canonical_json(response).decode("utf-8"), _now()))
             return response
 
-    def retry_failed(self, intake_id: str) -> Dict[str, Any]:
+    def retry_failed(self, intake_id: str, *, command_id: Optional[str] = None) -> Dict[str, Any]:
+        request = {"kind": "intake.retry", "intake_id": intake_id}
+        req_sha = S.sha256_bytes(S.canonical_json(request))
         with self.store.transaction():
+            if command_id:
+                S.require_id(command_id)
+                existing = _row(self.store.conn.execute(
+                    "SELECT request_sha256,response FROM command_receipts WHERE command_id=?", (command_id,)))
+                if existing is not None:
+                    if existing["request_sha256"] != req_sha:
+                        raise Conflict("IDEMPOTENCY_CONFLICT", "command_id was reused")
+                    return json.loads(existing["response"])
             row = _row(self.store.conn.execute("SELECT * FROM intakes WHERE id=?", (intake_id,)))
             if row is None:
                 raise NotFound("INTAKE_NOT_FOUND", "Intake not found")
@@ -202,7 +212,13 @@ class AsyncIntakes:
             self.store.conn.execute(
                 "UPDATE intakes SET state='queued', error_code=NULL, attempt=attempt+1, "
                 "worker_id=NULL, session_id=NULL, lease_expires_at=NULL WHERE id=?", (intake_id,))
-            return self.get(intake_id)
+            response = self.get(intake_id)
+            if command_id:
+                self.store.conn.execute(
+                    "INSERT INTO command_receipts(command_id,task_id,request_sha256,state,response,created_at) "
+                    "VALUES(?,NULL,?,'committed',?,?)",
+                    (command_id, req_sha, S.canonical_json(response).decode("utf-8"), _now()))
+            return response
 
     # -- worker side -------------------------------------------------------
     def claim(self, worker_id: str) -> Optional[Dict[str, Any]]:
