@@ -38,13 +38,11 @@ from trace_annotate.workspace.errors import WorkspaceError
 from trace_annotate.workspace.intake import AsyncIntakes
 from trace_annotate.workspace.reporting import export_task
 from trace_annotate.workspace.store import WorkspaceStore
+from tests.support.media_tools import require_media_tools
 
 
 def _ffmpeg() -> str:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or not shutil.which("ffprobe"):
-        pytest.skip("ffmpeg/ffprobe required")
-    return ffmpeg
+    return require_media_tools()[0]
 
 
 @pytest.fixture(scope="module")

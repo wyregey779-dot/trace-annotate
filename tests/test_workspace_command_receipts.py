@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import shutil
 import subprocess
 import threading
 import time
@@ -30,15 +29,13 @@ from trace_annotate.workspace import media as media_module
 from trace_annotate.workspace.errors import WorkspaceError
 from trace_annotate.workspace.server import TOKEN_HEADER, make_server
 from trace_annotate.workspace.store import WorkspaceStore
+from tests.support.media_tools import require_media_tools
 
 PREFIX = "/api/v1/projects/current"
 
 
 def _ffmpeg() -> str:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or not shutil.which("ffprobe"):
-        pytest.skip("ffmpeg/ffprobe required")
-    return ffmpeg
+    return require_media_tools()[0]
 
 
 @pytest.fixture(scope="module")

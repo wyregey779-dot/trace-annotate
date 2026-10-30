@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import shutil
 import socket
 import subprocess
 import threading
@@ -28,15 +27,13 @@ import pytest
 
 from trace_annotate.workspace.server import make_server, TOKEN_HEADER
 from trace_annotate.workspace.store import WorkspaceStore
+from tests.support.media_tools import require_media_tools
 
 PREFIX = "/api/v1/projects/current"
 
 
 def _ffmpeg() -> str:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or not shutil.which("ffprobe"):
-        pytest.skip("ffmpeg/ffprobe required")
-    return ffmpeg
+    return require_media_tools()[0]
 
 
 def _make_video(path: Path, *, seconds: float, size: str = "320x240", rate: int = 10) -> Path:
