@@ -24,6 +24,8 @@ MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 UPLOAD_TIMEOUT_SECONDS = 120
 STREAM_CHUNK_BYTES = 64 * 1024
 FILENAME_HEADER = "X-TraceAnnotate-Filename"
+SHA_HEADER = "X-TraceAnnotate-SHA256"
+COMMAND_HEADER = "X-TraceAnnotate-Command-Id"
 
 
 def resolve_media_object(store, media_id, key):
@@ -86,6 +88,38 @@ def upload_name(headers):
             or any(ord(char) < 32 or ord(char) == 127 for char in name)):
         raise BadRequest("INVALID_UPLOAD", "Filename must be a plain display name")
     return name
+
+
+def _declared(headers, name):
+    """Return the single optional value of ``name``, or None when absent.
+
+    A declaration is optional, but a client that declares one must declare it
+    exactly once. Silently dropping a duplicate would leave the browser and the
+    server disagreeing about which command the bytes belong to, so duplicates
+    and empty values are rejected before any byte of the body is consumed.
+    """
+    values = headers.get_all(name, [])
+    if not values:
+        return None
+    if len(values) != 1:
+        raise BadRequest("INVALID_UPLOAD", f"{name} must be sent at most once")
+    value = values[0].strip()
+    if not value:
+        raise BadRequest("INVALID_UPLOAD", f"{name} must not be empty")
+    return value
+
+
+def upload_identity(headers):
+    """Return the (sha256, command_id) an uploader declared, if any."""
+    digest = _declared(headers, SHA_HEADER)
+    command_id = _declared(headers, COMMAND_HEADER)
+    if digest is not None:
+        if re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+            raise BadRequest("INVALID_UPLOAD", "Upload sha256 must be 64 hexadecimal characters")
+        digest = digest.lower()
+    if command_id is not None and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,95}", command_id) is None:
+        raise BadRequest("INVALID_UPLOAD", "Upload command id must be an ASCII identifier")
+    return digest, command_id
 
 
 def upload_length(headers, maximum):

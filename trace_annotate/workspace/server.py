@@ -522,16 +522,21 @@ class _Handler(BaseHTTPRequestHandler):
         store = self.server.store
         if self.command == "POST" and parts == ["imports"]:
             if self._query.get("async", ["0"])[0] == "1":
-                from .http_media import receive_upload_temp
+                from .http_media import receive_upload_temp, upload_identity
+                if self.server.closing.is_set():
+                    # Close forbids new admission before a byte of body is
+                    # accepted; the declaration is checked first as well so a
+                    # malformed request never streams a payload.
+                    raise Conflict("WORKSPACE_CLOSING",
+                                   "Workspace is shutting down and accepts no new uploads")
+                declared_sha, declared_command = upload_identity(self.headers)
                 path, name, size = receive_upload_temp(self)
                 try:
-                    header_sha = self.headers.get_all("X-TraceAnnotate-SHA256", [])
-                    header_cid = self.headers.get_all("X-TraceAnnotate-Command-Id", [])
                     result = self.server.async_intakes.enqueue(
                         path, display_name=name,
-                        expected_sha256=header_sha[0].strip().lower() if len(header_sha) == 1 else None,
+                        expected_sha256=declared_sha,
                         expected_size=size,
-                        command_id=header_cid[0].strip() if len(header_cid) == 1 else None)
+                        command_id=declared_command)
                 finally:
                     try:
                         path.unlink(missing_ok=True)
@@ -619,7 +624,16 @@ class _Handler(BaseHTTPRequestHandler):
             raw, body = self._read_body()
             with store.transaction():
                 if intake_control:
-                    cid = body.get("command_id") if isinstance(body, dict) else None
+                    # A control body is exactly "optionally one command_id".
+                    # Arrays, null, unknown fields and non-identifier ids are
+                    # refused instead of being silently treated as "no command",
+                    # which would drop the caller's idempotency key.
+                    if not isinstance(body, dict) or set(body) - {"command_id"}:
+                        raise SchemaInvalid("SCHEMA_INVALID",
+                                            "Intake control accepts only an optional command_id")
+                    cid = body.get("command_id")
+                    if cid is not None:
+                        _require_id(cid, "command_id")
                     result = (self.server.async_intakes.request_cancel(parts[1], command_id=cid)
                               if parts[2] == "cancel" else self.server.async_intakes.retry_failed(parts[1], command_id=cid))
                 elif parts == ["drafts"]:

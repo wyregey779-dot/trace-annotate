@@ -330,3 +330,99 @@ def test_cancelling_one_batch_leaves_another_batch_and_the_editing_task_alone(se
         after = store.get_task(editing_task)
     assert after == before, "cancelling a batch changed the editing task"
     assert _task_count(store) == 2
+
+
+# ---------------------------------------------------------------------------
+# HTTP_STRICT_INPUT
+# ---------------------------------------------------------------------------
+def _post_duplicate_headers(httpd, raw, *, extra_headers, name="small.mp4", timeout=60):
+    """Send a request with a header name repeated verbatim."""
+    sock = socket.create_connection(("127.0.0.1", httpd.server_port), timeout=timeout)
+    try:
+        lines = ["POST " + PREFIX + "/imports?async=1 HTTP/1.1",
+                 f"Host: 127.0.0.1:{httpd.server_port}",
+                 f"{TOKEN_HEADER}: {httpd.token}",
+                 f"Origin: {httpd.origin}",
+                 "Content-Type: application/octet-stream",
+                 f"Content-Length: {len(raw)}",
+                 f"X-TraceAnnotate-Filename: {name}"]
+        lines.extend(extra_headers)
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + raw)
+        received = b""
+        while b"\r\n\r\n" not in received:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            received += chunk
+        head, _, rest = received.partition(b"\r\n\r\n")
+        status = int(head.split(b" ")[1])
+        length = None
+        for line in head.split(b"\r\n")[1:]:
+            key, _, value = line.partition(b":")
+            if key.strip().lower() == b"content-length":
+                length = int(value.strip())
+        body = rest
+        while length is not None and len(body) < length:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+        return status, json.loads(body or b"{}")
+    finally:
+        sock.close()
+
+
+def _no_rows_and_no_temp_bytes(store):
+    with store.transaction():
+        intakes = int(store.conn.execute("SELECT COUNT(*) FROM intakes").fetchone()[0])
+        receipts = int(store.conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0])
+    # `tmp/intakes` is part of the workspace layout; any *file* under tmp/ is
+    # a leftover upload or staging byte and must not survive a rejection.
+    leftovers = [str(p.relative_to(store.tmp_dir)) for p in store.tmp_dir.rglob("*")
+                 if p.is_file()] if store.tmp_dir.exists() else []
+    return intakes == 0 and receipts == 0 and leftovers == []
+
+
+@pytest.mark.parametrize("headers", [
+    ["X-TraceAnnotate-SHA256: " + "a" * 64, "X-TraceAnnotate-SHA256: " + "b" * 64],
+    ["X-TraceAnnotate-Command-Id: upl-dup", "X-TraceAnnotate-Command-Id: upl-dup2"],
+    ["X-TraceAnnotate-SHA256: "],
+    ["X-TraceAnnotate-Command-Id: "],
+    ["X-TraceAnnotate-SHA256: " + "a" * 63],
+    ["X-TraceAnnotate-SHA256: " + "g" * 64],
+    ["X-TraceAnnotate-Command-Id: 1leading-digit"],
+    ["X-TraceAnnotate-Command-Id: ../escape"],
+    ["X-TraceAnnotate-Command-Id: upl space"],
+])
+def test_a_duplicate_or_malformed_upload_declaration_is_refused_before_any_byte_is_kept(
+        server, clips, headers):
+    httpd, store = server
+    raw = clips["small"].read_bytes()
+    status, payload = _post_duplicate_headers(httpd, raw, extra_headers=headers)
+    assert status == 400, payload
+    assert payload["error"]["code"] == "INVALID_UPLOAD", payload
+    # The rejection is total: no intake row, no receipt, no temporary bytes.
+    assert _no_rows_and_no_temp_bytes(store), (store.list_intakes(), list(store.tmp_dir.iterdir()))
+    # And the refusal does not leak the token or a filesystem path.
+    text = json.dumps(payload)
+    assert httpd.token not in text and str(store.root) not in text and "\\\\" not in text
+
+
+def test_an_uppercase_declared_sha256_is_accepted_and_normalized(server, clips):
+    httpd, store = server
+    import hashlib
+    digest = hashlib.sha256(clips["small"].read_bytes()).hexdigest()
+    status, accepted = _post_upload(httpd, clips["small"], command_id="upl-upper",
+                                    sha256=digest.upper())
+    assert status == 202, accepted
+    assert accepted["source_sha256"] == digest
+    _wait(lambda: (_intake(store, accepted["id"]) or {}).get("state") == "succeeded", budget=120)
+
+
+def test_a_declared_sha256_that_does_not_match_the_bytes_is_refused(server, clips):
+    httpd, store = server
+    status, payload = _post_upload(httpd, clips["small"], command_id="upl-wrong-sha",
+                                   sha256="0" * 64)
+    assert status == 409, payload
+    assert payload["error"]["code"] == "MEDIA_IDENTITY_MISMATCH", payload
+    assert _no_rows_and_no_temp_bytes(store)
