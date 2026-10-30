@@ -71,6 +71,11 @@ class AsyncIntakes:
             store.conn.execute(
                 "UPDATE intakes SET state='failed', error_code='INTERRUPTED', worker_id=NULL, "
                 "session_id=NULL, lease_expires_at=NULL WHERE state='preparing' AND task_id IS NULL")
+            # A row left in cancel_requested by a dead process is a settled
+            # cancellation, not something a new worker should resume.
+            store.conn.execute(
+                "UPDATE intakes SET state='cancelled', error_code='CANCELLED', worker_id=NULL, "
+                "session_id=NULL, lease_expires_at=NULL WHERE state='cancel_requested'")
 
     # -- views -------------------------------------------------------------
     def get(self, intake_id: str) -> Dict[str, Any]:
@@ -142,7 +147,7 @@ class AsyncIntakes:
                 "INSERT INTO intakes(id,group_id,state,display_name,created_at,source_sha256,source_size,"
                 "job_id,template_id,template_version,staged_path,attempt,generation,request_sha256) "
                 "VALUES(?,?,'queued',?,?,?,?,null,?,?,?,0,0,?)",
-                (intake_id, group_id, _now(), display_name, digest, size,
+                (intake_id, group_id, display_name, _now(), digest, size,
                  template_id, template_version, f"tmp/intakes/{intake_id}/source", request_sha))
             response = self.get(intake_id)
             response["staged_present"] = True
@@ -243,6 +248,12 @@ class AsyncIntakes:
             row = _row(self.store.conn.execute("SELECT * FROM intakes WHERE id=?", (intake_id,)))
             if row is None:
                 raise NotFound("INTAKE_NOT_FOUND", "Intake not found")
+            # An old attempt must not overwrite a newer generation / a row that
+            # has already reached a terminal or been re-claimed by another worker.
+            if row["generation"] != generation or row["worker_id"] != worker_id:
+                return self.get(intake_id)
+            if row["state"] not in ("preparing", "cancel_requested"):
+                return self.get(intake_id)
             terminal_state = "cancelled" if row["state"] == "cancel_requested" else "failed"
             self.store.conn.execute(
                 "UPDATE intakes SET state=?, error_code=?, worker_id=NULL, session_id=NULL, "
@@ -270,7 +281,9 @@ class AsyncIntakes:
             return cancelled_flag["cancelled"]
 
         try:
-            result = self.store.admit_staged_intake(claimed, cancelled=is_cancelled)
+            result = self.store.admit_staged_intake(
+                claimed, cancelled=is_cancelled,
+                generation=generation, worker_id=worker_id, session_id=self.session_id)
             return self.finish(intake_id, generation, worker_id, result)
         except Exception as exc:  # noqa: BLE001 - persisted as a failed intake
             code = getattr(exc, "code", None) or ("CANCELLED" if cancelled_flag["cancelled"] else "ADMISSION_FAILED")

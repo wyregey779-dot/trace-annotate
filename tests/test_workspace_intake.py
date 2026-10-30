@@ -129,3 +129,47 @@ def test_bad_media_fails_and_can_be_retried(store, tmp_path):
     assert again["state"] == "queued"
     rerun = q.run_pending()[0]
     assert rerun["state"] == "failed"
+
+
+def test_enqueue_stores_display_name_and_created_at_in_correct_columns(store, source_video):
+    q = AsyncIntakes(store)
+    upload = _staging_upload(store, source_video)
+    rec = q.enqueue(upload, display_name="真实文件名.mp4")
+    row = q.get(rec["id"])
+    assert row["display_name"] == "真实文件名.mp4"
+    # created_at is an ISO timestamp, not the filename (R08 column swap).
+    assert row["display_name"] != row["created_at"]
+    assert "T" in row["created_at"]
+
+
+def test_stale_generation_fail_does_not_overwrite(store, source_video):
+    q = AsyncIntakes(store)
+    upload = _staging_upload(store, source_video)
+    rec = q.enqueue(upload, display_name="g.mp4")
+    claimed = q.claim("worker-a")
+    assert claimed["state"] == "preparing"
+    # Simulate worker-a losing its lease: the row returns to the queue and a
+    # second worker claims it, bumping the generation.
+    with store.transaction() as conn:
+        conn.execute("UPDATE intakes SET state='queued' WHERE id=?", (rec["id"],))
+    fresh = q.claim("worker-b")
+    assert fresh["generation"] > claimed["generation"]
+    # worker-a's delayed failure must not change the row.
+    q.fail(claimed["id"], claimed["generation"], "worker-a", "ADMISSION_FAILED")
+    row = q.get(claimed["id"])
+    assert row["worker_id"] == "worker-b"
+    assert row["state"] == "preparing"
+
+
+def test_cancel_requested_row_is_settled_on_restart(store, source_video):
+    q = AsyncIntakes(store)
+    upload = _staging_upload(store, source_video)
+    rec = q.enqueue(upload, display_name="c2.mp4")
+    q.request_cancel(rec["id"])
+    with store.transaction() as conn:
+        conn.execute("UPDATE intakes SET state='cancel_requested' WHERE id=?", (rec["id"],))
+    q2 = AsyncIntakes(store)
+    row = q2.get(rec["id"])
+    assert row["state"] == "cancelled" and row["error_code"] == "CANCELLED"
+    # drainer has nothing to pick up
+    assert q2.run_pending() == []

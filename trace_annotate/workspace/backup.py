@@ -191,10 +191,30 @@ def backup_workspace(store: WorkspaceStore, target: Path) -> Dict[str, Any]:
                 _copy_verified(store.root / relative, output / relative, artifact)
                 copied.add(relative)
         _sync_directory(output / "objects")
+        # Retryable (failed) staged uploads are part of the closure: without
+        # them restore can never re-run the intake. Verified against the DB.
+        retryable_sources = []
+        for intake_id, staged_path, sha, size in connection.execute(
+                "SELECT id,staged_path,source_sha256,source_size FROM intakes WHERE state='failed'"):
+            if not staged_path:
+                continue
+            source_path = store.root / staged_path
+            if not source_path.is_file():
+                continue
+            declaration = _fingerprint(source_path)
+            if declaration["sha256"] != sha or int(declaration["size_bytes"]) != size:
+                _fail("BACKUP_INTEGRITY_FAILED", "Retryable intake source does not match its recorded identity")
+            relative = Path("tmp") / "intakes" / intake_id / "source"
+            (output / relative).parent.mkdir(parents=True, exist_ok=True)
+            _copy_verified(source_path, output / relative, declaration)
+            retryable_sources.append({"intake_id": intake_id,
+                                      "relative_path": str(relative).replace("\\", "/"),
+                                      **declaration})
         manifest = {"kind": "traceannotate-workspace-backup", "backup_version": 1,
                     "state": "complete", "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "scope": "quiescent-sqlite-and-registered-objects",
-                    "excluded": ["unregistered-files", "tmp", "exports", "logs", "external-source-media"],
+                    "excluded": ["unregistered-files", "tmp-other", "exports", "logs", "external-source-media"],
+                    "retryable_sources": retryable_sources,
                     "database": {"relative_path": SNAPSHOT_DB, **_fingerprint(database)}, **description}
         _write_manifest(output / BACKUP_MANIFEST, manifest)
         return manifest
@@ -271,6 +291,11 @@ def restore_workspace(backup: Path, target: Path) -> Dict[str, Any]:
     _sync_directory(output / "objects")
     # Objects are complete before the workspace database becomes available.
     _copy_verified(backup / SNAPSHOT_DB, output / DB_FILE, manifest["database"])
+    # Restore retryable staged sources so failed intakes can be retried.
+    for source in manifest.get("retryable_sources", []):
+        target = output / source["relative_path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _copy_verified(backup / source["relative_path"], target, source)
     recovered = WorkspaceStore(output)
     try:
         recovered.open()

@@ -131,6 +131,21 @@ class WorkspaceHTTPServer(ThreadingHTTPServer):
     def server_close(self):
         if hasattr(self, "closing"):
             self.closing.set()
+        # Cooperatively stop any in-flight async preparation before joining.
+        ai = getattr(self, "async_intakes", None)
+        if ai is not None:
+            try:
+                for row in ai.list():
+                    if row.get("state") in ("queued", "preparing", "cancel_requested"):
+                        try:
+                            ai.request_cancel(row["id"])
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        drainer = getattr(self, "drain_thread", None)
+        if drainer is not None and drainer.is_alive():
+            drainer.join(timeout=60)
         super().server_close()
         if hasattr(self, "image_service"):
             self.image_service.close()
@@ -724,7 +739,8 @@ def make_server(store: WorkspaceStore, host: str = "127.0.0.1", port: int = 0) -
                 # One intake failure is already persisted; never kill the drainer.
                 continue
 
-    threading.Thread(target=_drain_intakes, name="intake-drain", daemon=False).start()
+    server.drain_thread = threading.Thread(target=_drain_intakes, name="intake-drain", daemon=False)
+    server.drain_thread.start()
     server.authority = f"127.0.0.1:{server.server_port}"
     server.origin = f"http://{server.authority}"
     server.editor_url = server.origin + "/"

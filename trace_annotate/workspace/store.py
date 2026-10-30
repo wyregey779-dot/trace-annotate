@@ -25,6 +25,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import time
 from ..temporal.media import stream_sha256
 from typing import Any, Dict, List, Optional
 
@@ -462,15 +463,15 @@ class WorkspaceStore:
                 raise WorkspaceError("CANCELLED", "Media admission was cancelled") from exc
             raise
 
-    @_serialized
-    def admit_staged_intake(self, intake, *, cancelled=None):
+    def admit_staged_intake(self, intake, *, cancelled=None, generation=None,
+                             worker_id=None, session_id=None):
         """Prepare a staged async intake and commit its media + task.
 
-        This is the worker side of the async admission route; the request side
-        has already received, fsynced and hash/size-verified the upload and moved
-        it to ``staged_path``. The staged bytes are re-hashed here, preparation
-        runs outside any SQLite write transaction, and at most one task is ever
-        created for the intake row. Raises propagate; the caller owns state.
+        Long-running ffmpeg preparation runs OUTSIDE any SQLite transaction and
+        outside the store mutex. Media/task creation happens only in a short
+        fenced transaction that re-checks the intake generation, worker and
+        cancellation state, so a stale or cancelled worker can never leave an
+        orphan task row.
         """
         from .media import prepare_workspace_media
         if cancelled is not None and not callable(cancelled):
@@ -485,16 +486,19 @@ class WorkspaceStore:
         _safe(staged)
         if not staged.is_file():
             raise NotFound("SOURCE_MISSING", "Staged upload is missing")
+        # Outside any write transaction: verify the staged bytes are unchanged.
         digest = stream_sha256(staged, cancelled=cancelled)
         size = staged.stat().st_size
         if digest != intake["source_sha256"] or size != intake["source_size"]:
             raise Conflict("MEDIA_CHANGED", "Staged upload changed during admission")
         template_id, template_version = intake["template_id"], intake["template_version"]
-        if not self.conn.execute("SELECT 1 FROM templates WHERE id=? AND version=?",
-                                 (template_id, template_version)).fetchone():
-            raise NotFound("TEMPLATE_NOT_FOUND", "Requested template does not exist")
-        candidates = [json.loads(row[0]) for row in self.conn.execute("SELECT body FROM media")]
-        media = next((value for value in candidates if value["source"]["sha256"] == digest), None)
+        # Short transaction: read template and decide whether to reuse media.
+        with self.transaction() as conn:
+            if not conn.execute("SELECT 1 FROM templates WHERE id=? AND version=?",
+                                (template_id, template_version)).fetchone():
+                raise NotFound("TEMPLATE_NOT_FOUND", "Requested template does not exist")
+            candidates = [json.loads(row[0]) for row in conn.execute("SELECT body FROM media")]
+            media = next((value for value in candidates if value["source"]["sha256"] == digest), None)
         was_reused = media is not None
         objects = None
         if media is None:
@@ -511,20 +515,36 @@ class WorkspaceStore:
             if objects["playback_path"]["sha256"] != media["playback"]["sha256"]:
                 raise Conflict("MEDIA_CHANGED", "Playback changed during admission")
         check_cancelled()
-        if stream_sha256(staged, cancelled=cancelled) != digest or staged.stat().st_size != size:
-            raise Conflict("MEDIA_CHANGED", "Staged upload changed before admission commit")
-        task_id = _new_id("tsk")
-        task = {"id": task_id, "media_id": media["id"], "template_id": template_id,
-                "template_version": template_version, "revision": 0, "annotations": [], "extensions": {}}
-        self.conn.execute("INSERT OR IGNORE INTO media VALUES(?,?)", (media["id"], S.canonical_json(media).decode("utf-8")))
-        if objects:
-            self.conn.execute("INSERT OR IGNORE INTO meta VALUES(?,?)",
-                              (f"media_objects:{media['id']}", S.canonical_json(objects).decode("utf-8")))
-        task["content_sha256"] = self.task_digest(task)
-        self.conn.execute("INSERT INTO tasks VALUES(?,?,?,?,?)", (task_id, media["id"], template_id, template_version, 0))
-        self.conn.execute("INSERT INTO task_revisions VALUES(?,?,?,?,?,?,?)",
-                          (_new_id("rev"), task_id, 0, S.canonical_json(task).decode("utf-8"),
-                           task["content_sha256"], None, _now()))
+        # Final fenced short transaction: only here do we create media/task rows.
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT state,generation,worker_id,session_id,lease_expires_at FROM intakes WHERE id=?",
+                (intake_id,)).fetchone()
+            if row is None:
+                raise NotFound("INTAKE_NOT_FOUND", "Intake disappeared during admission")
+            state_now, gen_now, worker_now, sess_now, lease = row
+            if state_now == "cancel_requested":
+                raise WorkspaceError("CANCELLED", "Cancellation was requested before admission committed")
+            if generation is not None and (gen_now != generation or worker_now != worker_id
+                                           or sess_now != session_id):
+                raise Conflict("STALE_LEASE", "Intake lease is no longer valid")
+            if (lease or 0) <= time.time():
+                raise Conflict("STALE_LEASE", "Intake lease expired before admission committed")
+            conn.execute("INSERT OR IGNORE INTO media VALUES(?,?)",
+                         (media["id"], S.canonical_json(media).decode("utf-8")))
+            if objects:
+                conn.execute("INSERT OR IGNORE INTO meta VALUES(?,?)",
+                             (f"media_objects:{media['id']}", S.canonical_json(objects).decode("utf-8")))
+            task_id = _new_id("tsk")
+            task = {"id": task_id, "media_id": media["id"], "template_id": template_id,
+                    "template_version": template_version, "revision": 0,
+                    "annotations": [], "extensions": {}}
+            task["content_sha256"] = self.task_digest(task)
+            conn.execute("INSERT INTO tasks VALUES(?,?,?,?,?)",
+                         (task_id, media["id"], template_id, template_version, 0))
+            conn.execute("INSERT INTO task_revisions VALUES(?,?,?,?,?,?,?)",
+                         (_new_id("rev"), task_id, 0, S.canonical_json(task).decode("utf-8"),
+                          task["content_sha256"], None, _now()))
         return {"intake_id": intake_id, "media_id": media["id"], "task_id": task_id,
                 "duration_seconds": float(S.rational_value(media["duration"])),
                 "frames": media["frame_count"], "reused_existing": was_reused}
