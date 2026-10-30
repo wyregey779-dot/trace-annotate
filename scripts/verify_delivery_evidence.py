@@ -221,6 +221,13 @@ class Verifier:
         self.report = Report()
 
     # -- helpers ---------------------------------------------------------
+    def _input_key(self, path: Path) -> str:
+        """Name an input for the hash manifest; tolerate an external policy."""
+        try:
+            return str(path.relative_to(self.run)).replace("\\", "/")
+        except ValueError:
+            return str(path).replace("\\", "/")
+
     def _load(self, path: Path, code_prefix: str, what: str,
               case_id: Optional[str] = None) -> Optional[Any]:
         if not path.is_file():
@@ -234,7 +241,7 @@ class Verifier:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             self.report.add(f"{code_prefix}_INVALID", f"{what} is not valid JSON: {exc}", case_id)
             return None
-        self.report.inputs[str(path.relative_to(self.run)).replace("\\", "/")] = sha256_file(path)
+        self.report.inputs[self._input_key(path)] = sha256_file(path)
         if not isinstance(payload, dict):
             self.report.add(f"{code_prefix}_INVALID", f"{what} must be a JSON object", case_id)
             return None
