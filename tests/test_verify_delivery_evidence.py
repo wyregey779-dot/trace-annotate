@@ -56,7 +56,7 @@ def _policy() -> dict:
     }
 
 
-def _junit(path: Path, *, tests: int = 2, failures: int = 0, errors: int = 0,
+def _junit(path: Path, *, tests: int = 1, failures: int = 0, errors: int = 0,
            skipped: int = 0, node: str = "tests/test_x.py::test_case") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if tests == 0:
@@ -284,7 +284,7 @@ def test_verify_process_still_running_is_rejected(run):
 
 
 def test_verify_junit_false_pass_is_rejected(run):
-    _junit(run / "logs" / "ALPHA.xml", tests=2, failures=1)
+    _junit(run / "logs" / "ALPHA.xml", tests=1, failures=1)
     document = json.loads((run / "case-results.json").read_text(encoding="utf-8"))
     for entry in document["results"]:
         if entry["case_id"] == "ALPHA":
@@ -294,8 +294,20 @@ def test_verify_junit_false_pass_is_rejected(run):
     assert "JUNIT_FAILURES" in codes(report)
 
 
+def test_verify_count_mismatch_is_rejected(run):
+    # The header claims two tests but the document holds one testcase.
+    _junit(run / "logs" / "ALPHA.xml", tests=2)
+    document = json.loads((run / "case-results.json").read_text(encoding="utf-8"))
+    for entry in document["results"]:
+        if entry["case_id"] == "ALPHA":
+            entry["evidence"][0]["sha256"] = _sha(run / "logs" / "ALPHA.xml")
+    _write_json(run / "case-results.json", document)
+    report = verifier.verify(run)
+    assert "JUNIT_COUNT_MISMATCH" in codes(report)
+
+
 def test_verify_required_skip_is_rejected(run):
-    _junit(run / "logs" / "ALPHA.xml", tests=2, skipped=1)
+    _junit(run / "logs" / "ALPHA.xml", tests=1, skipped=1)
     document = json.loads((run / "case-results.json").read_text(encoding="utf-8"))
     for entry in document["results"]:
         if entry["case_id"] == "ALPHA":

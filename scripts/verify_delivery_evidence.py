@@ -187,6 +187,7 @@ class JunitSummary:
     skipped: int = 0
     node_ids: List[str] = field(default_factory=list)
     suite_count: int = 0
+    declared_tests: int = 0
 
 
 def read_junit(path: Path) -> JunitSummary:
@@ -197,6 +198,7 @@ def read_junit(path: Path) -> JunitSummary:
     suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
     summary.suite_count = len(suites)
     for suite in suites:
+        summary.declared_tests += int(suite.get("tests") or 0)
         summary.tests += int(suite.get("tests") or 0)
         summary.failures += int(suite.get("failures") or 0)
         summary.errors += int(suite.get("errors") or 0)
@@ -574,6 +576,12 @@ class Verifier:
                 if summary.tests == 0:
                     self.report.add("JUNIT_ZERO_TESTS", f"{path.name} contains no testcase", case_id)
                     continue
+                if summary.declared_tests != len(summary.node_ids):
+                    # The suite header and the testcase nodes must agree: a file
+                    # that declares more tests than it contains hides removals.
+                    self.report.add("JUNIT_COUNT_MISMATCH",
+                                    f"{path.name} declares {summary.declared_tests} tests but has "
+                                    f"{len(summary.node_ids)} testcase nodes", case_id)
                 if summary.failures or summary.errors:
                     self.report.add("JUNIT_FAILURES",
                                     f"{path.name}: {summary.failures} failures / {summary.errors} errors",
