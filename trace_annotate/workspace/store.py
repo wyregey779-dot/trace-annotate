@@ -23,6 +23,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import sqlite3
 import time
@@ -503,6 +504,8 @@ class WorkspaceStore:
         objects = None
         if media is None:
             work = self.tmp_dir / intake_id
+            if work.exists():
+                shutil.rmtree(work, ignore_errors=True)
             prepared = prepare_workspace_media(staged, work, cancelled=cancelled)
             if prepared["source_sha256"] != digest or prepared["source_size"] != size:
                 raise Conflict("MEDIA_CHANGED", "Source changed during preparation")
