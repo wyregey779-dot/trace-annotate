@@ -55,6 +55,10 @@ def _now() -> str:
 class AsyncIntakes:
     """Durable staged-upload queue sharing the store's single-writer boundary."""
 
+    # Process-wide single physical prepare slot: the drainer and any manual
+    # run_pending must not decode two inputs at once on the same workspace.
+    _prepare_slot = threading.Lock()
+
     def __init__(self, store: Any, *, lease_seconds: float = 120,
                  clock: Callable[[], float] = time.time):
         if (isinstance(lease_seconds, bool) or not isinstance(lease_seconds, (int, float))
@@ -304,9 +308,10 @@ class AsyncIntakes:
             return cancelled_flag["cancelled"]
 
         try:
-            result = self.store.admit_staged_intake(
-                claimed, cancelled=is_cancelled,
-                generation=generation, worker_id=worker_id, session_id=self.session_id)
+            with self._prepare_slot:
+                result = self.store.admit_staged_intake(
+                    claimed, cancelled=is_cancelled,
+                    generation=generation, worker_id=worker_id, session_id=self.session_id)
             return self.finish(intake_id, generation, worker_id, result)
         except Exception as exc:  # noqa: BLE001 - persisted as a failed intake
             code = getattr(exc, "code", None) or ("CANCELLED" if cancelled_flag["cancelled"] else "ADMISSION_FAILED")
