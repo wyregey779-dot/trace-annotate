@@ -167,6 +167,7 @@ class Harness:
         self.slot = None
         self.seed = None
         self.live = None
+        self.strip_controls = False
 
     # -- evidence helpers ------------------------------------------------
     def shot(self, name: str) -> str:
@@ -264,6 +265,13 @@ class Harness:
         detail["trace"].append({"db": "queued", "at": time.time()})
 
         self.reload()
+        if self.strip_controls:
+            # Controlled fault: the control never appears, so the reachability
+            # assertion below must fail. A script that skips missing buttons
+            # would still "pass" here, which is exactly what we are testing.
+            self.page.evaluate(
+                "() => document.querySelectorAll("
+                "\"#intake-list button[data-action='cancel']\").forEach(b => b.remove())")
         require(self.row(intake_id).count() == 1, "the target intake row is not rendered")
         require(self.row(intake_id).get_attribute("data-intake-state") == "queued",
                 "the rendered row is not in the queued state")
@@ -332,6 +340,8 @@ class Harness:
                 f"media child parent {child['parent_pid']} is not this process {os.getpid()}")
         require(self.state_of(intake_id) == "preparing", "the intake left preparing before the click")
 
+        # No page reload here: the intake poller already reflects the state, and
+        # a reload would burn most of the prepare window before the click.
         self.wait_row_state(intake_id, "preparing")
         button = self.button(intake_id, "cancel")
         require(button.count() == 1, "the cancel button is missing on the preparing row")
@@ -343,7 +353,8 @@ class Harness:
         detail["response"] = reply
         require(reply["status"] == 200, f"cancel returned HTTP {reply['status']}")
         require(reply["body"].get("state") in ("cancel_requested", "cancelled"),
-                f"cancel response state is {reply['body'].get('state')!r}")
+                f"cancel response state is {reply['body'].get('state')!r} "
+                f"(the prepare finished before the click was delivered)")
         command = self.last_command()
         require(command["action"] == "cancel" and command["intakeId"] == intake_id,
                 "the editor did not record this cancel click")
@@ -498,7 +509,8 @@ def main() -> int:
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--headed", dest="headless", action="store_false")
     parser.add_argument("--fault", choices=["missing-control", "no-effect"], default=None)
-    parser.add_argument("--slow-media-seconds", type=float, default=25.0)
+    parser.add_argument("--slow-media-seconds", type=float, default=90.0)
+    parser.add_argument("--slow-media-size", default="854x480")
     args = parser.parse_args()
 
     out = args.output.expanduser().resolve()
@@ -537,7 +549,7 @@ def main() -> int:
 
     queued_media = make_video(out / "media" / "queued.mp4", seconds=1.0, pattern="testsrc")
     slow_media = make_video(out / "media" / "slow.mp4", seconds=args.slow_media_seconds,
-                            pattern="smptebars")
+                            pattern="smptebars", size=args.slow_media_size)
     retry_media = make_video(out / "media" / "retry.mp4", seconds=1.0, pattern="rgbtestsrc")
 
     seed = AsyncIntakes(store)
@@ -574,9 +586,7 @@ def main() -> int:
             harness.open_panel()
 
             if args.fault == "missing-control":
-                page.evaluate(
-                    "() => document.querySelectorAll("
-                    "\"#intake-list button[data-action='cancel']\").forEach(b => b.remove())")
+                harness.strip_controls = True
                 harness.run_case("UI_MISSING_CONTROL_NEGATIVE",
                                  lambda: harness.cancel_queued(queued["id"]))
             elif args.fault == "no-effect":
