@@ -12,12 +12,18 @@ import json
 import os
 from pathlib import Path
 import shutil
+import threading
 from typing import Any, Callable, Dict, Optional
 
 from ..temporal.media import stream_sha256
 from ..temporal.preparation import MediaPreparationError, prepare_media
 from .errors import Conflict, DependencyUnavailable, NotFound, SchemaInvalid, StorageFull, WorkspaceError
 from .schema import rational
+
+# Process-wide single physical decode slot: synchronous CLI/HTTP import and the
+# async drainer both funnel through prepare_workspace_media, so this is the one
+# place that guarantees at most one ffmpeg decode per workspace process.
+_PREPARE_SLOT = threading.Lock()
 
 
 def _integer(value: Any, name: str, *, positive: bool = False) -> int:
@@ -117,7 +123,8 @@ def prepare_workspace_media(source: Path, output_dir: Path, *,
         if missing:
             raise DependencyUnavailable("DEPENDENCY_UNAVAILABLE", "Media preparation tools are unavailable",
                                         details={"tools": missing})
-        manifest = prepare_media(source, target, cancelled=cancelled)
+        with _PREPARE_SLOT:
+            manifest = prepare_media(source, target, cancelled=cancelled)
         manifest_path = target / "project.json"
         preparation_log_path = target / "preparation-log.json"
         log = json.loads(preparation_log_path.read_text(encoding="utf-8"))
