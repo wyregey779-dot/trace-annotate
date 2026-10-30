@@ -144,6 +144,9 @@ jobs:
       - name: Verify persistent multi-video workspace and displayed frame identity
         run: python scripts/check_workspace_editor.py --output output/workspace-editor-ci
 
+      - name: Verify intake cancel/retry buttons post JSON command receipts
+        run: python scripts/check_workspace_intake_controls.py --output output/intake-controls-ci
+
       - name: Verify enhancement persistence, history, review and recovery workflows
         run: python scripts/check_enhanced_editor.py --output output/enhanced-editor-ci
 
@@ -171,6 +174,7 @@ jobs:
             output/prepared-editor-ci
             output/embodied-editor-ci
             output/workspace-editor-ci
+            output/intake-controls-ci
             output/enhanced-editor-ci
             output/installed-workspace-ci
             output/installed-enhanced-ci
