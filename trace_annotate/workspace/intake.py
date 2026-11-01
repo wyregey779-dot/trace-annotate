@@ -496,7 +496,8 @@ class AsyncIntakes:
                 raise NotFound("INTAKE_NOT_FOUND", "Intake not found")
             # An old attempt must not overwrite a newer generation / a row that
             # has already reached a terminal or been re-claimed by another worker.
-            if row["generation"] != generation or row["worker_id"] != worker_id:
+            if (row["generation"] != generation or row["worker_id"] != worker_id
+                    or row["session_id"] != self.session_id):
                 return self.get(intake_id)
             if row["state"] not in ("preparing", "cancel_requested"):
                 return self.get(intake_id)
@@ -556,23 +557,32 @@ class AsyncIntakes:
                 # interrupted, the staged source is kept and the row becomes a
                 # retryable failure instead of a settled cancellation.
                 return _stop("closing")
-            # The deadline is checked before the lease: an overrun also makes
-            # the next renewal fail, so checking the lease first would relabel
-            # every deadline abort as a lost lease.
-            if heartbeat.deadline_exceeded or self.clock() >= deadline_at:
-                return _stop("deadline")
+            # A lost lease already observed by the heartbeat must not be
+            # relabelled just because a later poll runs after the deadline.
             if heartbeat.lease_lost:
                 return _stop("lease_lost")
             with self.store.transaction():
                 row = _row(self.store.conn.execute(
-                    "SELECT state,generation,worker_id,lease_expires_at FROM intakes WHERE id=?",
+                    "SELECT state,generation,worker_id,session_id,lease_expires_at FROM intakes WHERE id=?",
                     (intake_id,)))
+                observed_at = self.clock()
             if row is None:
                 return _stop("cancelled")
             if row["state"] == "cancel_requested":
                 return _stop("cancelled")
             if (row["generation"] != generation or row["worker_id"] != worker_id
-                    or (row["lease_expires_at"] or 0) <= self.clock()):
+                    or row["session_id"] != self.session_id or row["state"] != "preparing"):
+                return _stop("lease_lost")
+            expires = row["lease_expires_at"] or 0
+            # The store lock can delay this read across the deadline. An
+            # independently expired lease (strictly earlier than the deadline)
+            # is still a lost lease, but a lease capped at the deadline is the
+            # deadline itself, not evidence of a competing worker.
+            if expires <= observed_at and expires < deadline_at:
+                return _stop("lease_lost")
+            if heartbeat.deadline_exceeded or observed_at >= deadline_at:
+                return _stop("deadline")
+            if expires <= observed_at:
                 return _stop("lease_lost")
             return False
 

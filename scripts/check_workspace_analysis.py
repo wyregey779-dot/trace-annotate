@@ -35,6 +35,34 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def preserve_browser_installation():
+    """Pin read-only browser dependencies before isolating writable XDG caches.
+
+    Playwright resolves Linux's default registry through XDG_CACHE_HOME at
+    driver startup. Moving that cache must not move previously installed
+    browsers. Explicit registries (including hermetic "0") remain explicit.
+    """
+    for key in ("PLAYWRIGHT_BROWSERS_PATH", "npm_config_playwright_browsers_path",
+                "npm_package_config_playwright_browsers_path"):
+        if key in os.environ:
+            configured = os.environ[key]
+            if configured:
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = configured
+                return {"source": key, "path": configured, "read_only_dependency": True}
+            break  # An explicit empty value uses the platform default.
+    if sys.platform == "linux":
+        cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    elif sys.platform == "darwin":
+        cache = Path.home() / "Library/Caches"
+    elif sys.platform == "win32":
+        cache = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
+    else:
+        raise RuntimeError("Unsupported Playwright browser-cache platform: " + sys.platform)
+    location = str(cache / "ms-playwright")
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = location
+    return {"source": "original_platform_cache", "path": location, "read_only_dependency": True}
+
+
 def load_harness(installed_wheel):
     # The existing harness checks -I, site-packages membership, exact package
     # resources and extra/missing modules. Only test support loads by file.
@@ -331,13 +359,14 @@ def main():
     write_json(output / "result.json", summary)
     # Browser profiles, downloads and FFmpeg/analysis outputs stay inside this
     # new evidence root. Existing browser executables are read-only dependencies.
-    previous = {key: os.environ.get(key) for key in ("TEMP", "TMP", "TMPDIR", "XDG_CACHE_HOME")}
+    previous = {key: os.environ.get(key) for key in ("TEMP", "TMP", "TMPDIR", "XDG_CACHE_HOME", "PLAYWRIGHT_BROWSERS_PATH")}
     bytecode = sys.dont_write_bytecode
     try:
         for name in ("temp", "cache", "browser-cache", "download-staging"):
             (output / name).mkdir()
         for key in ("TEMP", "TMP", "TMPDIR"):
             os.environ[key] = str(output / "temp")
+        summary["browser_installation"] = preserve_browser_installation()
         os.environ["XDG_CACHE_HOME"] = str(output / "cache")
         sys.dont_write_bytecode = True
         harness = load_harness(args.installed_wheel)

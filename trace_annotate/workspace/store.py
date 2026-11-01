@@ -618,9 +618,17 @@ class WorkspaceStore:
             if generation is not None and (gen_now != generation or worker_now != worker_id
                                            or sess_now != session_id):
                 raise Conflict("STALE_LEASE", "Intake lease is no longer valid")
-            if (lease or 0) <= now_fn():
+            observed_at = now_fn()
+            expires = lease or 0
+            # A deadline-capped lease expires at the deadline by design. If
+            # the transaction lock carried us past it, report the deadline;
+            # an independently earlier expiry is still a genuinely stale lease.
+            if (expires <= observed_at and deadline_at is not None
+                    and observed_at >= deadline_at and expires >= deadline_at):
+                raise Conflict("DEADLINE_EXCEEDED", "Admission deadline passed before commit")
+            if expires <= observed_at:
                 raise Conflict("STALE_LEASE", "Intake lease expired before admission committed")
-            if deadline_at is not None and now_fn() >= deadline_at:
+            if deadline_at is not None and observed_at >= deadline_at:
                 raise Conflict("DEADLINE_EXCEEDED", "Admission deadline passed before commit")
             conn.execute("INSERT OR IGNORE INTO media VALUES(?,?)",
                          (media["id"], S.canonical_json(media).decode("utf-8")))

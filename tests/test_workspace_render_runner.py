@@ -51,7 +51,7 @@ def test_render_runner_early_fault_preserves_failure_and_environment(tmp_path, m
     runner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runner)
     output = tmp_path / "new-output"
-    keys = ("TEMP", "TMP", "TMPDIR", "XDG_CACHE_HOME")
+    keys = ("TEMP", "TMP", "TMPDIR", "XDG_CACHE_HOME", "PLAYWRIGHT_BROWSERS_PATH")
     before = {key: os.environ.get(key) for key in keys}
     bytecode = sys.dont_write_bytecode
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--output", str(output)])

@@ -1,4 +1,4 @@
-include CHANGELOG.md CONTRIBUTING.md SECURITY.md README_CN.md
+include .gitattributes CHANGELOG.md CONTRIBUTING.md SECURITY.md README_CN.md
 recursive-include docs *.md *.jpg *.png *.mp4 *.json
 recursive-include examples *.py *.json
 recursive-include scripts *.py *.cmd
