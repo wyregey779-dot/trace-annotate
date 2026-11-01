@@ -247,8 +247,35 @@ def case_legacy_draft(case):
                        + "?integrity_legacy=" + variant)
         case.page.locator("#videoInput").set_input_files(media)
         case.expect(case.page.locator("#restoreDraft")).to_be_visible(timeout=15000)
+        # The previous page correctly preserves its page-owned draft. Removing
+        # the compatibility mirror above must not erase those copies or cause
+        # this legacy test to restore whichever draft happens to be first.
+        # Select the actual historical fixture through the public selector.
+        choices = case.page.locator("#draftChoice option").evaluate_all(
+            "options => options.map(option => ({key:option.value,label:option.textContent}))")
+        session_keys = [choice["key"] for choice in choices
+                        if choice["key"].startswith(content_key + ":session:")]
+        case.equal(storage_key in [choice["key"] for choice in choices], True,
+                   "Legacy " + variant + " fixture remains an explicit recovery choice")
+        case.equal(bool(session_keys), True,
+                   "Legacy " + variant + " recovery coexists with preserved page-owned drafts")
+        preserved_keys = session_keys + [storage_key]
+        before = case.page.evaluate(
+            "keys => Object.fromEntries(keys.map(key=>[key,localStorage.getItem(key)]))", preserved_keys)
+        observation = {"variant": variant, "choices": choices,
+                       "initial_selection": case.page.locator("#draftChoice").input_value(),
+                       "selected_fixture_key": storage_key,
+                       "preserved_raw_sha256": {key: hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                                                for key, raw in before.items()}}
+        case.page.locator("#draftChoice").select_option(storage_key)
+        case.expect(case.page.locator("#draftChoice")).to_have_value(storage_key)
+        dialog_count = len(case.record["dialogs"])
         case.page.locator("#restoreDraft").click()
         case.expect(case.page.locator("#endInput")).to_have_value("5.75" if variant == "edited" else "4")
+        migration_dialogs = case.record["dialogs"][dialog_count:]
+        case.equal(any(dialog["action"] == "accept" and "旧 v1 文档" in dialog["message"]
+                       for dialog in migration_dialogs), True,
+                   "Legacy " + variant + " restoration explicitly accepts content-identity migration")
         case.reviewed(False, "Legacy " + variant + " draft migration invalidates an unbound review")
         case.save()
         expected = (case.expected(end=5.75, review_status="unreviewed")
@@ -258,6 +285,14 @@ def case_legacy_draft(case):
             item["review_status"] = "unreviewed"
         case.equal(case.export("legacy-" + variant), expected,
                    "Legacy " + variant + " draft preserves native CRLF and multiline label/track while applying only intended changes")
+        after = case.page.evaluate(
+            "keys => Object.fromEntries(keys.map(key=>[key,localStorage.getItem(key)]))", preserved_keys)
+        case.equal(after, before,
+                   "Legacy " + variant + " migration leaves the old source and coexisting page draft bytes unchanged")
+        observation["preserved_raw_sha256_after"] = {
+            key: hashlib.sha256(raw.encode("utf-8")).hexdigest() for key, raw in after.items()}
+        observation["migration_dialogs"] = migration_dialogs
+        write_json(case.output / ("legacy-" + variant + "-recovery-selection.json"), observation)
 
 
 def case_export_preflight(case):

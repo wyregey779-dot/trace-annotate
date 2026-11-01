@@ -143,6 +143,27 @@ test('legacy v1 recovery preserves source and invalidates old review', () => {
   assert.equal(store.getItem(legacyKey), saved);
 });
 
+test('explicit legacy selection preserves coexisting modern page drafts and both remain recoverable', () => {
+  const store = storage(), modernKey = primary + ':session:coexisting-modern-page';
+  const modern = rawEnvelope(doc('Modern page copy'));
+  const legacy = doc('Legacy selected explicitly'); legacy.schema_version = 1; delete legacy.media_sha256;
+  const older = rawEnvelope(legacy, 1);
+  store.setItem(modernKey, modern); store.setItem(legacyKey, older);
+  const edit = page(store); edit.api.open(doc());
+  assert.equal(edit.api.refresh(), 2);
+  assert.deepEqual(edit.get('draftChoice').children.map(choice => choice.value).sort(), [modernKey, legacyKey].sort());
+  edit.choose(legacyKey); edit.api.restore();
+  assert.equal(edit.api.state().document.segments[0].label, 'Legacy selected explicitly');
+  assert.equal(edit.api.state().document.schema_version, 2);
+  assert.equal(edit.api.state().document.segments[0].review_status, 'unreviewed');
+  assert.equal(store.getItem(legacyKey), older);
+  assert.equal(store.getItem(modernKey), modern);
+  const other = page(store); other.api.open(doc()); other.choose(modernKey); other.api.restore();
+  assert.equal(other.api.state().document.segments[0].label, 'Modern page copy');
+  assert.equal(store.getItem(legacyKey), older);
+  assert.equal(store.getItem(modernKey), modern);
+});
+
 test('malformed content-bound draft is not silently replaced by a legacy draft', () => {
   const store = storage(), invalid = '{"draft_format":999}'; store.setItem(primary, invalid);
   const value = doc('Legacy fallback'); value.schema_version = 1; delete value.media_sha256;
