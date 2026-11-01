@@ -77,7 +77,8 @@ def _tool(name: str) -> str:
 
 
 def _run(command: list, directory: Path, name: str,
-         cancelled: Optional[Callable[[], bool]], *, strict: bool = True) -> Path:
+         cancelled: Optional[Callable[[], bool]], *, strict: bool = True,
+         cwd: Optional[Path] = None) -> Path:
     """Capture arbitrarily long tool output on disk, polling for cancellation."""
     _cancel(cancelled)
     stdout, stderr = directory / f"{name}.stdout", directory / f"{name}.stderr"
@@ -85,7 +86,7 @@ def _run(command: list, directory: Path, name: str,
     was_cancelled = False
     with stdout.open("xb") as output, stderr.open("xb") as errors:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                   stdout=output, stderr=errors)
+                                   stdout=output, stderr=errors, cwd=cwd)
         child = _register_child(process, name, command)
         try:
             while process.poll() is None:
@@ -107,7 +108,7 @@ def _run(command: list, directory: Path, name: str,
             output.flush()
             errors.flush()
             with (directory / "commands.jsonl").open("a", encoding="utf-8") as log:
-                log.write(json.dumps({"name": name, "args": command, "pid": child["pid"],
+                log.write(json.dumps({"name": name, "args": command, "cwd": None if cwd is None else str(cwd), "pid": child["pid"],
                                       "parent_pid": child["parent_pid"],
                                       "created_at": child["created_at"],
                                       "exit_code": process.returncode,

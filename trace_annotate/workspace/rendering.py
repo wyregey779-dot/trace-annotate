@@ -199,6 +199,25 @@ def _encode_command(ffmpeg, source, panels, plan, video, audios, summary, graph,
     return args
 
 
+def _panel_arguments(work, paths):
+    """Use a safe ancestor for a short, child-local cwd and bounded paths."""
+    # CreateProcess on Windows may reject a long cwd even with a long-path
+    # prefix. Choose the nearest ancestor short enough for a child process;
+    # every relative input must still resolve underneath the private work dir.
+    cwd=work
+    if os.name=='nt':
+        cwd=next((p for p in (work,*work.parents) if len(str(p).encode('utf-16-le'))//2<=200),None)
+        if cwd is None:raise SchemaInvalid('RENDER_LIMIT_EXCEEDED','No usable short working directory exists')
+    _safe(cwd);_safe(work)
+    result=[]
+    for path in paths:
+        _safe(path)
+        if path.parent != work or re.fullmatch(r'panel-[0-9]{3}\.png',path.name) is None:
+            raise SchemaInvalid('UNSAFE_RENDER_PATH','Panel is outside the private render work directory')
+        result.append(str(path.relative_to(cwd)))
+    return cwd,result
+
+
 def _graph(plan, panel_ids, video_index):
     w,h=plan['geometry']['canvas'];sx,sy=plan['geometry']['source_rect'][:2];x,y=plan['geometry']['panel_rect'][:2]
     base=S.rational_value(plan['proxy_time_base'])
@@ -310,8 +329,12 @@ def render_video(playback_path, plan, output_dir, *, font_path=None, font=None,
             panel_ids.append(ident);panel_paths.append(path)
         graph=work/'filtergraph.txt';graph.write_text(_graph(frozen,panel_ids,video['index']),encoding='utf-8')
         candidate=project/'annotation.mp4'
-        command=_encode_command(ffmpeg,source,panel_paths,frozen,video,audios,summary,graph,candidate,max_output_bytes,work/'encode-progress.txt',graph_option)
-        tick('encode');P._run(command,work,'encode',check)
+        # Use paths relative to a validated ancestor only for generated panels.
+        # Source, output, filter and verification paths remain absolute, and
+        # a child-local cwd avoids process-global chdir and concurrency races.
+        encode_cwd,panel_arguments=_panel_arguments(work,panel_paths)
+        command=_encode_command(ffmpeg,source,panel_arguments,frozen,video,audios,summary,graph,candidate,max_output_bytes,work/'encode-progress.txt',graph_option)
+        tick('encode');P._run(command,work,'encode',check,cwd=encode_cwd)
         _check_output_size(candidate,max_output_bytes)
         tick('verify_result')
         P._run([ffmpeg,'-hide_banner','-v','error','-nostdin','-xerror','-err_detect','explode','-protocol_whitelist','file,pipe','-i',str(candidate),'-map','0:v','-map','0:a?','-fps_mode:v','passthrough','-enc_time_base:v','demux','-f','null','-'],work,'full-decode',check)

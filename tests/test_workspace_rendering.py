@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
 import json
@@ -72,6 +73,76 @@ def make_plan(face,clip,position='bottom',audio='copy'):
             'fields':['label','text'],'tracks':['shots'],'font_sha256':face.sha256,'font_license':'Local test font, not distributed',
             'encoding':{'video_codec':'libx264','pixel_format':'yuv420p','crf':18,'preset':'veryfast','audio_codec':audio,'audio_bitrate_kbps':96,'color_policy':'preserve_declared_proxy'}}
     return L.prepare_plan(task,media,rows,recipe,font=face,playback_size=(160,120),frame_map_sha256='3'*64)
+
+
+def test_child_cwd_is_isolated_and_recorded_for_concurrent_media_commands(tmp_path):
+    original=Path.cwd()
+    dirs=[tmp_path/'first',tmp_path/'second']
+    for directory in dirs:directory.mkdir()
+    def run(directory):
+        stdout=P._run([sys.executable,'-B','-c','from pathlib import Path; print(Path.cwd())'],directory,'cwd',None,cwd=directory)
+        return Path(stdout.read_text('utf-8').strip()),json.loads((directory/'commands.jsonl').read_text('utf-8'))
+    with ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(run,dirs))
+    for directory,(actual,record) in zip(dirs,results):
+        assert actual==directory and Path(record['cwd'])==directory and record['exit_code']==0
+    assert Path.cwd()==original
+
+
+def test_panel_names_reject_outside_and_unexpected_entries(tmp_path):
+    work=tmp_path/'work';work.mkdir()
+    inside=work/'panel-000.png';inside.touch()
+    wrong=work/'other.png';wrong.touch()
+    outside=tmp_path/'panel-001.png';outside.touch()
+    cwd,arguments=R._panel_arguments(work,[inside])
+    assert cwd/arguments[0]==inside
+    for path in (wrong,outside):
+        with pytest.raises(WorkspaceError) as error:R._panel_arguments(work,[path])
+        assert error.value.code=='UNSAFE_RENDER_PATH'
+
+
+@pytest.mark.skipif(sys.platform!='win32',reason='Windows command length regression')
+def test_real_78_panels_in_long_windows_path_preserve_frames_and_audio(face,clips,tmp_path):
+    """The former absolute panel paths exceed the budget; child cwd must not."""
+    source_dir=tmp_path/'input';source_dir.mkdir();source=source_dir/'source.mp4'
+    P._run(['ffmpeg','-hide_banner','-v','error','-nostdin','-n',
+            '-f','lavfi','-i','testsrc2=size=160x120:rate=10:duration=7.8',
+            '-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=7.8',
+            '-c:v','libx264','-bf','0','-pix_fmt','yuv420p','-preset','veryfast','-crf','18',
+            '-fps_mode:v','passthrough','-enc_time_base:v','1/1000','-video_track_timescale','1000',
+            '-c:a','aac','-b:a','96k',str(source)],source_dir,'generate',None)
+    probe=P._probe('ffprobe',source,source_dir,'probe',None);video=next(s for s in probe['streams'] if s['codec_type']=='video')
+    base=P._time_base(video);raw=P._frames('ffprobe',source,video['index'],source_dir,'frames',None)
+    summary=P._verified_video_summary('ffprobe',source,video['index'],raw,base,source_dir,'packets',None)
+    assert summary['count']==78
+    rows=[{'frame_index':str(i),'source_pts':str(row['pts']),'proxy_pts':str(row['pts']),'seconds':S.rational(row['pts']*base)} for i,row in enumerate(P._frame_rows(raw))]
+    task=copy.deepcopy(clips['cfr'][1]);media=copy.deepcopy(clips['cfr'][2])
+    sha=stream_sha256(source);end=(summary['last']+summary['last_duration'])*base
+    for item in ('source','playback'):media[item].update(sha256=sha,size_bytes=str(source.stat().st_size))
+    media.update(duration=S.rational(end),video_start=S.rational(summary['first']*base),video_end=S.rational(end),frame_count='78',source_time_base=S.rational(base),proxy_time_base=S.rational(base),source_video_stream=video['index'])
+    task['annotations']=[{'id':f'ann-{i:03d}','type':'segment','label':f'Shot {i:03d}','text':f'Detailed shot {i:03d}',
+                          'start':{'seconds':row['seconds']},'end':{'seconds':rows[i+1]['seconds'] if i<77 else S.rational(end)},
+                          'track':'shots','tags':[],'review_status':'unreviewed'} for i,row in enumerate(rows)]
+    plan=make_plan(face,(source,task,media,rows));assert len(plan['panels'])==78
+    parent=tmp_path/'deep';parent.mkdir()
+    while len(str(parent))<385:
+        parent=parent/('path'+str(len(str(parent)))+'x'*29);parent.mkdir()
+    target=parent/'render';work=target/'work'
+    panels=[work/f'panel-{i:03d}.png' for i in range(78)]
+    audios=[s for s in probe['streams'] if s.get('codec_type')=='audio']
+    with pytest.raises(WorkspaceError) as error:
+        R._encode_command('ffmpeg',source,panels,plan,video,audios,summary,work/'filtergraph.txt',work/'project/annotation.mp4',8*1024*1024,work/'encode-progress.txt','-filter_complex_script')
+    assert error.value.code=='RENDER_LIMIT_EXCEEDED'
+    original=Path.cwd();manifest=R.render_video(source,plan,target,font=face,max_output_bytes=8*1024*1024)
+    assert Path.cwd()==original and manifest['video']['frame_count']=='78' and manifest['validation']['all_frame_pts_exact']
+    verification=json.loads((target/'validated/verification.json').read_text('utf-8'))
+    assert verification['full_decode_exit']==0 and verification['final_hold_exact'] and len(verification['panel_boundaries'])==78
+    assert verification['audio'][0]['input_samples']==verification['audio'][0]['output_samples'] and verification['audio'][0]['pcm_sha256']
+    records=[json.loads(line) for line in (work/'commands.jsonl').read_text('utf-8').splitlines()]
+    record=next(row for row in records if row['name']=='encode');args=record['args']
+    cwd=Path(record['cwd'])
+    assert cwd in work.parents and sum(len(a)+3 for a in args)<=28000
+    actual=[arg for arg in args if Path(arg).name.startswith('panel-') and arg.endswith('.png')]
+    assert [cwd/arg for arg in actual]==panels
 
 
 @pytest.mark.parametrize('kind',['cfr','vfr'])
