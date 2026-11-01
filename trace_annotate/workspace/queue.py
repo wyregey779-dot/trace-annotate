@@ -315,13 +315,20 @@ class DurableQueue:
                     active += 1
             if active >= self.max_concurrency:
                 return None
-            sql = ("SELECT j.id FROM jobs j WHERE j.state='queued' AND EXISTS "
+            sql = "SELECT j.id FROM jobs j WHERE j.state='queued'"
+            # A cancelled/expired attempt may still be unwinding Python or an
+            # owned child. A spare global slot must not re-enter that SAME job
+            # before the old runner exits; unrelated jobs may use the slot.
+            active_ids = sorted({ident for ident, _ in self.store._queue_active_processors})
+            args = tuple(active_ids)
+            if active_ids:
+                sql += " AND j.id NOT IN (" + ",".join("?" for _ in active_ids) + ")"
+            sql += (" AND EXISTS "
                    "(SELECT 1 FROM batch_jobs bj JOIN batches b ON b.id=bj.batch_id "
                    "WHERE bj.job_id=j.id AND b.dispatch_paused=0")
-            args = ()
             if batch_id is not None:
                 sql += " AND b.id=?"
-                args = (batch_id,)
+                args += (batch_id,)
             row = self.store.conn.execute(sql + ") ORDER BY j.rowid LIMIT 1", args).fetchone()
             if row is None:
                 return None
@@ -450,6 +457,20 @@ class DurableQueue:
                                     "error_code=NULL WHERE id=?", (job_id,))
             return self.get_job(job_id)
 
+    def retry_cancelled(self, job_id: str) -> Dict[str, Any]:
+        """Explicitly resume a cancelled job with its original frozen input.
+
+        Claim still fences generations and waits for the old processor to exit;
+        neither a new batch nor a repeated control creates a second job.
+        """
+        with self.store.transaction():
+            job = self._job(job_id)
+            if job["state"] != "cancelled":
+                raise Conflict("INVALID_JOB_STATE", "Only cancelled jobs can be resumed")
+            self.store.conn.execute("UPDATE jobs SET state='queued',worker_id=NULL,session_id=NULL,lease_expires_at=NULL, "
+                                    "error_code=NULL WHERE id=?", (job_id,))
+            return self.get_job(job_id)
+
     def control_batch(self, batch_id: str, action: str, *, command_id: Optional[str] = None) -> Dict[str, Any]:
         if action not in ("pause_dispatch", "resume_dispatch", "cancel", "retry_failed"):
             raise SchemaInvalid("SCHEMA_INVALID", "Unsupported batch control")
@@ -480,14 +501,15 @@ class DurableQueue:
             return result
 
     def control_job(self, job_id: str, action: str, *, command_id: Optional[str] = None) -> Dict[str, Any]:
-        if action not in ("cancel", "retry_failed"):
+        if action not in ("cancel", "retry_failed", "retry_cancelled"):
             raise SchemaInvalid("SCHEMA_INVALID", "Unsupported job control")
         request = {"kind": "queue.control_job", "job_id": job_id, "action": action}
         with self.store.transaction():
             receipt = self._receipt(command_id, request)
             if receipt is not None:
                 return receipt
-            value = (self.cancel if action == "cancel" else self.retry_failed)(job_id)
+            value = {"cancel": self.cancel, "retry_failed": self.retry_failed,
+                     "retry_cancelled": self.retry_cancelled}[action](job_id)
             result = {"job_id": job_id, "action": action, "state": value["state"]}
             self._save_receipt(command_id, request, result)
             return result

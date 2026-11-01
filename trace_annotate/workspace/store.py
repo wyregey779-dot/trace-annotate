@@ -32,9 +32,10 @@ from typing import Any, Dict, List, Optional
 
 from . import schema as S
 from .errors import Conflict, NotFound, SchemaInvalid, WorkspaceError, revision_conflict
+from .artifact_refs import REFERENCE_DDL, collect_artifact_references, validate_owner
 
 SCHEMA_VERSION = 3
-STORAGE_VERSION = "1"
+STORAGE_VERSION = "2"
 DB_FILE = "workspace.sqlite3"
 LOCK_FILE = "write.lock"
 OBJECTS_DIR = "objects"
@@ -115,6 +116,24 @@ def _serialized(function):
     def invoke(self, *args, **kwargs):
         with self.transaction():
             return function(self, *args, **kwargs)
+    return invoke
+
+
+def _publishing_media(function):
+    """Keep uncommitted admission objects live without a long SQLite tx."""
+    @wraps(function)
+    def invoke(self, *args, **kwargs):
+        token = object()
+        with self._mutex:
+            active = getattr(self, "_active_media_publications", None)
+            if active is None:
+                active = self._active_media_publications = set()
+            active.add(token)
+        try:
+            return function(self, *args, **kwargs)
+        finally:
+            with self._mutex:
+                active.discard(token)
     return invoke
 
 
@@ -202,6 +221,7 @@ class WorkspaceStore:
                 if not directory.is_dir():
                     raise WorkspaceError("RECOVERY_REQUIRED", "Workspace directory is missing")
             self._init_db(new=False)
+            self._recover_pending_gc()
             self._check_artifacts()
             with self.transaction():
                 self.conn.execute("UPDATE intakes SET state='failed',error_code='INTERRUPTED' "
@@ -212,6 +232,8 @@ class WorkspaceStore:
 
     def close(self):
         with self._mutex:
+            if self._conn is not None and getattr(self, "_queue_active_processors", set()):
+                raise Conflict("WORKSPACE_BUSY", "Wait for owned processing to stop before closing the workspace")
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
@@ -253,23 +275,38 @@ class WorkspaceStore:
                 self._depth = depth
 
     def _init_db(self, *, new):
+        migrating = False
         if not new:
             try:
                 values = dict(self.conn.execute("SELECT key,value FROM meta"))
             except sqlite3.DatabaseError as exc:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Workspace database cannot be read") from exc
-            if values.get("storage_version") != STORAGE_VERSION:
+            if values.get("storage_version") not in {"1", STORAGE_VERSION}:
                 raise WorkspaceError("WORKSPACE_MIGRATION_REQUIRED", "Experimental workspace requires explicit migration; original data preserved")
+            migrating = values.get("storage_version") == "1"
+            if not migrating:
+                required_columns = {
+                    "artifact_references": {"artifact_id", "owner_kind", "owner_id", "owner_revision", "role"},
+                    "artifact_gc_pending": {"artifact_id", "rel_path", "sha256", "size_bytes"},
+                }
+                for table, columns in required_columns.items():
+                    actual = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+                    if not columns <= actual:
+                        raise WorkspaceError("RECOVERY_REQUIRED", "Artifact ownership schema is missing or incomplete; refusing to recreate lost references")
             if values.get("schema_version") != str(SCHEMA_VERSION):
                 raise WorkspaceError("UNSUPPORTED_SCHEMA", "Workspace schema is unsupported")
             if (values.get("digest_version") != "workspace-task-v1"
                     or not isinstance(values.get("project_id"), str)
                     or S.ID_RE.fullmatch(values["project_id"]) is None):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Workspace identity or digest metadata is missing")
+            if self.conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise WorkspaceError("RECOVERY_REQUIRED", "Database integrity check failed before migration")
         with self.transaction():
             for statement in DDL.split(";"):
                 if statement.strip():
                     self.conn.execute(statement)
+            for statement in REFERENCE_DDL:
+                self.conn.execute(statement)
             if new:
                 self.conn.executemany("INSERT INTO meta VALUES(?,?)", [
                     ("schema_version", str(SCHEMA_VERSION)), ("storage_version", STORAGE_VERSION),
@@ -289,13 +326,20 @@ class WorkspaceStore:
                     self.conn.execute(statement)
                 except sqlite3.OperationalError:
                     pass
-            self._install_revision_triggers(("tasks", "intakes", "artifacts", "templates", "durable_commits"))
+            self._install_revision_triggers(("tasks", "intakes", "artifacts", "templates", "durable_commits", "artifact_references"))
+            if migrating:
+                # Additive migration has one SQL commit. Verify old owner and
+                # object identities before marking v2; a failed check rolls
+                # back the new tables/triggers and version together. v2 stops
+                # older writers whose GC does not understand these references.
+                self._check_artifacts()
+                self.conn.execute("UPDATE meta SET value=? WHERE key='storage_version'", (STORAGE_VERSION,))
         if self.conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise WorkspaceError("RECOVERY_REQUIRED", "Database integrity check failed")
 
     def _install_revision_triggers(self, tables):
         allowed = {"tasks", "intakes", "artifacts", "templates", "durable_commits",
-                   "batches", "jobs", "attempts", "batch_jobs"}
+                   "batches", "jobs", "attempts", "batch_jobs", "artifact_references"}
         for table in tables:
             if table not in allowed:
                 raise ValueError("Unexpected revision table")
@@ -306,6 +350,7 @@ class WorkspaceStore:
 
     @_serialized
     def _check_artifacts(self):
+        collect_artifact_references(self.conn)
         for rel, digest, size in self.conn.execute("SELECT rel_path,sha256,size_bytes FROM artifacts"):
             if rel != f"objects/{digest}":
                 raise WorkspaceError("RECOVERY_REQUIRED", "Artifact path is invalid")
@@ -370,15 +415,23 @@ class WorkspaceStore:
             sha = digest.hexdigest()
             target = self.objects_dir / sha
             _safe(target)
-            try:
-                os.link(temporary, target)
-                _sync_directory(self.objects_dir)
-            except FileExistsError:
-                if target.stat().st_size != size or stream_sha256(target) != sha:
-                    raise WorkspaceError("RECOVERY_REQUIRED", "Existing immutable object is corrupt")
             ident = S.make_id("art", sha)
-            with self.transaction():
-                self.conn.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?)", (ident, f"objects/{sha}", sha, size))
+            # Publication and registration share GC's mutex. Streaming the
+            # temporary bytes remains outside it; GC can never unlink between
+            # a successful target check and its registration transaction.
+            with self._mutex:
+                if self.conn.execute("SELECT 1 FROM artifact_gc_pending WHERE artifact_id=?", (ident,)).fetchone():
+                    if self._depth or self.conn.in_transaction:
+                        raise Conflict("GC_RECOVERY_REQUIRED", "Finish interrupted cleanup before publishing this object")
+                    self._recover_pending_gc()
+                try:
+                    os.link(temporary, target)
+                    _sync_directory(self.objects_dir)
+                except FileExistsError:
+                    if target.stat().st_size != size or stream_sha256(target) != sha:
+                        raise WorkspaceError("RECOVERY_REQUIRED", "Existing immutable object is corrupt")
+                with self.transaction():
+                    self.conn.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?)", (ident, f"objects/{sha}", sha, size))
             return {"id": ident, "relative_path": f"objects/{sha}", "sha256": sha, "size_bytes": str(size)}
         finally:
             temporary.unlink(missing_ok=True)
@@ -399,6 +452,7 @@ class WorkspaceStore:
         return [json.loads(r[0]) for r in rows]
 
     # -- intake / admission -------------------------------------------------
+    @_publishing_media
     def import_source(self, source, *, display_name=None, template_id="generic-segment", template_version=1, cancelled=None, closing=None):
         from .media import prepare_workspace_media
         if cancelled is not None and not callable(cancelled):
@@ -479,6 +533,7 @@ class WorkspaceStore:
                 raise WorkspaceError("CANCELLED", "Media admission was cancelled") from exc
             raise
 
+    @_publishing_media
     def admit_staged_intake(self, intake, *, cancelled=None, generation=None,
                              worker_id=None, session_id=None, clock=None, deadline_at=None):
         """Prepare a staged async intake and commit its media + task.
@@ -659,22 +714,13 @@ class WorkspaceStore:
 
     @_serialized
     def unbound_artifacts(self) -> Dict[str, Any]:
-        """Measure content-addressed objects no media record binds.
+        """Measure registered objects outside every validated owner closure.
 
         A crash between publishing objects and committing the admission leaves
         such objects behind. They are immutable and harmless, but they must be
         countable before anything is removed.
         """
-        referenced = set()
-        for (body,) in self.conn.execute("SELECT value FROM meta WHERE key LIKE 'media_objects:%'"):
-            try:
-                bindings = json.loads(body)
-            except ValueError:
-                continue
-            if isinstance(bindings, dict):
-                for reference in bindings.values():
-                    if isinstance(reference, dict) and isinstance(reference.get("id"), str):
-                        referenced.add(reference["id"])
+        referenced = {row["artifact_id"] for row in collect_artifact_references(self.conn)}
         items = [{"id": ident, "relative_path": rel, "size_bytes": str(size)}
                  for ident, rel, size in self.conn.execute(
                      "SELECT id,rel_path,size_bytes FROM artifacts ORDER BY id")
@@ -683,37 +729,94 @@ class WorkspaceStore:
                 "total_bytes": str(sum(int(item["size_bytes"]) for item in items))}
 
     def sweep_unbound_artifacts(self, *, apply: bool = False) -> Dict[str, Any]:
-        """Remove measured unbound objects, re-checking each one under the lock.
+        """Commit a durable tombstone before physical deletion, under one lock.
 
-        Dry run by default. A row is deleted only when it is still unbound at
-        deletion time, so a concurrent admission that just bound the object is
-        never damaged.
+        File deletion cannot roll back with SQL. Once a tombstone commits the
+        object has no registered owner; restart finishes any pending unlink.
+        This operation may not run inside a caller's transaction.
         """
         measured = self.unbound_artifacts()
         if not apply:
             return {**measured, "applied": False, "removed": 0}
-        removed = 0
-        with self._mutex, self.transaction() as conn:
-            for item in measured["artifacts"]:
-                referenced = False
-                for (body,) in conn.execute("SELECT value FROM meta WHERE key LIKE 'media_objects:%'"):
-                    try:
-                        bindings = json.loads(body)
-                    except ValueError:
+        with self._mutex:
+            if self._depth or self.conn.in_transaction:
+                raise Conflict("GC_IN_TRANSACTION", "Cleanup must run outside a workspace transaction")
+            if getattr(self, "_active_media_publications", set()):
+                raise Conflict("GC_ACTIVE_WORK", "Finish media admission before collecting unpublished objects")
+            if getattr(self, "_queue_active_processors", set()):
+                raise Conflict("GC_ACTIVE_WORK", "Wait for active processors to exit before cleanup")
+            self._recover_pending_gc()
+            with self.transaction() as conn:
+                referenced = {row["artifact_id"] for row in collect_artifact_references(conn)}
+                for item in measured["artifacts"]:
+                    if item["id"] in referenced:
                         continue
-                    if isinstance(bindings, dict) and any(
-                            isinstance(reference, dict) and reference.get("id") == item["id"]
-                            for reference in bindings.values()):
-                        referenced = True
-                        break
-                if referenced:
-                    continue
-                conn.execute("DELETE FROM artifacts WHERE id=?", (item["id"],))
-                path = self.root / item["relative_path"]
+                    row = conn.execute("SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?", (item["id"],)).fetchone()
+                    if row is None:
+                        continue
+                    rel, digest, size = row
+                    path = self.root / rel
+                    _safe(path)
+                    if rel != "objects/" + digest or not path.is_file() or path.stat().st_size != size or stream_sha256(path) != digest:
+                        raise WorkspaceError("RECOVERY_REQUIRED", "Unbound object identity is corrupt; cleanup refused")
+                    conn.execute("INSERT INTO artifact_gc_pending VALUES(?,?,?,?)", (item["id"], rel, digest, size))
+                    conn.execute("DELETE FROM artifacts WHERE id=?", (item["id"],))
+            removed = self._recover_pending_gc()
+            return {**self.unbound_artifacts(), "applied": True, "removed": removed}
+
+    def _recover_pending_gc(self):
+        """Finish committed cleanup; never delete a referenced/republished path."""
+        with self._mutex:
+            if self._depth or self.conn.in_transaction:
+                raise Conflict("GC_IN_TRANSACTION", "Cleanup recovery requires its own transaction")
+            refs = {row["artifact_id"] for row in collect_artifact_references(self.conn)}
+            pending = self.conn.execute("SELECT artifact_id,rel_path,sha256,size_bytes FROM artifact_gc_pending ORDER BY artifact_id").fetchall()
+            removed = 0
+            for ident, rel, digest, size in pending:
+                S.require_id(ident)
+                S.require_hash(digest)
+                if (rel != "objects/" + digest or ident != S.make_id("art", digest)
+                        or type(size) is not int or size < 0 or ident in refs
+                        or self.conn.execute("SELECT 1 FROM artifacts WHERE id=? OR rel_path=?", (ident, rel)).fetchone()):
+                    raise WorkspaceError("RECOVERY_REQUIRED", "Cleanup journal conflicts with a registered owner")
+                path = self.root / rel
                 _safe(path)
-                path.unlink(missing_ok=True)
+                if path.exists():
+                    if not path.is_file() or path.stat().st_size != size or stream_sha256(path) != digest:
+                        raise WorkspaceError("RECOVERY_REQUIRED", "Cleanup journal object identity changed")
+                    path.unlink()
+                    _sync_directory(self.objects_dir)
+                with self.transaction():
+                    self.conn.execute("DELETE FROM artifact_gc_pending WHERE artifact_id=?", (ident,))
                 removed += 1
-        return {**self.unbound_artifacts(), "applied": True, "removed": removed}
+            return removed
+
+    @_serialized
+    def bind_artifact_reference(self, artifact, *, owner_kind, owner_id, role, owner_revision="0"):
+        """Pin a registered immutable descriptor within the caller's business tx.
+
+        A task_revision owner must already exist in that transaction. Other
+        finite owner kinds are durable explicit pins, retained until released.
+        """
+        validate_owner(self.conn, owner_kind, owner_id, owner_revision, role)
+        if not isinstance(artifact, dict) or set(artifact) != {"id", "relative_path", "sha256", "size_bytes"}:
+            raise SchemaInvalid("SCHEMA_INVALID", "Artifact reference needs an exact immutable descriptor")
+        ident = S.require_id(artifact["id"])
+        row = self.conn.execute("SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?", (ident,)).fetchone()
+        if row is None or artifact != {"id": ident, "relative_path": row[0], "sha256": row[1], "size_bytes": str(row[2])}:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Pinned artifact is missing or differs from its registration")
+        path = self.root / row[0]
+        _safe(path)
+        if not path.is_file() or path.stat().st_size != row[2] or stream_sha256(path) != row[1]:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Pinned artifact is missing or corrupt")
+        self.conn.execute("INSERT OR IGNORE INTO artifact_references VALUES(?,?,?,?,?)", (ident, owner_kind, owner_id, owner_revision, role))
+
+    @_serialized
+    def release_artifact_reference(self, artifact_id, *, owner_kind, owner_id, role, owner_revision="0"):
+        """Release one explicit pin; authoritative legacy/history owners remain."""
+        S.require_id(artifact_id)
+        validate_owner(self.conn, owner_kind, owner_id, owner_revision, role)
+        self.conn.execute("DELETE FROM artifact_references WHERE artifact_id=? AND owner_kind=? AND owner_id=? AND owner_revision=? AND role=?", (artifact_id, owner_kind, owner_id, owner_revision, role))
 
     @_serialized
     def get_snapshot(self) -> Dict[str, Any]:
@@ -838,6 +941,9 @@ class WorkspaceStore:
                 copy.deepcopy(current["annotations"]), "replace_annotations", {"annotations": payload["annotations"]})
             new_task["legacy_document_metadata"] = copy.deepcopy(payload["legacy_document_metadata"])
             new_task.setdefault("extensions", {})["temporal_source"] = copy.deepcopy(payload["legacy_document_envelope"])
+        elif operation in {"import_professional", "set_analysis_report", "set_analysis_reports"}:
+            from .professional_store import prepare_task
+            new_task = prepare_task(self, current, operation, payload, command_id=command_id)
         elif operation == "review_annotation":
             if set(payload) != {"annotation_id", "reviewed"} or type(payload["reviewed"]) is not bool:
                 raise SchemaInvalid("SCHEMA_INVALID", "Review requires annotation_id and a boolean")
@@ -851,6 +957,14 @@ class WorkspaceStore:
         for annotation in new_task["annotations"]:
             self._validate_annotation(annotation, self.get_media(current["media_id"]), template)
         previous = {a["id"]: a for a in current["annotations"]}
+        if operation not in {"import_professional", "import_temporal", "revert_command"}:
+            for annotation in new_task["annotations"]:
+                provenance = annotation.get("provenance", {})
+                prior = previous.get(annotation["id"])
+                prior_provenance = prior.get("provenance", {}) if prior is not None else {}
+                if ((provenance.get("origin") == "imported" or prior_provenance.get("origin") == "imported")
+                        and (prior is None or provenance != prior_provenance)):
+                    raise SchemaInvalid("SCHEMA_INVALID", "Imported provenance can only be admitted through professional import")
         for annotation in new_task["annotations"]:
             prior = previous.get(annotation["id"])
             subject = self.annotation_review_digest(annotation, new_task)
@@ -879,6 +993,12 @@ class WorkspaceStore:
             "previous_revision": current_rev, "revision": new_task["revision"],
             "content_sha256": new_task["content_sha256"], "commit_id": commit_id,
         }
+        if operation == "set_analysis_report":
+            response["analysis_id"] = payload["report"]["id"]
+        elif operation == "set_analysis_reports":
+            response["report_count"] = len(payload["reports"])
+        elif operation == "import_professional":
+            response["imported_count"] = len(new_task["annotations"])
         ts = _now()
         with self.transaction():
             self.conn.execute("UPDATE tasks SET revision=? WHERE id=?",
@@ -1006,8 +1126,8 @@ class WorkspaceStore:
             raise SchemaInvalid("UNSUPPORTED_OPERATION", "Evidence and custom attributes need their own admission workflow")
         provenance = ann["provenance"]
         if (not isinstance(provenance, dict) or set(provenance) != {"origin", "actor_id", "job_id"}
-                or provenance["origin"] != "manual" or provenance["job_id"] is not None):
-            raise SchemaInvalid("SCHEMA_INVALID", "Manual commands require manual provenance")
+                or provenance["origin"] not in {"manual", "imported"} or provenance["job_id"] is not None):
+            raise SchemaInvalid("SCHEMA_INVALID", "Unsupported annotation provenance")
         S.require_id(provenance.get("actor_id"))
         times = {"whole_clip": set(), "event": {"at"}, "segment": {"start", "end"}}[kind]
         if {"start", "end", "at"}.intersection(ann) != times:

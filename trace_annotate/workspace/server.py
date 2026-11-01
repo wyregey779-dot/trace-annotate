@@ -28,7 +28,11 @@ from .classic import classic_resource, CLASSIC_DOCUMENTS, HASH_SCRIPT
 
 MAX_COMMAND_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 10
-REJECT_DRAIN_MAX_BYTES = 64 * 1024
+# A normal client may already have sent a just-over-limit JSON body. Drain a
+# bounded margin so Windows can deliver its413 response instead of resetting
+# the socket with unread bytes. Huge declared bodies remain undrained.
+REJECT_DRAIN_MARGIN_BYTES = 64 * 1024
+REJECT_DRAIN_MAX_BYTES = MAX_COMMAND_BYTES + REJECT_DRAIN_MARGIN_BYTES
 REJECT_DRAIN_TIMEOUT_SECONDS = 0.25
 # Frozen shutdown budget: how long close waits for the async worker to stop.
 # A worker that is still alive after this must be reported, not silently left
@@ -143,6 +147,12 @@ class WorkspaceHTTPServer(ThreadingHTTPServer):
             self.closing.set()
         report = {"closing_set": hasattr(self, "closing"), "worker_stopped": None,
                   "active_intake": None, "drain_alive": None}
+        analysis_jobs = getattr(self, "analysis_jobs", None)
+        if analysis_jobs is not None:
+            report["analysis_worker"] = analysis_jobs.close(timeout=CLOSE_WORKER_SECONDS)
+        render_jobs = getattr(self, "render_jobs", None)
+        if render_jobs is not None:
+            report["render_worker"] = render_jobs.close(timeout=CLOSE_WORKER_SECONDS)
         ai = getattr(self, "async_intakes", None)
         if ai is not None:
             close_report = ai.close(timeout=CLOSE_WORKER_SECONDS)
@@ -159,6 +169,10 @@ class WorkspaceHTTPServer(ThreadingHTTPServer):
         super().server_close()
         if hasattr(self, "image_service"):
             self.image_service.close()
+        if report.get("analysis_worker", {}).get("stopped") is False:
+            raise Conflict("WORKSPACE_BUSY", "Analysis worker has not stopped; preserve its open workspace and retry shutdown")
+        if report.get("render_worker", {}).get("stopped") is False:
+            raise Conflict("WORKSPACE_BUSY", "Render worker has not stopped; preserve its open workspace and retry shutdown")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -262,7 +276,8 @@ class _Handler(BaseHTTPRequestHandler):
         if len(lengths) != 1 or re.fullmatch(r"[0-9]{1,10}", lengths[0]) is None:
             return
         remaining = int(lengths[0])
-        if not 0 < remaining <= min(REJECT_DRAIN_MAX_BYTES, self.server.max_command_bytes):
+        if not 0 < remaining <= min(REJECT_DRAIN_MAX_BYTES,
+                                    self.server.max_command_bytes + REJECT_DRAIN_MARGIN_BYTES):
             return
         self._body_read_started = True
         previous_timeout = self.connection.gettimeout()
@@ -520,6 +535,19 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._token()
         store = self.server.store
+        if (self.command == "POST" and len(parts) == 3 and parts[0] == "tasks"
+                and parts[2] == "render-preview"):
+            _require_id(parts[1], "task_id")
+            _, body = self._read_body()
+            from .render_api import preview
+            item = preview(self.server, parts[1], body)
+            self._extra_headers = [("X-TraceAnnotate-Task-Revision", str(item['binding']['revision'])),
+                ("X-TraceAnnotate-Content-SHA256", item['binding']['content_sha256']),
+                ("X-TraceAnnotate-Frame-Index", item['frame_index']),
+                ("X-TraceAnnotate-Render-Plan-SHA256", item['plan_sha256'])]
+            self._headers(200, len(item['data']), item['content_type'])
+            self.wfile.write(item['data'])
+            return
         if self.command == "POST" and parts == ["imports"]:
             if self._query.get("async", ["0"])[0] == "1":
                 from .http_media import receive_upload_temp, upload_identity
@@ -557,6 +585,46 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, snapshot)
             return
         if self.command == "GET":
+            if parts == ["render-options"]:
+                self._send_json(200, self.server.render_jobs.options())
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] in {"render-result", "render-video", "render-json"}:
+                _require_id(parts[1], "job_id")
+                if parts[2] == "render-result":
+                    self._send_json(200, self.server.render_jobs.result(parts[1]))
+                elif parts[2] == "render-json":
+                    item = self.server.render_jobs.frozen_document(parts[1])
+                    self._extra_headers = [("Content-Disposition", f'attachment; filename="{item["filename"]}"'),
+                        ("X-TraceAnnotate-Task-Revision", str(item['binding']['revision'])),
+                        ("X-TraceAnnotate-Content-SHA256", item['binding']['content_sha256']),
+                        ("X-TraceAnnotate-Export-Losses", item['losses'])]
+                    self._headers(200, len(item['data']), item['content_type'])
+                    self.wfile.write(item['data'])
+                else:
+                    path, digest, _ = self.server.render_jobs.video(parts[1])
+                    job = self.server.queue.get_job(parts[1])
+                    self._send_file(path, 'video/mp4', byte_ranges=True, extra_headers=[
+                        ('Content-Disposition', f'attachment; filename="TraceAnnotate-{job["task_id"]}-r{job["input_revision"]}.mp4"'),
+                        ('X-TraceAnnotate-Task-Revision', str(job['input_revision'])),
+                        ('X-TraceAnnotate-Content-SHA256', job['input_sha256']),
+                        ('X-TraceAnnotate-File-SHA256', digest)])
+                return
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "analysis-status":
+                _require_id(parts[1], "task_id")
+                from .professional_schema import derived_analysis_status
+                with store.transaction():
+                    task = store.get_task(parts[1])
+                    media = store.get_media(task["media_id"])
+                    reports = task.get("extensions", {}).get("professional", {}).get("analysis_reports", [])
+                    result = {"task_id": task["id"], "revision": task["revision"],
+                        "content_sha256": task["content_sha256"], "reports": reports,
+                        "assessment": [derived_analysis_status(task, media, report) for report in reports]}
+                self._send_json(200, result)
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "analysis-result":
+                _require_id(parts[1], "job_id")
+                self._send_json(200, self.server.analysis_jobs.result(parts[1]))
+                return
             if parts == ["drafts"]:
                 self._send_json(200, {"drafts": self.server.drafts.list()})
                 return
@@ -614,16 +682,32 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.command == "POST":
             task_command = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "commands"
             task_import_temporal = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "import-temporal"
+            professional_write = len(parts) == 3 and parts[0] == "tasks" and parts[2] in {"professional-import", "analysis-reports"}
+            analysis_submit = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "analysis-jobs"
+            analysis_apply = len(parts) == 3 and parts[0] == "jobs" and parts[2] == "apply-analysis"
+            render_submit = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "render-jobs"
             control = len(parts) == 3 and parts[0] in ("batches", "jobs") and parts[2] == "control"
             intake_control = len(parts) == 3 and parts[0] == "intakes" and parts[2] in {"cancel", "retry"}
-            if not (task_command or task_import_temporal or control or intake_control
+            if not (task_command or task_import_temporal or professional_write or analysis_submit or analysis_apply or render_submit or control or intake_control
                     or parts in (["batches"], ["drafts"])):
                 raise NotFound("NOT_FOUND", "Unknown route")
             if len(parts) > 1:
                 _require_id(parts[1], "resource_id")
             raw, body = self._read_body()
             with store.transaction():
-                if intake_control:
+                if render_submit:
+                    _fields(body, {"command_id", "expected_revision", "expected_sha256", "recipe"})
+                    result = self.server.render_jobs.submit(parts[1], **body)
+                elif analysis_submit:
+                    _fields(body, {"command_id", "expected_revision", "expected_sha256", "stream_index", "window", "subject_annotation_id"})
+                    result = self.server.analysis_jobs.submit(parts[1], **body)
+                elif analysis_apply:
+                    _fields(body, {"command_id", "expected_revision", "expected_sha256", "operation", "payload"})
+                    if body["operation"] != "apply_analysis_job" or body["payload"] != {}:
+                        raise SchemaInvalid("SCHEMA_INVALID", "Analysis apply accepts only its fixed server-loaded candidate")
+                    result = self.server.analysis_jobs.apply(parts[1], command_id=body["command_id"],
+                        expected_revision=body["expected_revision"], expected_sha256=body["expected_sha256"], request_body=raw)
+                elif intake_control:
                     # A control body is exactly "optionally one command_id".
                     # Arrays, null, unknown fields and non-identifier ids are
                     # refused instead of being silently treated as "no command",
@@ -641,6 +725,12 @@ class _Handler(BaseHTTPRequestHandler):
                     if not isinstance(body, dict) or set(body) != expected:
                         raise SchemaInvalid("SCHEMA_INVALID", "Invalid draft save request")
                     result = self.server.drafts.save(**body)
+                elif professional_write:
+                    from .professional_store import apply_import, apply_analysis
+                    field = "document" if parts[2] == "professional-import" else "report"
+                    _fields(body, {"command_id", "expected_revision", "expected_sha256", field})
+                    method = apply_import if field == "document" else apply_analysis
+                    result = method(store, parts[1], request_body=raw, **body)
                 elif task_command:
                     body = _command(body)
                     result = store.apply_task_command(task_id=parts[1], request_body=raw, **body)["response"]
@@ -708,7 +798,7 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._deny("METHOD_NOT_ALLOWED", 405)
         # Report success only after the outer transaction has committed.
-        self._send_json(200, result)
+        self._send_json(202 if self.command == "POST" and (analysis_submit or render_submit) else 200, result)
 
     def _serve(self):
         request_id = "req-" + secrets.token_hex(12)
@@ -769,6 +859,13 @@ def make_server(store: WorkspaceStore, host: str = "127.0.0.1", port: int = 0) -
     server.authority = f"127.0.0.1:{server.server_port}"
     server.origin = f"http://{server.authority}"
     server.editor_url = server.origin + "/"
+    from .analysis_jobs import AnalysisJobs
+    server.analysis_jobs = AnalysisJobs(store, queue=queue, closing=server.closing)
+    server.analysis_jobs.start()
+    from .render_jobs import RenderJobs
+    server.render_preview_lock = threading.Lock()
+    server.render_jobs = RenderJobs(store, queue=queue, closing=server.closing)
+    server.render_jobs.start()
     return server
 
 

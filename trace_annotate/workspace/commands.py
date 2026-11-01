@@ -84,6 +84,32 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_professional(args: argparse.Namespace) -> int:
+    from .professional_store import export_professional, apply_import
+    from .professional_schema import decode_document
+    from . import schema as S
+    store = _open_store(Path(args.project))
+    try:
+        if args.professional_command == "export":
+            data = export_professional(store, args.task_id)["data"]
+            # Exclusive creation protects any existing user export.
+            with Path(args.output).open("xb") as output:
+                output.write(data)
+            print(json.dumps({"exported": str(Path(args.output).absolute()),
+                              "sha256": S.sha256_bytes(data)}, ensure_ascii=False))
+        else:
+            with Path(args.input).open("rb") as incoming:
+                raw = incoming.read(1024 * 1024 + 1)
+            document = decode_document(raw)
+            body = {"command_id": args.command_id, "expected_revision": args.expected_revision,
+                    "expected_sha256": args.expected_sha256, "document": document}
+            result = apply_import(store, args.task_id, request_body=S.canonical_json(body), **body)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        store.close()
+
+
 def cmd_batch(args: argparse.Namespace) -> int:
     from .processors import OPERATION, VERSION, media_verifier
     from .queue import DurableQueue
@@ -98,8 +124,19 @@ def cmd_batch(args: argparse.Namespace) -> int:
                   "expected_sha256": task["content_sha256"]} for task in tasks],
                 operation=OPERATION, processor_version=VERSION, command_id=args.command_id)
         elif action == "run":
-            results = queue.run_pending(media_verifier(store), batch_id=args.batch_id)
-            result = {"executed": results, "batches": queue.list_batches()}
+            batches = [queue.get_batch(args.batch_id)] if args.batch_id else queue.list_batches()
+            eligible, skipped = [], []
+            for batch in batches:
+                (eligible if all(job['operation'] == OPERATION for job in batch['jobs']) else skipped).append(batch)
+            if args.batch_id and skipped:
+                from .errors import SchemaInvalid
+                raise SchemaInvalid('UNSUPPORTED_PROCESSOR',
+                    'This CLI runs integrity batches only; use the analysis workbench for media analysis')
+            results = []
+            for batch in eligible:
+                results.extend(queue.run_pending(media_verifier(store), batch_id=batch['id']))
+            result = {"executed": results, "batches": queue.list_batches(),
+                      "skipped_batch_ids": [batch['id'] for batch in skipped]}
         elif action == "show":
             result = queue.get_batch(args.batch_id) if args.batch_id else {"batches": queue.list_batches()}
         else:
@@ -164,6 +201,21 @@ def register_workspace_commands(subparsers: argparse._SubParsersAction) -> None:
     p_srv.add_argument("--port", type=int, default=0)
     p_srv.add_argument("--no-browser", action="store_true")
     p_srv.set_defaults(func=cmd_serve)
+
+    p_professional = sp.add_parser("professional", help="Complete professional task JSON; source media must already be admitted")
+    professional_sub = p_professional.add_subparsers(dest="professional_command", required=True)
+    for action in ("export", "import"):
+        command = professional_sub.add_parser(action)
+        command.add_argument("--project", required=True)
+        command.add_argument("--task-id", required=True)
+        command.set_defaults(func=cmd_professional)
+        if action == "export":
+            command.add_argument("--output", required=True)
+        else:
+            command.add_argument("--input", required=True)
+            command.add_argument("--command-id", required=True)
+            command.add_argument("--expected-revision", required=True, type=int)
+            command.add_argument("--expected-sha256", required=True)
 
     p_intakes = sp.add_parser("intakes", help="Show all import attempts, including failures")
     p_intakes.add_argument("--project", required=True)

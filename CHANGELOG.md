@@ -2,6 +2,27 @@
 
 ## Unreleased — 1.1.0.dev0
 
+- Add complete-current-task professional JSON exchange with exact anchors,
+  typed analysis reports, revision receipts and explicit history-index scope.
+  Preserve imported documents as immutable project objects; prevent recursive
+  export growth and retain them through GC, backup and recovery.
+- Add cancellable playback-media analysis jobs and an additive editor panel.
+  Keep original/proxy measurements separate, save candidate reports atomically
+  and preserve unavailable/stale states. Objective measurements do not mark
+  annotations as manually reviewed or provide semantic audio listening.
+- Add configurable black-and-white annotation panels above, below or beside
+  the complete playback image. Preview an exact decoded frame, then encode a
+  frozen task through cancellable durable render jobs. Verify frame timestamps,
+  final-frame duration, decoded output and audio before publishing downloads;
+  pair each video with its frozen professional JSON. Preserve VFR timing and
+  refuse text overflow, missing glyphs and resource-limit violations.
+- Resume cancelled jobs explicitly without changing their frozen input. Fence
+  old generations and prevent the same job from re-entering while its previous
+  processor is still exiting, including with multiple worker slots.
+- Protect committed queue results and diagnostics during cleanup, journal
+  interrupted deletion and upgrade validated workspaces to storage version2.
+  Refuse old writers and closing an active processor's database.
+
 - Add progressive enhancements to the unified workspace editor while preserving classic tools:
   - Multi-track visual timeline with sub-lane interval scheduling for overlapping segment clips, review state markers, and interactive click-to-seek navigation.
   - Conditional undo/redo commands bound to the original durable receipt and protected history successor. Divergent cross-tab history is rejected without overwriting saved annotations; failed or unknown saves do not advance history.

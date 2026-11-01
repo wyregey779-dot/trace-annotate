@@ -119,7 +119,7 @@
           <output class="time" id="timeDisplay" for="seek">00:00:00.000 / 00:00:00.000</output>
         </div>
         <p id="frameInfo" class="video-note">当前为秒级时间定位，尚未取得呈现帧时间戳。</p>
-        <div class="draft"><p class="hint" id="draftStatus">浏览器草稿是辅助恢复机制。请定期导出 JSON 主文件。</p><div class="toolbar"><button id="restoreDraft" type="button" hidden>恢复此视频的草稿</button><button id="ignoreDraft" type="button" hidden>用当前标注替换旧草稿</button></div></div>
+        <div class="draft"><p class="hint" id="draftStatus">浏览器草稿是辅助恢复机制。请定期导出 JSON 主文件。</p><div id="draftChoices" hidden><label for="draftChoice">可恢复的草稿（不同页面分别保留）</label><select id="draftChoice"></select></div><div class="toolbar"><button id="restoreDraft" type="button" hidden>恢复所选草稿</button><button id="ignoreDraft" type="button" hidden>保留旧草稿，继续当前标注</button></div></div>
       </section>
       <section class="panel timeline-section">
         <div class="seek-label"><h2>多轨时间线</h2><span class="small" id="segmentCount">0 个片段</span></div>
@@ -194,6 +194,10 @@
     let draftTimer = null;
     let pendingDraft = false;
     let pendingDraftKey = null;
+    let draftWriterId = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : typeof crypto.getRandomValues === 'function' ? Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, '0')).join('') : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+    let draftObservedRaw = null;
+    let draftSavedState = null;
+    let draftOwnRaw = null;
     let frameCallback = null;
     let frameEpoch = 0;
     let frameObservation = null;
@@ -640,7 +644,7 @@
       media = { name: file.name, size: file.size, duration: result.duration, sha256: result.sha256, url: result.url,
                 preparedMetadata: document?.metadata?.prepared_media || null };
       annotation = document || blankDocument(file, result.duration, result.sha256);
-      selectedId = null; undoStack = []; redoStack = []; lastExported = fingerprint(); pendingDraft = false; pendingDraftKey = null; revision++; importToken++;
+      selectedId = null; undoStack = []; redoStack = []; lastExported = fingerprint(); pendingDraft = false; pendingDraftKey = null; draftObservedRaw = null; draftSavedState = null; draftOwnRaw = null; revision++; importToken++;
       video.onloadeddata = () => {
         if (media?.url !== result.url || video.currentSrc !== result.url) return;
         if (!isTime(video.duration) || video.duration <= 0 || Math.abs(video.duration - media.duration) > .001) { videoReady = false; updateControls(); setStatus('播放器时长与已读取元数据不一致，标注已暂停；现有标注仍可导出。', true); return; }
@@ -659,6 +663,7 @@
       $('fileInfo').textContent = (source ? '原片：' + source.name + ' → 兼容副本：' : '') + file.name + ' · ' + formatTime(media.duration) + ' · ' + file.size.toLocaleString() + ' 字节';
       $('mediaIdentity').textContent = (source ? '本机服务已核对兼容副本完整内容 · SHA-256 ' : '已核对完整媒体内容 · SHA-256 ') + media.sha256;
       loadEditor(); render();
+      draftSavedState = draftState();
     }
     async function loadVideo(event) {
       const file = event.target.files?.[0]; event.target.value = '';
@@ -754,22 +759,99 @@
     }
     function draftKey() { return media ? 'traceannotate.temporal.v2:sha256:' + media.sha256 : null; }
     function legacyDraftKey() { return media ? 'traceannotate.temporal.v1:' + encodeURIComponent(media.name) + ':' + media.size : null; }
+    function draftState() {
+      // Clean selection/playback are not edits. A dirty form includes its
+      // target and recovery context, even when another segment has identical fields.
+      return JSON.stringify({ document: annotation, editor: formDirty ? {
+        values: formValues(), selected_id: selectedId, editor_baseline: formBaseline,
+        review_acknowledged_for: reviewAcknowledgedFor
+      } : null });
+    }
+    function hideDraftChoices() {
+      $('restoreDraft').hidden = true; $('ignoreDraft').hidden = true; $('draftChoices').hidden = true;
+    }
+    function refreshDraftChoices() {
+      const primary = draftKey(); const keys = [primary];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key?.startsWith(primary + ':session:')) keys.push(key);
+      }
+      keys.push(legacyDraftKey());
+      const seen = new Set(); const choices = [];
+      for (const key of keys) {
+        const raw = localStorage.getItem(key);
+        if (raw === null || seen.has(raw)) continue;
+        seen.add(raw); choices.push({ key, raw });
+      }
+      const select = $('draftChoice'); select.replaceChildren();
+      choices.forEach(({ key, raw }, index) => {
+        const option = document.createElement('option'); option.value = key;
+        let summary = '格式待核验';
+        try {
+          const saved = JSON.parse(raw);
+          summary = (typeof saved.updated_at === 'string' ? saved.updated_at : '时间未知') + ' · ' + (Array.isArray(saved.document?.segments) ? saved.document.segments.length : '?') + ' 个片段';
+        } catch (_) { /* Recovery must report malformed drafts, not silently discard them. */ }
+        option.textContent = '草稿 ' + (index + 1) + ' · ' + summary + (key === legacyDraftKey() ? ' · 旧版未绑定内容身份' : '');
+        select.append(option);
+      });
+      pendingDraftKey = choices.some(choice => choice.key === pendingDraftKey) ? pendingDraftKey : choices[0]?.key || null;
+      if (pendingDraftKey) select.value = pendingDraftKey;
+      $('draftChoices').hidden = choices.length === 0;
+      $('restoreDraft').hidden = choices.length === 0;
+      $('ignoreDraft').hidden = !pendingDraft;
+      return choices.length;
+    }
     function findDraft() {
-      $('restoreDraft').hidden = true; $('ignoreDraft').hidden = true;
+      hideDraftChoices(); draftSavedState = draftState();
       try {
-        pendingDraftKey = localStorage.getItem(draftKey()) !== null ? draftKey() : localStorage.getItem(legacyDraftKey()) !== null ? legacyDraftKey() : null;
-        pendingDraft = pendingDraftKey !== null;
-        $('restoreDraft').hidden = !pendingDraft; $('ignoreDraft').hidden = !pendingDraft;
-        $('draftStatus').textContent = pendingDraft ? (pendingDraftKey === draftKey() ? '发现与完整 SHA-256 绑定的草稿。请恢复或明确替换；选择之前不会覆盖。' : '发现旧版按文件名和大小保存的草稿，内容身份未验证。恢复需确认迁移并重新复核，旧草稿保留。') : '浏览器草稿按完整 SHA-256 区分媒体；同内容改名后可重定位。请定期导出 JSON。';
+        draftObservedRaw = localStorage.getItem(draftKey());
+        pendingDraft = refreshDraftChoices() > 0;
+        $('ignoreDraft').hidden = !pendingDraft;
+        $('draftStatus').textContent = pendingDraft ? '发现可恢复草稿。请选择草稿恢复，或保留旧草稿后继续当前标注；选择之前不会覆盖。不同页面的草稿分别保留，旧版草稿仍需确认迁移与重新复核。' : '浏览器草稿按完整 SHA-256 区分媒体；同内容改名后可重定位。不同页面分别保存，请定期导出 JSON。';
       } catch (error) { pendingDraft = false; $('draftStatus').textContent = '浏览器草稿不可用：' + error.message + '。请使用 JSON 保存。'; }
     }
     function scheduleDraft() { clearTimeout(draftTimer); draftTimer = setTimeout(writeDraft, 350); }
     function writeDraft() {
       if (!annotation || !media || pendingDraft) return;
+      const state = draftState();
+      if (state === draftSavedState) return;
       try {
-        const envelope = { draft_format: 2, updated_at: new Date().toISOString(), document: annotation, selected_id: selectedId, editor: formValues(), editor_baseline: JSON.parse(formBaseline), review_acknowledged_for: reviewAcknowledgedFor };
-        localStorage.setItem(draftKey(), JSON.stringify(envelope));
-        $('draftStatus').textContent = '本地草稿已更新 ' + new Date().toLocaleTimeString() + '（含未保存表单，绑定完整 SHA-256）。浏览器清理或配额可能影响恢复；JSON 是主文件。';
+        const key = draftKey(); let ownKey = key + ':session:' + draftWriterId;
+        const ownCurrent = localStorage.getItem(ownKey);
+        if (ownCurrent !== null && ownCurrent !== draftOwnRaw) {
+          let suffix = 1;
+          while (localStorage.getItem(ownKey + '-' + suffix) !== null) suffix++;
+          draftWriterId += '-' + suffix; ownKey = key + ':session:' + draftWriterId;
+        }
+        const envelope = { draft_format: 2, draft_writer: draftWriterId, updated_at: new Date().toISOString(), document: annotation, selected_id: selectedId, editor: formValues(), editor_baseline: JSON.parse(formBaseline), review_acknowledged_for: reviewAcknowledgedFor };
+        const raw = JSON.stringify(envelope);
+        // localStorage has no atomic compare-and-swap across tabs. Save a
+        // page-owned copy first so interleaved primary writes preserve both.
+        localStorage.setItem(ownKey, raw); draftOwnRaw = raw;
+        const current = localStorage.getItem(key);
+        let ownsPrimary = false;
+        try { ownsPrimary = current !== null && JSON.parse(current).draft_writer === draftWriterId; } catch (_) { /* Preserve unreadable foreign drafts. */ }
+        const conflict = current !== draftObservedRaw && !ownsPrimary;
+        if (!conflict) {
+          // Existing format-1/2 drafts may predate page-owned copies. Archive
+          // their bytes before replacing the compatibility key after recovery.
+          if (current !== null && !ownsPrimary) {
+            let preserved = false;
+            for (let i = 0; i < localStorage.length; i++) {
+              const candidate = localStorage.key(i);
+              if (candidate?.startsWith(key + ':session:') && localStorage.getItem(candidate) === current) { preserved = true; break; }
+            }
+            if (!preserved) {
+              let suffix = 1; const prefix = key + ':session:preserved-' + draftWriterId + '-';
+              while (localStorage.getItem(prefix + suffix) !== null) suffix++;
+              localStorage.setItem(prefix + suffix, current);
+            }
+          }
+          localStorage.setItem(key, raw); draftObservedRaw = raw;
+        }
+        if (conflict) refreshDraftChoices();
+        draftSavedState = state;
+        $('draftStatus').textContent = conflict ? '检测到其他页面更新。本页草稿已独立保存（含未保存表单），双方内容均保留；可在草稿列表中选择恢复。请分别导出 JSON。' : '本地草稿已更新 ' + new Date().toLocaleTimeString() + '（含未保存表单，绑定完整 SHA-256）。浏览器清理或配额可能影响恢复；JSON 是主文件。';
       } catch (error) { $('draftStatus').textContent = '本地草稿写入失败：' + error.message + '。请立即导出 JSON；表单修改请先保存片段。'; }
     }
     function restoreDraft() {
@@ -801,7 +883,7 @@
         reviewAcknowledgedFor = $('reviewInput').checked && (envelope.draft_format === 1 || envelope.review_acknowledged_for === contentFingerprint()) ? contentFingerprint() : null;
         if (reviewAcknowledgedFor === null) $('reviewInput').checked = false;
         updateFormDirty();
-        pendingDraft = false; pendingDraftKey = null; $('restoreDraft').hidden = true; $('ignoreDraft').hidden = true; modified('已恢复本地草稿。表单中尚未保存的内容仍需点击“保存片段”。' + (legacy ? '旧文档已迁移到 v2，所有片段需重新复核。' : ''));
+        pendingDraft = false; pendingDraftKey = null; hideDraftChoices(); modified('已恢复本地草稿。表单中尚未保存的内容仍需点击“保存片段”。' + (legacy ? '旧文档已迁移到 v2，所有片段需重新复核。' : ''));
       } catch (error) { setStatus('恢复失败：' + error.message + ' 当前标注与旧草稿未变更。', true); }
     }
     function exportableDocument(savedOnly = false) {
@@ -918,9 +1000,10 @@
     video.addEventListener('seeking', () => { frameEpoch++; frameObservation = null; updateTime(); $('frameInfo').textContent = '正在定位；呈现帧时间戳待确认。记起止点使用秒级位置。'; });
     video.addEventListener('seeked', renderFrameObservation);
     $('restoreDraft').addEventListener('click', restoreDraft);
+    $('draftChoice').addEventListener('change', () => { pendingDraftKey = $('draftChoice').value || null; });
     $('ignoreDraft').addEventListener('click', () => {
-      if (!requireMedia() || !window.confirm('用当前标注和表单替换此视频的旧浏览器草稿？此操作不会导出文件。')) return;
-      pendingDraft = false; pendingDraftKey = null; $('restoreDraft').hidden = true; $('ignoreDraft').hidden = true; writeDraft();
+      if (!requireMedia() || !window.confirm('保留已有草稿，并为当前标注和未保存表单另存草稿？此操作不会导出文件。')) return;
+      pendingDraft = false; pendingDraftKey = null; hideDraftChoices(); writeDraft();
     });
     ['JSON', 'CSV', 'SRT', 'VTT'].forEach(format => $('export' + format).addEventListener('click', () => exportFile(format.toLowerCase())));
     window.addEventListener('keydown', event => {

@@ -60,7 +60,7 @@ def validate_assets(dist: Path, expected_tag: str | None = None) -> list[Path]:
         source_files = {
             file.relative_to(root).as_posix(): file.read_bytes()
             for file in (root / "trace_annotate").rglob("*")
-            if file.is_file() and file.suffix in {".py", ".json", ".xml", ".html", ".js", ".txt"}
+            if file.is_file() and file.suffix in {".py", ".json", ".xml", ".html", ".js", ".txt", ".otf", ".md"}
         }
         wheel_files = {name for name in archive.namelist() if name.startswith("trace_annotate/")}
         if wheel_files != source_files.keys():
@@ -96,6 +96,23 @@ def validate_assets(dist: Path, expected_tag: str | None = None) -> list[Path]:
                      "scripts/check_media_admission.py", "scripts/check_prepared_editor.py",
                      "scripts/check_embodied_editor.py", "scripts/check_workspace_editor.py",
                      "scripts/check_enhanced_editor.py", "tests/test_enhanced_editor_runner.py",
+                     "tests/temporal_draft_recovery.test.mjs",
+                     "tests/workspace_draft_recovery.test.mjs",
+                     "tests/workspace_timeline_layout.test.mjs",
+                     "tests/workspace_analysis_ui.test.mjs",
+                     "tests/workspace_render_ui.test.mjs",
+                     "tests/fixtures/storage_v1_store.py",
+                     "docs/PROFESSIONAL_JSON.md",
+                     "scripts/check_workspace_analysis.py",
+                     "tests/test_workspace_analysis_runner.py",
+                     "scripts/check_workspace_render.py",
+                     "tests/test_workspace_render_runner.py",
+                     "tests/test_workspace_analysis_service.py", "tests/test_workspace_analysis_jobs.py",
+                     "tests/test_workspace_analysis_http.py", "tests/test_workspace_analysis_cli_safety.py",
+                     "tests/test_workspace_cancel_resume.py", "tests/test_workspace_render_layout.py",
+                     "tests/test_workspace_rendering.py", "tests/test_workspace_render_jobs.py", "tests/test_workspace_render_http.py",
+                     "tests/test_workspace_artifact_lifecycle.py", "tests/test_workspace_professional_codec.py",
+                     "tests/test_workspace_professional_http.py",
                      "tests/test_workspace_history_review.py", "tests/test_workspace_roundtrip_regressions.py",
                      "tests/test_workspace_drafts.py", "tests/test_workspace_backup.py",
                      "tests/test_workspace_legacy_endpoints.py",

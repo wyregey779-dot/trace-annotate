@@ -291,14 +291,17 @@ def _srt(task, track, track_id=None):
 
 
 def export_task(store, task_id, format, *, track=None, track_id=None):
-    if format not in {"json", "csv", "srt", "temporal"}:
-        raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT", "Supported task exports are json, csv, srt and temporal")
+    if format not in {"json", "csv", "srt", "temporal", "professional"}:
+        raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT", "Supported task exports are json, csv, srt, temporal and professional")
     if track is not None and track_id is not None:
         raise SchemaInvalid("TRACK_SELECTION_CONFLICT", "Select a track by either name or ID, not both")
     if (track is not None or track_id is not None) and format != "srt":
         raise SchemaInvalid("UNSUPPORTED_EXPORT_OPTION", "Track selection applies only to SRT")
     if track_id is not None and (not isinstance(track_id, str) or re.fullmatch(r"[0-9a-f]{64}", track_id) is None):
         raise SchemaInvalid("INVALID_TRACK_ID", "Track ID must be a lowercase SHA256 hex digest")
+    if format == "professional":
+        from .professional_store import export_professional
+        return export_professional(store, task_id)
     with store.transaction():
         task, media, template = _read_subject(store, task_id)
         report = _report(store, task, media, template)

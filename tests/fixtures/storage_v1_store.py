@@ -1,0 +1,1056 @@
+"""Persistent workspace storage: SQLite + immutable object files.
+
+Design contract (contracts/first-batch-contract.md section 6):
+* workspace.sqlite3 is the only authoritative mutable state; workspace-v3 JSON
+  is an exchange snapshot.
+* Objects are immutable files under objects/<sha256>.
+* Every successful user command writes a task_revision, a durable_commit and a
+  command_receipt in one SQLite transaction.
+* Second process cannot open the project for writing (OS file lock).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from contextlib import contextmanager
+from functools import wraps
+import io
+import copy
+import stat
+import tempfile
+import threading
+import uuid
+import datetime as _dt
+import hashlib
+import json
+import os
+import shutil
+from pathlib import Path
+import sqlite3
+import time
+from ..temporal.media import stream_sha256
+from typing import Any, Dict, List, Optional
+
+from . import schema as S
+from .errors import Conflict, NotFound, SchemaInvalid, WorkspaceError, revision_conflict
+
+SCHEMA_VERSION = 3
+STORAGE_VERSION = "1"
+DB_FILE = "workspace.sqlite3"
+LOCK_FILE = "write.lock"
+OBJECTS_DIR = "objects"
+TMP_DIR = "tmp"
+EXPORTS_DIR = "exports"
+LOGS_DIR = "logs"
+
+DEFAULT_TEMPLATE = {
+    "id": "generic-segment",
+    "version": 1,
+    "name": "General video segments",
+    "annotation_types": ["whole_clip", "event", "segment"],
+    "labels": [],
+    "attributes": [],
+    "coverage_policy": "sparse",
+}
+
+DDL = """
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS templates(id TEXT NOT NULL, version INTEGER NOT NULL,
+    body TEXT NOT NULL, PRIMARY KEY(id, version));
+CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, media_id TEXT NOT NULL,
+    template_id TEXT NOT NULL, template_version INTEGER NOT NULL,
+    revision INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS task_revisions(id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+    revision INTEGER NOT NULL, body TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+    commit_id TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS durable_commits(id TEXT PRIMARY KEY, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS command_receipts(command_id TEXT PRIMARY KEY, task_id TEXT,
+    request_sha256 TEXT NOT NULL, state TEXT NOT NULL, response TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY, rel_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL);
+-- One durable completion per admitted intake. The UNIQUE intake_id is the
+-- database-level guarantee that an intake can never own two tasks, even if two
+-- workers race after a crash. Its id lives in the "adm" namespace, so it can
+-- never collide with a user command id (which always hashes into "cmt").
+CREATE TABLE IF NOT EXISTS admission_completions(id TEXT PRIMARY KEY,
+    intake_id TEXT NOT NULL UNIQUE, generation INTEGER NOT NULL, task_id TEXT NOT NULL,
+    media_id TEXT NOT NULL, source_sha256 TEXT NOT NULL, source_size INTEGER NOT NULL,
+    task_content_sha256 TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS intakes(id TEXT PRIMARY KEY, group_id TEXT NOT NULL,
+    state TEXT NOT NULL, display_name TEXT, source_sha256 TEXT, source_size INTEGER,
+    media_id TEXT, task_id TEXT, error_code TEXT, created_at TEXT NOT NULL, job_id TEXT, template_id TEXT, template_version INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_revision ON task_revisions(task_id, revision);
+"""
+
+
+def _now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _new_id(prefix):
+    return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def _safe(path):
+    for entry in (Path(path).absolute(), *Path(path).absolute().parents):
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise WorkspaceError("UNSAFE_PATH", "Workspace paths cannot contain links or reparse points")
+
+
+def _sync_directory(path):
+    if os.name != "nt":
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _serialized(function):
+    @wraps(function)
+    def invoke(self, *args, **kwargs):
+        with self.transaction():
+            return function(self, *args, **kwargs)
+    return invoke
+
+
+@dataclass
+class ProjectLock:
+    """OS single-writer lock held for the lifetime of an open store."""
+    path: Path
+    _handle: Optional[int] = None
+
+    def acquire(self):
+        if self._handle is not None:
+            raise Conflict("PROJECT_LOCKED", "Workspace is already open")
+        _safe(self.path)
+        handle = os.open(str(self.path), os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(handle)
+            raise Conflict("PROJECT_LOCKED", "Another process holds the workspace lock") from exc
+        self._handle = handle
+
+    def release(self):
+        if self._handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(self._handle, 0, os.SEEK_SET)
+                msvcrt.locking(self._handle, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._handle, fcntl.LOCK_UN)
+        finally:
+            os.close(self._handle)
+            self._handle = None
+
+
+class WorkspaceStore:
+    """Owns the on-disk project directory and the SQLite connection."""
+
+    def __init__(self, root: Path):
+        self.root = Path(root).absolute()
+        if str(self.root).startswith(("\\\\", "//")):
+            raise WorkspaceError("UNSUPPORTED_STORAGE", "Network workspaces are unsupported")
+        self._mutex = threading.RLock()
+        self._conn = None
+        self._depth = 0
+        self.lock_path = self.root / LOCK_FILE
+        self.objects_dir = self.root / OBJECTS_DIR
+        self.tmp_dir = self.root / TMP_DIR
+        self.exports_dir = self.root / EXPORTS_DIR
+        self.logs_dir = self.root / LOGS_DIR
+        self.lock = ProjectLock(self.lock_path)
+
+    # -- lifecycle ---------------------------------------------------------
+    def create(self):
+        _safe(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock.acquire()
+        try:
+            if (self.root / DB_FILE).exists():
+                raise Conflict("PROJECT_EXISTS", "Workspace already exists")
+            for directory in (self.objects_dir, self.tmp_dir, self.exports_dir, self.logs_dir):
+                _safe(directory)
+                directory.mkdir(exist_ok=True)
+            self._init_db(new=True)
+            self._upsert_template(DEFAULT_TEMPLATE)
+        except BaseException:
+            self.close()
+            raise
+
+    def open(self):
+        _safe(self.root / DB_FILE)
+        if not (self.root / DB_FILE).is_file():
+            raise NotFound("PROJECT_NOT_FOUND", "Workspace database is missing")
+        self.lock.acquire()
+        try:
+            for directory in (self.objects_dir, self.tmp_dir, self.exports_dir, self.logs_dir):
+                _safe(directory)
+                if not directory.is_dir():
+                    raise WorkspaceError("RECOVERY_REQUIRED", "Workspace directory is missing")
+            self._init_db(new=False)
+            self._check_artifacts()
+            with self.transaction():
+                self.conn.execute("UPDATE intakes SET state='failed',error_code='INTERRUPTED' "
+                                  "WHERE state='running' AND task_id IS NULL")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        with self._mutex:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+            self.lock.release()
+
+    @property
+    def conn(self):
+        if self.lock._handle is None:
+            raise WorkspaceError("PROJECT_CLOSED", "Open the workspace before accessing its database")
+        if self._conn is None:
+            _safe(self.root / DB_FILE)
+            self._conn = sqlite3.connect(str(self.root / DB_FILE), isolation_level=None,
+                                         timeout=30, check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+        return self._conn
+
+    @contextmanager
+    def transaction(self):
+        with self._mutex:
+            connection = self.conn
+            depth = self._depth
+            marker = f"nested_{depth}"
+            connection.execute("BEGIN IMMEDIATE" if depth == 0 else f"SAVEPOINT {marker}")
+            self._depth += 1
+            try:
+                yield connection
+                connection.execute("COMMIT" if depth == 0 else f"RELEASE SAVEPOINT {marker}")
+            except BaseException:
+                if connection.in_transaction:
+                    if depth == 0:
+                        connection.execute("ROLLBACK")
+                    else:
+                        connection.execute(f"ROLLBACK TO SAVEPOINT {marker}")
+                        connection.execute(f"RELEASE SAVEPOINT {marker}")
+                raise
+            finally:
+                self._depth = depth
+
+    def _init_db(self, *, new):
+        if not new:
+            try:
+                values = dict(self.conn.execute("SELECT key,value FROM meta"))
+            except sqlite3.DatabaseError as exc:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Workspace database cannot be read") from exc
+            if values.get("storage_version") != STORAGE_VERSION:
+                raise WorkspaceError("WORKSPACE_MIGRATION_REQUIRED", "Experimental workspace requires explicit migration; original data preserved")
+            if values.get("schema_version") != str(SCHEMA_VERSION):
+                raise WorkspaceError("UNSUPPORTED_SCHEMA", "Workspace schema is unsupported")
+            if (values.get("digest_version") != "workspace-task-v1"
+                    or not isinstance(values.get("project_id"), str)
+                    or S.ID_RE.fullmatch(values["project_id"]) is None):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Workspace identity or digest metadata is missing")
+        with self.transaction():
+            for statement in DDL.split(";"):
+                if statement.strip():
+                    self.conn.execute(statement)
+            if new:
+                self.conn.executemany("INSERT INTO meta VALUES(?,?)", [
+                    ("schema_version", str(SCHEMA_VERSION)), ("storage_version", STORAGE_VERSION),
+                    ("project_id", _new_id("proj")), ("digest_version", "workspace-task-v1"),
+                    ("workspace_revision", "0")])
+            self.conn.execute("INSERT OR IGNORE INTO meta VALUES('workspace_revision','0')")
+            for statement in (
+                "ALTER TABLE intakes ADD COLUMN staged_path TEXT",
+                "ALTER TABLE intakes ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE intakes ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE intakes ADD COLUMN worker_id TEXT",
+                "ALTER TABLE intakes ADD COLUMN session_id TEXT",
+                "ALTER TABLE intakes ADD COLUMN lease_expires_at REAL",
+                "ALTER TABLE intakes ADD COLUMN request_sha256 TEXT",
+            ):
+                try:
+                    self.conn.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
+            self._install_revision_triggers(("tasks", "intakes", "artifacts", "templates", "durable_commits"))
+        if self.conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise WorkspaceError("RECOVERY_REQUIRED", "Database integrity check failed")
+
+    def _install_revision_triggers(self, tables):
+        allowed = {"tasks", "intakes", "artifacts", "templates", "durable_commits",
+                   "batches", "jobs", "attempts", "batch_jobs"}
+        for table in tables:
+            if table not in allowed:
+                raise ValueError("Unexpected revision table")
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                self.conn.execute(f"CREATE TRIGGER IF NOT EXISTS revision_{table}_{operation} "
+                                  f"AFTER {operation} ON {table} BEGIN UPDATE meta "
+                                  "SET value=CAST(value AS INTEGER)+1 WHERE key='workspace_revision'; END")
+
+    @_serialized
+    def _check_artifacts(self):
+        for rel, digest, size in self.conn.execute("SELECT rel_path,sha256,size_bytes FROM artifacts"):
+            if rel != f"objects/{digest}":
+                raise WorkspaceError("RECOVERY_REQUIRED", "Artifact path is invalid")
+            path = self.root / rel
+            _safe(path)
+            if not path.is_file() or path.stat().st_size != size or stream_sha256(path) != digest:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Artifact missing or corrupt; writes refused",
+                                     details={"artifact_sha256": digest})
+        for (body,) in self.conn.execute("SELECT body FROM media"):
+            media = json.loads(body)
+            frame_id = media.get("frame_map_artifact")
+            if not frame_id or not self.conn.execute("SELECT 1 FROM artifacts WHERE id=?", (frame_id,)).fetchone():
+                raise WorkspaceError("RECOVERY_REQUIRED", "Media frame-map reference is missing")
+            row = self.conn.execute("SELECT value FROM meta WHERE key=?", (f"media_objects:{media['id']}",)).fetchone()
+            if row is None:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Media object bindings are missing")
+            bindings = json.loads(row[0])
+            for key in ("playback_path", "frame_map_path", "manifest_path", "preparation_log_path"):
+                reference = bindings.get(key, {})
+                registered = self.conn.execute("SELECT sha256,size_bytes FROM artifacts WHERE id=?", (reference.get("id"),)).fetchone()
+                if registered is None or (registered[0], str(registered[1])) != (reference.get("sha256"), reference.get("size_bytes")):
+                    raise WorkspaceError("RECOVERY_REQUIRED", "Media object binding is missing or inconsistent")
+            if (bindings["frame_map_path"]["id"] != frame_id
+                    or bindings["playback_path"]["sha256"] != media["playback"]["sha256"]
+                    or bindings["playback_path"]["size_bytes"] != media["playback"]["size_bytes"]):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Media identity does not match its objects")
+        for task_id, revision in self.conn.execute("SELECT id,revision FROM tasks"):
+            task = self.get_task(task_id)
+            if task["revision"] != revision or self.task_digest(task) != task["content_sha256"]:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Current task revision or digest is inconsistent")
+
+    @_serialized
+    def _upsert_template(self, body):
+        S.require_id(body.get("id"))
+        if type(body.get("version")) is not int or body["version"] < 1:
+            raise SchemaInvalid("SCHEMA_INVALID", "Template version must be a positive integer")
+        encoded = S.canonical_json(body).decode("utf-8")
+        previous = self.conn.execute("SELECT body FROM templates WHERE id=? AND version=?", (body["id"], body["version"])).fetchone()
+        if previous:
+            if S.canonical_json(json.loads(previous[0])).decode("utf-8") != encoded:
+                raise Conflict("TEMPLATE_IMMUTABLE", "Publish a new template version")
+            return
+        self.conn.execute("INSERT INTO templates VALUES(?,?,?)", (body["id"], body["version"], encoded))
+
+    def _publish_stream(self, stream):
+        _safe(self.tmp_dir)
+        _safe(self.objects_dir)
+        handle, name = tempfile.mkstemp(dir=self.tmp_dir, suffix=".part")
+        temporary = Path(name)
+        try:
+            digest, size = hashlib.sha256(), 0
+            with os.fdopen(handle, "wb") as output:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            sha = digest.hexdigest()
+            target = self.objects_dir / sha
+            _safe(target)
+            try:
+                os.link(temporary, target)
+                _sync_directory(self.objects_dir)
+            except FileExistsError:
+                if target.stat().st_size != size or stream_sha256(target) != sha:
+                    raise WorkspaceError("RECOVERY_REQUIRED", "Existing immutable object is corrupt")
+            ident = S.make_id("art", sha)
+            with self.transaction():
+                self.conn.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?)", (ident, f"objects/{sha}", sha, size))
+            return {"id": ident, "relative_path": f"objects/{sha}", "sha256": sha, "size_bytes": str(size)}
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _put_artifact(self, data, rel_prefix="objects"):
+        if not isinstance(data, bytes) or rel_prefix != OBJECTS_DIR:
+            raise SchemaInvalid("SCHEMA_INVALID", "Artifact must be bytes in objects")
+        return self._publish_stream(io.BytesIO(data))
+
+    def _put_file(self, path):
+        with Path(path).open("rb") as source:
+            return self._publish_stream(source)
+
+    # -- templates ----------------------------------------------------------
+    @_serialized
+    def list_templates(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute("SELECT body FROM templates").fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    # -- intake / admission -------------------------------------------------
+    def import_source(self, source, *, display_name=None, template_id="generic-segment", template_version=1, cancelled=None, closing=None):
+        from .media import prepare_workspace_media
+        if cancelled is not None and not callable(cancelled):
+            raise SchemaInvalid("SCHEMA_INVALID", "Cancellation must be a callback")
+        if closing is not None and not callable(closing):
+            raise SchemaInvalid("SCHEMA_INVALID", "closing must be a callback")
+        def check_cancelled():
+            # A shutdown is not a user cancellation: it must persist as an
+            # interrupted, retryable failure instead of a settled cancellation.
+            if closing is not None and closing():
+                raise WorkspaceError("INTERRUPTED", "Workspace is shutting down")
+            if cancelled is not None and cancelled():
+                raise WorkspaceError("CANCELLED", "Media admission was cancelled")
+        source = Path(source)
+        display_name = source.name if display_name is None else display_name
+        if not isinstance(display_name, str) or not display_name:
+            raise SchemaInvalid("SCHEMA_INVALID", "Display name must be a nonempty string")
+        S.canonical_json(display_name)
+        S.require_id(template_id)
+        if type(template_version) is not int or template_version < 1:
+            raise SchemaInvalid("SCHEMA_INVALID", "Template version must be a positive integer")
+        intake_id, group_id, job_id = _new_id("int"), _new_id("grp"), _new_id("job")
+        with self.transaction():
+            if not self.conn.execute("SELECT 1 FROM templates WHERE id=? AND version=?", (template_id, template_version)).fetchone():
+                raise NotFound("TEMPLATE_NOT_FOUND", "Requested template does not exist")
+            self.conn.execute("INSERT INTO intakes(id,group_id,state,display_name,created_at,job_id,template_id,template_version) VALUES(?,?,?,?,?,?,?,?)",
+                              (intake_id, group_id, "running", display_name, _now(), job_id, template_id, template_version))
+        try:
+            check_cancelled()
+            if not source.is_file():
+                raise NotFound("SOURCE_MISSING", "Source file does not exist")
+            digest = stream_sha256(source, cancelled=check_cancelled)
+            size = source.stat().st_size
+            with self.transaction():
+                self.conn.execute("UPDATE intakes SET source_sha256=?,source_size=? WHERE id=?", (digest, size, intake_id))
+                candidates = [json.loads(row[0]) for row in self.conn.execute("SELECT body FROM media")]
+                media = next((value for value in candidates if value["source"]["sha256"] == digest), None)
+            reused = media is not None
+            objects = None
+            if reused:
+                self._check_artifacts()
+            if media is None:
+                prepared = prepare_workspace_media(source, self.tmp_dir / job_id,
+                                                   cancelled=check_cancelled, slot_key=self.root)
+                if prepared["source_sha256"] != digest or prepared["source_size"] != size:
+                    raise Conflict("MEDIA_CHANGED", "Source changed during preparation")
+                objects = {key: self._put_file(prepared[key]) for key in
+                           ("playback_path", "frame_map_path", "manifest_path", "preparation_log_path")}
+                media = dict(prepared["media_fields"])
+                media["source"]["display_name"] = display_name
+                media["id"] = S.make_id("med", digest)
+                media["frame_map_artifact"] = objects["frame_map_path"]["id"]
+                if objects["playback_path"]["sha256"] != media["playback"]["sha256"]:
+                    raise Conflict("MEDIA_CHANGED", "Playback changed during admission")
+            if stream_sha256(source, cancelled=check_cancelled) != digest or source.stat().st_size != size:
+                raise Conflict("MEDIA_CHANGED", "Source changed before admission commit")
+            task_id = _new_id("tsk")
+            task = {"id": task_id, "media_id": media["id"], "template_id": template_id,
+                    "template_version": template_version, "revision": 0, "annotations": [], "extensions": {}}
+            with self.transaction():
+                check_cancelled()
+                self.conn.execute("INSERT OR IGNORE INTO media VALUES(?,?)", (media["id"], S.canonical_json(media).decode("utf-8")))
+                if objects:
+                    self.conn.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (f"media_objects:{media['id']}", S.canonical_json(objects).decode("utf-8")))
+                task["content_sha256"] = self.task_digest(task)
+                self.conn.execute("INSERT INTO tasks VALUES(?,?,?,?,?)", (task_id, media["id"], template_id, template_version, 0))
+                self.conn.execute("INSERT INTO task_revisions VALUES(?,?,?,?,?,?,?)", (_new_id("rev"), task_id, 0,
+                                  S.canonical_json(task).decode("utf-8"), task["content_sha256"], None, _now()))
+                self.conn.execute("UPDATE intakes SET state='succeeded',media_id=?,task_id=? WHERE id=?", (media["id"], task_id, intake_id))
+            return {"intake_id": intake_id, "media_id": media["id"], "task_id": task_id,
+                    "duration_seconds": float(S.rational_value(media["duration"])), "frames": media["frame_count"], "reused_existing": reused}
+        except BaseException as exc:
+            is_cancelled = isinstance(exc, InterruptedError) or getattr(exc, "code", None) == "CANCELLED"
+            with self.transaction():
+                self.conn.execute("UPDATE intakes SET state=?,error_code=? WHERE id=?",
+                                  ("cancelled" if is_cancelled else "failed", "CANCELLED" if is_cancelled else getattr(exc, "code", "IMPORT_FAILED"), intake_id))
+            if isinstance(exc, InterruptedError):
+                raise WorkspaceError("CANCELLED", "Media admission was cancelled") from exc
+            raise
+
+    def admit_staged_intake(self, intake, *, cancelled=None, generation=None,
+                             worker_id=None, session_id=None, clock=None, deadline_at=None):
+        """Prepare a staged async intake and commit its media + task.
+
+        Long-running ffmpeg preparation runs OUTSIDE any SQLite transaction and
+        outside the store mutex. Media/task creation happens only in a short
+        fenced transaction that re-checks the intake generation, worker and
+        cancellation state, so a stale or cancelled worker can never leave an
+        orphan task row.
+
+        ``clock`` is the caller's monotonic lease clock (never ``time.time``)
+        so lease expiry, heartbeat renewal and the attempt deadline all agree.
+        Each attempt gets its own work directory keyed by attempt+generation so
+        a retry never deletes the previous attempt's failure evidence.
+        """
+        from .media import prepare_workspace_media
+        now_fn = clock if clock is not None else time.time
+        if cancelled is not None and not callable(cancelled):
+            raise SchemaInvalid("SCHEMA_INVALID", "Cancellation must be a callback")
+
+        def check_cancelled():
+            if cancelled is not None and cancelled():
+                raise WorkspaceError("CANCELLED", "Media admission was cancelled")
+
+        intake_id = intake["id"]
+        staged = self.root / intake["staged_path"]
+        _safe(staged)
+        if not staged.is_file():
+            raise NotFound("SOURCE_MISSING", "Staged upload is missing")
+        # Outside any write transaction: verify the staged bytes are unchanged.
+        digest = stream_sha256(staged, cancelled=cancelled)
+        size = staged.stat().st_size
+        if digest != intake["source_sha256"] or size != intake["source_size"]:
+            raise Conflict("MEDIA_CHANGED", "Staged upload changed during admission")
+        template_id, template_version = intake["template_id"], intake["template_version"]
+        # Short transaction: read template and decide whether to reuse media.
+        with self.transaction() as conn:
+            if not conn.execute("SELECT 1 FROM templates WHERE id=? AND version=?",
+                                (template_id, template_version)).fetchone():
+                raise NotFound("TEMPLATE_NOT_FOUND", "Requested template does not exist")
+            candidates = [json.loads(row[0]) for row in conn.execute("SELECT body FROM media")]
+            media = next((value for value in candidates if value["source"]["sha256"] == digest), None)
+        was_reused = media is not None
+        objects = None
+        # The generation names this attempt's completion identity; it is needed
+        # on both the prepared and the reused path.
+        gen = generation if generation is not None else intake.get("generation", 0)
+        if media is None:
+            attempt = intake.get("attempt", 0) or 0
+            work = self.tmp_dir / f"{intake_id}-a{attempt}-g{gen}"
+            # Never mask a cleanup failure: a stale work dir would make the
+            # next prepare fail with OUTPUT_EXISTS and hide the real cause.
+            if os.path.lexists(work):
+                if work.is_symlink() or not work.is_dir():
+                    raise Conflict("WORKDIR_CONFLICT",
+                                   "Prepare work directory is not a plain directory")
+                _safe(work)
+                shutil.rmtree(work)
+            prepared = prepare_workspace_media(staged, work, cancelled=cancelled,
+                                               slot_key=self.root)
+            if prepared["source_sha256"] != digest or prepared["source_size"] != size:
+                raise Conflict("MEDIA_CHANGED", "Source changed during preparation")
+            objects = {key: self._put_file(prepared[key]) for key in
+                       ("playback_path", "frame_map_path", "manifest_path", "preparation_log_path")}
+            media = dict(prepared["media_fields"])
+            media["source"]["display_name"] = intake["display_name"] or staged.name
+            media["id"] = S.make_id("med", digest)
+            media["frame_map_artifact"] = objects["frame_map_path"]["id"]
+            if objects["playback_path"]["sha256"] != media["playback"]["sha256"]:
+                raise Conflict("MEDIA_CHANGED", "Playback changed during admission")
+        check_cancelled()
+        # Final fenced short transaction: only here do we create media/task rows.
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT state,generation,worker_id,session_id,lease_expires_at FROM intakes WHERE id=?",
+                (intake_id,)).fetchone()
+            if row is None:
+                raise NotFound("INTAKE_NOT_FOUND", "Intake disappeared during admission")
+            state_now, gen_now, worker_now, sess_now, lease = row
+            if state_now == "cancel_requested":
+                raise WorkspaceError("CANCELLED", "Cancellation was requested before admission committed")
+            if generation is not None and (gen_now != generation or worker_now != worker_id
+                                           or sess_now != session_id):
+                raise Conflict("STALE_LEASE", "Intake lease is no longer valid")
+            if (lease or 0) <= now_fn():
+                raise Conflict("STALE_LEASE", "Intake lease expired before admission committed")
+            if deadline_at is not None and now_fn() >= deadline_at:
+                raise Conflict("DEADLINE_EXCEEDED", "Admission deadline passed before commit")
+            conn.execute("INSERT OR IGNORE INTO media VALUES(?,?)",
+                         (media["id"], S.canonical_json(media).decode("utf-8")))
+            if objects:
+                conn.execute("INSERT OR IGNORE INTO meta VALUES(?,?)",
+                             (f"media_objects:{media['id']}", S.canonical_json(objects).decode("utf-8")))
+            task_id = _new_id("tsk")
+            task = {"id": task_id, "media_id": media["id"], "template_id": template_id,
+                    "template_version": template_version, "revision": 0,
+                    "annotations": [], "extensions": {}}
+            task["content_sha256"] = self.task_digest(task)
+            conn.execute("INSERT INTO tasks VALUES(?,?,?,?,?)",
+                         (task_id, media["id"], template_id, template_version, 0))
+            conn.execute("INSERT INTO task_revisions VALUES(?,?,?,?,?,?,?)",
+                         (_new_id("rev"), task_id, 0, S.canonical_json(task).decode("utf-8"),
+                          task["content_sha256"], None, _now()))
+            # A stable, queryable completion record commits with the rows it
+            # describes. Its identity is derived from the intake (never from a
+            # client command id), so a confirmation after a restart finds the
+            # same record instead of inventing a second task.
+            conn.execute(
+                "INSERT INTO admission_completions(id,intake_id,generation,task_id,media_id,"
+                "source_sha256,source_size,task_content_sha256,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (S.make_id("adm", f"{intake_id}:{gen}"), intake_id, gen, task_id, media["id"],
+                 digest, size, task["content_sha256"], _now()))
+            # Atomic with task creation: a crash now leaves neither a task whose
+            # intake is still preparing nor an intake whose task vanished.
+            conn.execute(
+                "UPDATE intakes SET state='succeeded', media_id=?, task_id=?, error_code=NULL, "
+                "worker_id=NULL, session_id=NULL, lease_expires_at=NULL WHERE id=?",
+                (media["id"], task_id, intake_id))
+        return {"intake_id": intake_id, "media_id": media["id"], "task_id": task_id,
+                "duration_seconds": float(S.rational_value(media["duration"])),
+                "frames": media["frame_count"], "reused_existing": was_reused}
+
+    @_serialized
+    def list_intakes(self):
+        cursor = self.conn.execute("SELECT * FROM intakes ORDER BY rowid")
+        names = [value[0] for value in cursor.description]
+        return [dict(zip(names, row)) for row in cursor]
+
+    @_serialized
+    def task_digest(self, task):
+        media = self.get_media(task["media_id"])
+        for key in ("source", "playback"):
+            media.get(key, {}).pop("display_name", None)
+        template = self.conn.execute("SELECT body FROM templates WHERE id=? AND version=?", (task["template_id"], task["template_version"])).fetchone()
+        if template is None:
+            raise NotFound("TEMPLATE_NOT_FOUND", "Task template does not exist")
+        artifacts = []
+        if media.get("frame_map_artifact"):
+            row = self.conn.execute("SELECT id,sha256,size_bytes FROM artifacts WHERE id=?", (media["frame_map_artifact"],)).fetchone()
+            if row is None:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Task frame map is missing")
+            artifacts.append({"id": row[0], "sha256": row[1], "size_bytes": str(row[2])})
+        return S.sha256_text({"digest_version": "workspace-task-v1", "task": S.task_subject(task),
+                              "media": media, "template": json.loads(template[0]), "artifacts": artifacts})
+
+    # -- reads ---------------------------------------------------------------
+    @_serialized
+    def get_task(self, task_id: str) -> Dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT r.body FROM tasks t JOIN task_revisions r ON r.task_id=t.id AND r.revision=t.revision WHERE t.id=?",
+            (task_id,)).fetchone()
+        if row is None:
+            raise NotFound("TASK_NOT_FOUND", f"No such task {task_id}")
+        return json.loads(row[0])
+
+    @_serialized
+    def list_tasks(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute("SELECT id, media_id, revision FROM tasks").fetchall()
+        return [{"task_id": t, "media_id": m, "revision": r} for (t, m, r) in rows]
+
+    @_serialized
+    def get_media(self, media_id: str) -> Dict[str, Any]:
+        row = self.conn.execute("SELECT body FROM media WHERE id=?", (media_id,)).fetchone()
+        if row is None:
+            raise NotFound("MEDIA_NOT_FOUND", f"No such media {media_id}")
+        return json.loads(row[0])
+
+    @_serialized
+    def get_completion(self, intake_id: str) -> Optional[Dict[str, Any]]:
+        """Return the durable completion record of an admitted intake, if any."""
+        cursor = self.conn.execute("SELECT * FROM admission_completions WHERE intake_id=?", (intake_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        record = dict(zip([column[0] for column in cursor.description], row))
+        record["source_size"] = str(record["source_size"])
+        return record
+
+    @_serialized
+    def unbound_artifacts(self) -> Dict[str, Any]:
+        """Measure content-addressed objects no media record binds.
+
+        A crash between publishing objects and committing the admission leaves
+        such objects behind. They are immutable and harmless, but they must be
+        countable before anything is removed.
+        """
+        referenced = set()
+        for (body,) in self.conn.execute("SELECT value FROM meta WHERE key LIKE 'media_objects:%'"):
+            try:
+                bindings = json.loads(body)
+            except ValueError:
+                continue
+            if isinstance(bindings, dict):
+                for reference in bindings.values():
+                    if isinstance(reference, dict) and isinstance(reference.get("id"), str):
+                        referenced.add(reference["id"])
+        items = [{"id": ident, "relative_path": rel, "size_bytes": str(size)}
+                 for ident, rel, size in self.conn.execute(
+                     "SELECT id,rel_path,size_bytes FROM artifacts ORDER BY id")
+                 if ident not in referenced]
+        return {"count": len(items), "artifacts": items,
+                "total_bytes": str(sum(int(item["size_bytes"]) for item in items))}
+
+    def sweep_unbound_artifacts(self, *, apply: bool = False) -> Dict[str, Any]:
+        """Remove measured unbound objects, re-checking each one under the lock.
+
+        Dry run by default. A row is deleted only when it is still unbound at
+        deletion time, so a concurrent admission that just bound the object is
+        never damaged.
+        """
+        measured = self.unbound_artifacts()
+        if not apply:
+            return {**measured, "applied": False, "removed": 0}
+        removed = 0
+        with self._mutex, self.transaction() as conn:
+            for item in measured["artifacts"]:
+                referenced = False
+                for (body,) in conn.execute("SELECT value FROM meta WHERE key LIKE 'media_objects:%'"):
+                    try:
+                        bindings = json.loads(body)
+                    except ValueError:
+                        continue
+                    if isinstance(bindings, dict) and any(
+                            isinstance(reference, dict) and reference.get("id") == item["id"]
+                            for reference in bindings.values()):
+                        referenced = True
+                        break
+                if referenced:
+                    continue
+                conn.execute("DELETE FROM artifacts WHERE id=?", (item["id"],))
+                path = self.root / item["relative_path"]
+                _safe(path)
+                path.unlink(missing_ok=True)
+                removed += 1
+        return {**self.unbound_artifacts(), "applied": True, "removed": removed}
+
+    @_serialized
+    def get_snapshot(self) -> Dict[str, Any]:
+        media = [json.loads(r[0]) for r in self.conn.execute("SELECT body FROM media")]
+        templates = [json.loads(r[0]) for r in self.conn.execute("SELECT body FROM templates")]
+        tasks = []
+        for (tid,) in self.conn.execute("SELECT id FROM tasks ORDER BY rowid"):
+            tasks.append(self.get_task(tid))
+        revs = int(self.conn.execute("SELECT value FROM meta WHERE key='workspace_revision'").fetchone()[0])
+        from .queue import read_queue_snapshot
+        queue_snapshot = read_queue_snapshot(self)
+        return {
+            "kind": "traceannotate-workspace",
+            "schema_version": SCHEMA_VERSION,
+            "project_id": self._project_id(),
+            "workspace_revision": revs,
+            "media": media,
+            "templates": templates,
+            "tasks": tasks,
+            "evidence": [],
+            "reviews": [],
+            "batches": queue_snapshot["batches"],
+            "commits": [json.loads(r[0]) for r in self.conn.execute("SELECT body FROM durable_commits ORDER BY rowid")],
+            "artifacts": [{"id": r[0], "relative_path": r[1], "sha256": r[2], "size_bytes": str(r[3])}
+                          for r in self.conn.execute(
+                              "SELECT id,rel_path,sha256,size_bytes FROM artifacts")],
+        }
+
+    @_serialized
+    def _project_id(self) -> str:
+        row = self.conn.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
+        if row:
+            return row[0]
+        pid = S.make_id("proj", self.root.resolve().__str__() + "v3")
+        self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('project_id',?)", (pid,))
+        return pid
+
+    @_serialized
+    def get_command_receipt(self, command_id: str) -> Dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT task_id,state,response,request_sha256 FROM command_receipts WHERE command_id=?",
+            (command_id,)).fetchone()
+        if row is None:
+            raise NotFound("COMMAND_UNKNOWN", f"No command {command_id}")
+        return {"command_id": command_id, "task_id": row[0], "state": row[1],
+                "response": json.loads(row[2]) if row[2] else None,
+                "request_sha256": row[3]}
+
+    # -- writes ---------------------------------------------------------------
+    @_serialized
+    def apply_task_command(self, *, command_id: str, task_id: str, expected_revision: int,
+                           expected_sha256: str, operation: str, payload: Dict[str, Any],
+                           request_body: bytes) -> Dict[str, Any]:
+        S.require_id(command_id)
+        S.require_id(task_id)
+        S.require_hash(expected_sha256)
+        if type(expected_revision) is not int or not 0 <= expected_revision <= S.MAX_SAFE_INTEGER:
+            raise SchemaInvalid("SCHEMA_INVALID", "Expected revision must be a nonnegative safe integer")
+        if not isinstance(payload, dict) or not isinstance(request_body, bytes):
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid command payload")
+        request_sha = S.sha256_text({"task_id": task_id, "expected_revision": expected_revision,
+                                    "expected_sha256": expected_sha256, "operation": operation,
+                                    "payload": payload, "body_sha256": S.sha256_bytes(request_body)})
+        existing = self.conn.execute(
+            "SELECT state,response,request_sha256 FROM command_receipts WHERE command_id=?",
+            (command_id,)).fetchone()
+        if existing is not None:
+            if existing[2] != request_sha:
+                raise Conflict("IDEMPOTENCY_CONFLICT", "Same command_id with different request body")
+            resp = json.loads(existing[1]) if existing[1] else None
+            return {"applied": existing[0] == "committed", "idempotent_replay": True,
+                    "response": resp}
+        current = self.get_task(task_id)
+        current_rev = current["revision"]
+        if current_rev != expected_revision:
+            raise revision_conflict(expected_revision, current_rev)
+        if current["content_sha256"] != expected_sha256 or self.task_digest(current) != expected_sha256:
+            raise Conflict("MEDIA_CHANGED", "Task content hash mismatch",
+                           details={"expected_sha256": expected_sha256,
+                                    "current_sha256": current["content_sha256"]})
+        new_task = copy.deepcopy(current)
+        if operation == "revert_command":
+            if set(payload) != {"target_command_id"}:
+                raise SchemaInvalid("SCHEMA_INVALID", "History requires the original command id")
+            target_id = S.require_id(payload["target_command_id"])
+            target = self.get_command_receipt(target_id)
+            original = target.get("response") or {}
+            logical_head = current_rev
+            head_row = self.conn.execute("SELECT c.body FROM task_revisions r JOIN durable_commits c ON c.id=r.commit_id "
+                                         "WHERE r.task_id=? AND r.revision=?", (task_id, current_rev)).fetchone()
+            if head_row:
+                head_commit = json.loads(head_row[0])
+                if head_commit.get("operation") == "revert_command":
+                    logical_head = head_commit["history_parent_revision"]
+            if (target["task_id"] != task_id or target["state"] != "committed"
+                    or original.get("revision") not in {current_rev, logical_head}):
+                raise Conflict("HISTORY_DIVERGED", "Task changed after this command; history was not applied")
+            after_row = self.conn.execute("SELECT body FROM task_revisions WHERE task_id=? AND revision=?",
+                                         (task_id, original["revision"])).fetchone()
+            if after_row is None:
+                raise WorkspaceError("RECOVERY_REQUIRED", "History successor is missing")
+            after = json.loads(after_row[0])
+            if (after["content_sha256"] != original.get("content_sha256")
+                    or self._history_subject(after) != self._history_subject(current)):
+                raise Conflict("HISTORY_DIVERGED", "Task contents differ from the protected history successor")
+            before = self.conn.execute("SELECT body,content_sha256 FROM task_revisions WHERE task_id=? AND revision=?",
+                                       (task_id, original.get("previous_revision"))).fetchone()
+            if before is None:
+                raise WorkspaceError("RECOVERY_REQUIRED", "History revision is missing")
+            new_task = json.loads(before[0])
+            if (new_task.get("id") != task_id or new_task.get("revision") != original.get("previous_revision")
+                    or new_task.get("content_sha256") != before[1] or self.task_digest(new_task) != before[1]):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Historical revision identity or digest is corrupt")
+        elif operation == "import_temporal":
+            from .legacy_adapter import validate_temporal_import_payload
+            validate_temporal_import_payload(payload, self.get_media(current["media_id"]))
+            if set(payload) != {"annotations", "legacy_document_metadata", "legacy_document_envelope"}:
+                raise SchemaInvalid("SCHEMA_INVALID", "Invalid temporal import envelope")
+            if not isinstance(payload["legacy_document_metadata"], dict) or not isinstance(payload["legacy_document_envelope"], dict):
+                raise SchemaInvalid("SCHEMA_INVALID", "Temporal metadata must be an object")
+            new_task["annotations"] = self._apply_operation(
+                copy.deepcopy(current["annotations"]), "replace_annotations", {"annotations": payload["annotations"]})
+            new_task["legacy_document_metadata"] = copy.deepcopy(payload["legacy_document_metadata"])
+            new_task.setdefault("extensions", {})["temporal_source"] = copy.deepcopy(payload["legacy_document_envelope"])
+        elif operation == "review_annotation":
+            if set(payload) != {"annotation_id", "reviewed"} or type(payload["reviewed"]) is not bool:
+                raise SchemaInvalid("SCHEMA_INVALID", "Review requires annotation_id and a boolean")
+            S.require_id(payload["annotation_id"], "annotation_id")
+            if not any(a["id"] == payload["annotation_id"] for a in new_task["annotations"]):
+                raise NotFound("ANNOTATION_NOT_FOUND", "Annotation to review is missing")
+        else:
+            new_task["annotations"] = self._apply_operation(copy.deepcopy(current["annotations"]), operation, payload)
+        new_task["revision"] = current_rev + 1
+        template = next(value for value in self.list_templates() if value["id"] == current["template_id"] and value["version"] == current["template_version"])
+        for annotation in new_task["annotations"]:
+            self._validate_annotation(annotation, self.get_media(current["media_id"]), template)
+        previous = {a["id"]: a for a in current["annotations"]}
+        for annotation in new_task["annotations"]:
+            prior = previous.get(annotation["id"])
+            subject = self.annotation_review_digest(annotation, new_task)
+            # Review is a separate explicit action. Normal commands cannot forge,
+            # inherit or resurrect a review by carrying a stale reviewed flag.
+            valid = (annotation.get("review_status") == "reviewed"
+                     and prior is not None and prior.get("review_status") == "reviewed"
+                     and isinstance(prior.get("review_binding"), dict)
+                     and prior["review_binding"].get("content_sha256") == subject)
+            annotation.pop("review_binding", None)
+            annotation["review_status"] = "reviewed" if valid else "unreviewed"
+            if valid:
+                annotation["review_binding"] = copy.deepcopy(prior["review_binding"])
+            if operation == "review_annotation" and annotation["id"] == payload["annotation_id"]:
+                annotation["review_status"] = "reviewed" if payload["reviewed"] else "unreviewed"
+                annotation.pop("review_binding", None)
+                if payload["reviewed"]:
+                    annotation["review_binding"] = {"content_sha256": subject, "actor_id": "local-user",
+                                                   "command_id": command_id, "reviewed_at": _now(),
+                                                   "task_revision": new_task["revision"]}
+        new_task["content_sha256"] = self.task_digest(new_task)
+        new_rev_id = S.make_id("rev", task_id + str(new_task["revision"]))
+        commit_id = S.make_id("cmt", command_id)
+        response = {
+            "command_id": command_id, "applied": True, "task_id": task_id,
+            "previous_revision": current_rev, "revision": new_task["revision"],
+            "content_sha256": new_task["content_sha256"], "commit_id": commit_id,
+        }
+        ts = _now()
+        with self.transaction():
+            self.conn.execute("UPDATE tasks SET revision=? WHERE id=?",
+                              (new_task["revision"], task_id))
+            self.conn.execute(
+                "INSERT INTO task_revisions(id,task_id,revision,body,content_sha256,commit_id,created_at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (new_rev_id, task_id, new_task["revision"],
+                 json.dumps(new_task, ensure_ascii=False), new_task["content_sha256"], commit_id, ts))
+            self.conn.execute(
+                "INSERT INTO durable_commits(id,body) VALUES(?,?)",
+                (commit_id, json.dumps({"id": commit_id, "task_id": task_id,
+                                        "revision": new_task["revision"], "operation": operation,
+                                        **({"history_parent_revision": original["previous_revision"],
+                                            "target_command_id": target_id} if operation == "revert_command" else {})}, ensure_ascii=False)))
+            self.conn.execute(
+                "INSERT INTO command_receipts(command_id,task_id,request_sha256,state,response,created_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (command_id, task_id, request_sha, "committed",
+                 json.dumps(response, ensure_ascii=False), ts))
+        return {"applied": True, "idempotent_replay": False, "response": response}
+
+    @staticmethod
+    def _history_subject(task):
+        subject = copy.deepcopy(S.task_subject(task))
+        subject.pop("revision")
+        for annotation in subject["annotations"]:
+            annotation.pop("review_status", None)
+            annotation.pop("review_binding", None)
+        return subject
+
+    @staticmethod
+    def annotation_review_digest(annotation, task):
+        subject = {key: value for key, value in annotation.items()
+                   if key not in {"review_status", "review_binding"}}
+        return S.sha256_text({"annotation": subject, "media_id": task["media_id"],
+                              "template_id": task["template_id"], "template_version": task["template_version"]})
+
+    def _apply_operation(self, annotations: List[Dict[str, Any]], operation: str,
+                         payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        required = {
+            "add_annotation": {"annotation"},
+            "update_annotation": {"annotation_id", "changes"},
+            "delete_annotation": {"annotation_id"},
+            "replace_annotations": {"annotations"},
+        }
+        if operation not in required:
+            raise SchemaInvalid("UNSUPPORTED_OPERATION", "Unsupported annotation operation")
+        if set(payload) != required[operation]:
+            raise SchemaInvalid("SCHEMA_INVALID", "Operation payload has missing or unknown fields")
+        if operation == "add_annotation":
+            if not isinstance(payload["annotation"], dict):
+                raise SchemaInvalid("SCHEMA_INVALID", "Annotation must be an object")
+            ann = dict(payload["annotation"])
+            ann["id"] = S.require_id(ann.get("id"), "annotation.id")
+            if any(a["id"] == ann["id"] for a in annotations):
+                raise Conflict("ID_EXISTS", f"Annotation {ann['id']} already exists")
+            annotations.append(ann)
+        elif operation == "replace_annotations":
+            new_list = payload["annotations"]
+            if not isinstance(new_list, list):
+                raise SchemaInvalid("SCHEMA_INVALID", "Annotations must be a list")
+            seen_ids = set()
+            for item in new_list:
+                if not isinstance(item, dict):
+                    raise SchemaInvalid("SCHEMA_INVALID", "Annotation must be an object")
+                aid = S.require_id(item.get("id"), "annotation.id")
+                if aid in seen_ids:
+                    raise Conflict("ID_EXISTS", f"Duplicate annotation id {aid}")
+                seen_ids.add(aid)
+            annotations = [dict(a) for a in new_list]
+        elif operation == "update_annotation":
+            aid = payload["annotation_id"]
+            changes = payload["changes"]
+            if not isinstance(changes, dict):
+                raise SchemaInvalid("SCHEMA_INVALID", "Changes must be an object")
+            found = False
+            for a in annotations:
+                if a["id"] == aid:
+                    found = True
+                    for k, v in changes.items():
+                        if k in ("id", "type"):
+                            raise SchemaInvalid("INVALID_CHANGE", f"Cannot change {k}")
+                        a[k] = v
+            if not found:
+                raise NotFound("ANNOTATION_NOT_FOUND", f"No annotation {aid}")
+        elif operation == "delete_annotation":
+            aid = payload["annotation_id"]
+            before = len(annotations)
+            annotations = [a for a in annotations if a["id"] != aid]
+            if len(annotations) == before:
+                raise NotFound("ANNOTATION_NOT_FOUND", f"No annotation {aid}")
+        else:
+            raise SchemaInvalid("UNSUPPORTED_OPERATION", f"Unknown operation {operation}")
+        return annotations
+
+    def _validate_annotation(self, ann, media, template):
+        allowed = {"id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids", "provenance", "start", "end", "at", "legacy_id", "review_status", "review_binding"}
+        if set(ann) - allowed:
+            raise SchemaInvalid("SCHEMA_INVALID", "Annotation contains unknown fields")
+        S.require_id(ann.get("id"))
+        kind = ann.get("type")
+        if kind not in template["annotation_types"] or kind not in ("whole_clip", "event", "segment"):
+            raise SchemaInvalid("SCHEMA_INVALID", "Unsupported annotation type")
+        if not isinstance(ann.get("label"), str) or not ann["label"]:
+            raise SchemaInvalid("SCHEMA_INVALID", "Annotation requires a nonempty label")
+        if template["labels"] and ann["label"] not in template["labels"]:
+            raise SchemaInvalid("SCHEMA_INVALID", "Label is not in this template")
+        ann.setdefault("text", "")
+        ann.setdefault("tags", [])
+        ann.setdefault("track", "main")
+        ann.setdefault("attributes", {})
+        ann.setdefault("evidence_ids", [])
+        ann.setdefault("provenance", {"origin": "manual", "actor_id": "user", "job_id": None})
+        if not isinstance(ann["text"], str) or not isinstance(ann["track"], str) or not ann["track"]:
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid text or track")
+        if not isinstance(ann["tags"], list) or any(not isinstance(tag, str) for tag in ann["tags"]):
+            raise SchemaInvalid("SCHEMA_INVALID", "Tags must be strings")
+        ann.setdefault("review_status", "unreviewed")
+        if ann["review_status"] not in {"unreviewed", "reviewed"}:
+            raise SchemaInvalid("SCHEMA_INVALID", "review_status must be 'unreviewed' or 'reviewed'")
+        if "legacy_id" in ann and (not isinstance(ann["legacy_id"], str) or not ann["legacy_id"].strip()):
+            raise SchemaInvalid("SCHEMA_INVALID", "legacy_id must be a nonempty string")
+        if ann["evidence_ids"] != [] or ann["attributes"] != {}:
+            raise SchemaInvalid("UNSUPPORTED_OPERATION", "Evidence and custom attributes need their own admission workflow")
+        provenance = ann["provenance"]
+        if (not isinstance(provenance, dict) or set(provenance) != {"origin", "actor_id", "job_id"}
+                or provenance["origin"] != "manual" or provenance["job_id"] is not None):
+            raise SchemaInvalid("SCHEMA_INVALID", "Manual commands require manual provenance")
+        S.require_id(provenance.get("actor_id"))
+        times = {"whole_clip": set(), "event": {"at"}, "segment": {"start", "end"}}[kind]
+        if {"start", "end", "at"}.intersection(ann) != times:
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid time fields for this annotation type")
+        values = {}
+        duration = S.rational_value(media["duration"])
+        for key in times:
+            value = ann[key]
+            if not isinstance(value, dict) or set(value) not in ({"seconds"}, {"seconds", "anchor"}):
+                raise SchemaInvalid("SCHEMA_INVALID", "Time requires seconds and an optional mapped frame anchor")
+            if not isinstance(value["seconds"], dict):
+                raise SchemaInvalid("INVALID_RATIONAL", "Time must be an n/d object with decimal strings")
+            reduced = S.rational(value["seconds"])
+            if reduced != value["seconds"]:
+                raise SchemaInvalid("INVALID_RATIONAL", "Time must be reduced")
+            values[key] = S.rational_value(reduced)
+            if values[key] < 0 or values[key] > duration or (key != "end" and values[key] == duration):
+                raise SchemaInvalid("SCHEMA_INVALID", "Annotation time is outside media duration")
+            if "anchor" in value:
+                from .frames import validate_anchor
+                validate_anchor(self, media, value)
+        if kind == "segment" and values["start"] >= values["end"]:
+            raise SchemaInvalid("SCHEMA_INVALID", "Segment start must precede end")
+
+    def export_snapshot(self, export_name=None):
+        name = _new_id("exp") if export_name is None else S.require_id(export_name, "export_name")
+        _safe(self.exports_dir)
+        _safe(self.tmp_dir)
+        target = self.exports_dir / f"{name}.json"
+        _safe(target)
+        data = S.canonical_json(self.get_snapshot())
+        handle, temporary = tempfile.mkstemp(dir=self.tmp_dir, suffix=".export.part")
+        temporary = Path(temporary)
+        try:
+            with os.fdopen(handle, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            try:
+                os.link(temporary, target)
+            except FileExistsError as exc:
+                raise Conflict("EXPORT_EXISTS", "Export already exists; choose a new name") from exc
+            _sync_directory(self.exports_dir)
+            return target
+        finally:
+            temporary.unlink(missing_ok=True)

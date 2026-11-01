@@ -3,7 +3,9 @@
 The snapshot contains SQLite and every registered immutable object, not arbitrary
 exports/logs/tmp files or external original media. Active intakes and nonterminal
 queue jobs are refused: this API never restarts a job, lease or pending command.
-It performs no storage/digest migration and never overwrites an existing target.
+It never overwrites a target or changes a source snapshot. Opening a recovered
+legacy v1 copy atomically upgrades only its additive storage ownership schema to
+v2; task schema/digests and business history remain unchanged.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import uuid
 
 from . import schema as S
 from .errors import Conflict, WorkspaceError
+from .artifact_refs import collect_artifact_references
 from .store import (DB_FILE, STORAGE_VERSION, SCHEMA_VERSION, WorkspaceStore,
                     _safe, _sync_directory)
 
@@ -96,6 +99,8 @@ def _quiescent(connection: sqlite3.Connection) -> None:
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if not {"meta", "artifacts", "tasks", "task_revisions", "command_receipts", "intakes"} <= tables:
         _fail("BACKUP_INCOMPLETE", "Workspace tables are missing")
+    if "artifact_gc_pending" in tables and connection.execute("SELECT 1 FROM artifact_gc_pending LIMIT 1").fetchone():
+        raise Conflict("GC_RECOVERY_REQUIRED", "Complete interrupted artifact cleanup before backup")
     if connection.execute("SELECT 1 FROM intakes WHERE state NOT IN ('succeeded','failed','cancelled') LIMIT 1").fetchone():
         raise Conflict("BACKUP_ACTIVE_WORK", "Finish or cancel media admission before taking a snapshot")
     queue_tables = {"batches", "jobs", "batch_jobs", "attempts", "job_commits"}
@@ -201,7 +206,7 @@ def _inspect(connection: sqlite3.Connection) -> Dict[str, Any]:
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         _fail("BACKUP_INTEGRITY_FAILED", "Snapshot database references are inconsistent")
     meta = dict(connection.execute("SELECT key,value FROM meta"))
-    if (meta.get("storage_version") != STORAGE_VERSION
+    if (meta.get("storage_version") not in {"1", STORAGE_VERSION}
             or meta.get("schema_version") != str(SCHEMA_VERSION)
             or meta.get("digest_version") != "workspace-task-v1"):
         _fail("UNSUPPORTED_BACKUP_VERSION", "Snapshot needs an explicit supported migration")
@@ -209,6 +214,9 @@ def _inspect(connection: sqlite3.Connection) -> Dict[str, Any]:
     revision = meta.get("workspace_revision")
     if not isinstance(revision, str) or not revision.isdecimal():
         _fail("BACKUP_INTEGRITY_FAILED", "Snapshot revision metadata is invalid")
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if meta["storage_version"] == STORAGE_VERSION and not {"artifact_references", "artifact_gc_pending"} <= tables:
+        _fail("BACKUP_INTEGRITY_FAILED", "Version2 snapshot is missing artifact ownership tables")
     _quiescent(connection)
     artifacts = []
     for ident, relative, digest, size in connection.execute(
@@ -219,8 +227,12 @@ def _inspect(connection: sqlite3.Connection) -> Dict[str, Any]:
             _fail("BACKUP_INTEGRITY_FAILED", "Snapshot artifact identity is invalid")
         artifacts.append({"id": ident, "relative_path": relative,
                           "sha256": digest, "size_bytes": str(size)})
+    try:
+        references = collect_artifact_references(connection)
+    except WorkspaceError as exc:
+        raise WorkspaceError("BACKUP_INTEGRITY_FAILED", "Snapshot artifact reference closure is invalid") from exc
     return {"metadata": {key: meta[key] for key in _META_KEYS}, "artifacts": artifacts,
-            "retryable_sources": _retryable_sources(connection)}
+            "artifact_references": references, "retryable_sources": _retryable_sources(connection)}
 
 
 def _write_manifest(path: Path, value: Dict[str, Any]) -> None:
@@ -334,12 +346,21 @@ def _load_backup(root: Path) -> Tuple[Dict[str, Any], str]:
         connection = sqlite3.connect(uri, uri=True, isolation_level=None)
         try:
             description = _inspect(connection)
+            legacy_references = not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_references'").fetchone()
         finally:
             connection.close()
     except sqlite3.DatabaseError as exc:
         raise WorkspaceError("BACKUP_INTEGRITY_FAILED", "Snapshot database cannot be read") from exc
     if description["metadata"] != manifest.get("metadata") or description["artifacts"] != manifest.get("artifacts"):
         _fail("BACKUP_INTEGRITY_FAILED", "Manifest differs from its database object closure")
+    if ("artifact_references" not in manifest and legacy_references
+            and description["metadata"]["storage_version"] == "1"):
+        # Supported older snapshots had authoritative media/queue owners but
+        # no explicit pin table or closure field. Infer, do not mutate them.
+        manifest["artifact_references"] = description["artifact_references"]
+    if manifest.get("artifact_references") != description["artifact_references"]:
+        _fail("BACKUP_INTEGRITY_FAILED", "Manifest differs from its artifact reference closure")
     declarations = manifest.get("retryable_sources", [])
     _compare_retryable_closure(declarations, description["retryable_sources"])
     for source in declarations:
@@ -384,7 +405,11 @@ def restore_workspace(backup: Path, target: Path) -> Dict[str, Any]:
         recovered.open()
         with recovered._mutex:
             description = _inspect(recovered.conn)
-        if description["metadata"] != manifest["metadata"] or description["artifacts"] != manifest["artifacts"]:
+        expected_metadata = dict(manifest["metadata"])
+        if expected_metadata["storage_version"] == "1":
+            expected_metadata["storage_version"] = STORAGE_VERSION
+        if (description["metadata"] != expected_metadata or description["artifacts"] != manifest["artifacts"]
+                or description["artifact_references"] != manifest["artifact_references"]):
             _fail("BACKUP_INTEGRITY_FAILED", "Opening the recovered project changed its snapshot identity")
         try:
             _compare_retryable_closure(description["retryable_sources"],
@@ -401,6 +426,9 @@ def restore_workspace(backup: Path, target: Path) -> Dict[str, Any]:
                "source_backup_manifest_sha256": manifest_sha256,
                "source_database_sha256": manifest["database"]["sha256"],
                "restored_database": _fingerprint(output / DB_FILE),
+               "storage_migration": {"source_version": manifest["metadata"]["storage_version"],
+                                     "restored_version": STORAGE_VERSION,
+                                     "source_backup_modified": False},
                "jobs_restarted": False, "commands_replayed": False}
     _write_manifest(output / RESTORE_MANIFEST, receipt)
     return receipt

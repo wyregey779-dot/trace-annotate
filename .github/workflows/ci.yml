@@ -33,6 +33,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Set up Node for cross-runtime JSON regression tests
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+
       - name: Install verified media toolchain on Linux
         if: runner.os == 'Linux'
         run: python .github/scripts/install_ci_media.py
@@ -117,6 +122,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set up Node for editor state regressions
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+
+      - name: Check draft recovery and timeline layout without a browser
+        run: node --test tests/temporal_draft_recovery.test.mjs tests/workspace_draft_recovery.test.mjs tests/workspace_timeline_layout.test.mjs tests/workspace_analysis_ui.test.mjs tests/workspace_render_ui.test.mjs
+
       - name: Install synthetic media and browser test dependencies
         run: |
           sudo apt-get update
@@ -148,6 +161,12 @@ jobs:
       - name: Verify persistent multi-video workspace and displayed frame identity
         run: python scripts/check_workspace_editor.py --output output/workspace-editor-ci
 
+      - name: Verify objective analysis candidate, explicit save and professional download
+        run: python scripts/check_workspace_analysis.py --output output/workspace-analysis-ci
+
+      - name: Verify annotation previews, frozen video downloads and cancel/resume
+        run: python scripts/check_workspace_render.py --output output/workspace-render-ci
+
       - name: Verify intake cancel/retry buttons post JSON command receipts
         run: python scripts/check_workspace_intake_controls.py --output output/intake-controls-ci
 
@@ -175,6 +194,8 @@ jobs:
           candidate_wheels=(output/workspace-dist/*.whl)
           test "${#candidate_wheels[@]}" -eq 1
           "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_editor.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-workspace-ci
+          "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_analysis.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-analysis-ci
+          "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_render.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-render-ci
           "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_enhanced_editor.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-enhanced-ci
           "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_intake_controls.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-intake-controls-ci
           "${{ runner.temp }}/workspace-wheel-env/bin/python" -I scripts/check_workspace_batch_upload.py --installed-wheel "${candidate_wheels[0]}" --output output/installed-batch-upload-ci
@@ -192,10 +213,14 @@ jobs:
             output/prepared-editor-ci
             output/embodied-editor-ci
             output/workspace-editor-ci
+            output/workspace-analysis-ci
+            output/workspace-render-ci
             output/intake-controls-ci
             output/batch-upload-ci
             output/enhanced-editor-ci
             output/installed-workspace-ci
+            output/installed-analysis-ci
+            output/installed-render-ci
             output/installed-enhanced-ci
             output/installed-intake-controls-ci
             output/installed-batch-upload-ci

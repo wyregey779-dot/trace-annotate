@@ -67,4 +67,4 @@ where = ["."]
 include = ["trace_annotate*"]
 
 [tool.setuptools.package-data]
-trace_annotate = ["templates/*.json", "templates/*.xml", "embodied/ui/*.html", "temporal/ui/*.html", "temporal/ui/*.js", "temporal/ui/*.txt"]
+trace_annotate = ["templates/*.json", "templates/*.xml", "embodied/ui/*.html", "temporal/ui/*.html", "temporal/ui/*.js", "temporal/ui/*.txt", "workspace/fonts/*.otf", "workspace/fonts/*.txt", "workspace/fonts/*.json", "workspace/fonts/*.md"]
