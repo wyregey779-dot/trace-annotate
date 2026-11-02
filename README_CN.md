@@ -13,9 +13,31 @@ TraceAnnotate 提供本地媒体复核与视频时序标注。开发版新增通
 
 工作台还支持导出带标注的视频：保留完整画面，在上下左右添加黑底白字面板，自定义字号、字段和轨道。先预览精确帧，再下载验证后的视频及同一修订的 JSON。请按[工作台入口与操作顺序](docs/PROFESSIONAL_JSON.md#open-the-workspace)启动；原有普通视频和具身标注入口继续保留。
 
-![使用合成操作视频的实际具身标注界面](docs/media/embodied-editor.png)
+## 试用多视频工作台
 
-[实际界面、质检截图与 12 秒浏览器操作录屏](docs/DEMO_MEDIA.md)展示当前开发版流程。录屏使用合成素材与明确指定的测试标签，不代表真实视频语义准确率。
+当前 `main` 分支包含试验性的 `1.1.0.dev0` 工作台；已发布的 `v1.0.2` 不包含这一功能。请准备 Python 3.9 或更新版本，并将 FFmpeg 6 或更新版本及 ffprobe 加入 `PATH`，然后运行：
+
+```bash
+git clone https://github.com/wyregey779-dot/trace-annotate.git
+cd trace-annotate
+python -m venv .venv
+```
+
+PowerShell 使用 `.venv\Scripts\Activate.ps1` 激活环境，Linux/macOS 使用 `source .venv/bin/activate`。在源码目录之外、支持硬链接的本地文件系统上选择新的项目目录，执行：
+
+```bash
+python -m pip install -e ".[dev]"
+trace-annotate workspace init --project ../traceannotate-workspace
+trace-annotate workspace serve --project ../traceannotate-workspace
+```
+
+打开命令输出的本地网址，选择视频，等待导入完成后，在各自任务中创建并保存标注。工作台支持选择解码帧、重叠多轨、专业 JSON 和可选的带标注视频导出；后续使用同一个项目目录继续工作。请保留原片和经验证的项目备份：JSON 导出不包含完整媒体及全部历史工件。详见[工作台指南](docs/WORKSPACE_DEVELOPMENT.md)和[专业 JSON 指南](docs/PROFESSIONAL_JSON.md)。
+
+![使用合成视频和测试标签的多视频工作台](docs/media/workspace-synthetic.png)
+
+截图来自实际浏览器，使用合成测试视频和测试标签；图中分析结果仍是候选，尚未保存为报告。
+
+原有 `video-ui` 和 `embodied-ui` 仍是独立流程，其文件和工作台任务不会自动互通。工作台不会自动识别视频内容、跟踪对象或证明标注语义正确。
 
 ## 普通视频片段标注（开发版）
 
@@ -30,7 +52,7 @@ trace-annotate video-export examples/annotations/general-video.json --format srt
 
 选择本地视频后，可以创建片段、修改时间和标签、按轨道组织事件，并下载 JSON 供下次继续编辑。多个事件可以同时发生，不会被自动解释为工作段或判定对错。JSON 是完整主文件；CSV、SRT 和 WebVTT 是表格或字幕投影，不能完整保留所有字段。新命令拒绝覆盖已有输出。详见[通用视频标注指南](docs/GENERAL_VIDEO_ANNOTATION.md)，包含字幕导入、草稿恢复、格式限制与后续框选/跟踪计划。
 
-新页面使用 v2 文档，把标注和草稿绑定到完整媒体 SHA-256；后台 Worker 本地分块计算，可以取消。同名、同大小、同时长但内容不同的视频会被拒绝。旧 v1 文档需确认迁移并重新复核；同内容改名后可重新关联。命令行提供 `video-hash` 与 `video-bind`。页面分别显示呈现帧时间戳和秒级播放位置，准确逐帧导航仍待实现。
+新页面使用 v2 文档，把标注和草稿绑定到完整媒体 SHA-256；后台 Worker 本地分块计算，可以取消。同名、同大小、同时长但内容不同的视频会被拒绝。旧 v1 文档需确认迁移并重新复核；同内容改名后可重新关联。命令行提供 `video-hash` 与 `video-bind`。独立的 `video-ui` 页面分别显示呈现帧时间戳和秒级播放位置，该页面的准确逐帧导航仍待实现。
 
 浏览器不能直接播放 ProRes、AVI、TS 或其他本地格式时，使用 `video-open 原片 -o 新项目目录`。它调用本机 FFmpeg/ffprobe 准备 H.264/AAC 兼容副本，逐帧核对时间对应、保留原片身份与音轨偏移，再自动打开编辑器。继续编辑使用 `video-ui --project 项目目录` 并导入上次下载的 JSON。HDR 预览需显式添加 `--tone-map-hdr`；损坏、加密或无法可靠解码的文件会明确失败。详见[跨格式兼容指南](docs/MEDIA_COMPATIBILITY.md)。
 
@@ -91,6 +113,10 @@ trace-annotate --help
 参与开发时，在源码目录执行 `python -m pip install -e ".[dev]"`，具体流程见[贡献指南](CONTRIBUTING.md)。
 
 ## 标注和复核自己的视频
+
+![使用合成操作视频的实际具身标注界面](docs/media/embodied-editor.png)
+
+[具身标注界面、质检截图与 12 秒浏览器操作录屏](docs/DEMO_MEDIA.md)展示独立的具身流程，并非新版工作台截图。录屏使用合成素材与明确指定的测试标签，不代表真实视频语义准确率。
 
 ```bash
 trace-annotate embodied-ui

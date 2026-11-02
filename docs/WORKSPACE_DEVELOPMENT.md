@@ -1,7 +1,7 @@
 # Persistent workspace development slice
 
-This is part of `1.1.0.dev0`, on `feat/general-video-annotation`. It is not a
-finished batch annotation product or a release candidate. `workspace serve`
+This is part of the `1.1.0.dev0` development code on `main`. It is not included
+in the `v1.0.2` release or a finished batch annotation product. `workspace serve`
 opens the persistent multi-video segment editor. The existing `video-ui` and
 embodied editor remain separate, compatible annotation interfaces.
 
@@ -146,13 +146,15 @@ After initializing a new workspace, run:
 trace-annotate workspace serve --project D:\TraceAnnotateProjects\sample
 ```
 
-Select multiple files in the workbench. Each selected file is uploaded and
-fully prepared in order; a rejected file does not stop unrelated files. The
-development upload limit is 512 MiB per file. Preparation is synchronous per
-file, not the complete durable asynchronous intake protocol. Interrupted uploads
-are not admitted; completed but invalid media stays in the intake error ledger.
-If the connection is lost during admission, refresh the task/intake list before
-retrying: an import does not have the task command's idempotency guarantee.
+Select multiple files in the workbench. Upload and media preparation are separate:
+received files enter a persistent intake queue and are prepared in the background,
+with at most one active preparation per workspace. A rejected file does not stop
+unrelated files. The development upload limit is 512 MiB per file. The interface
+provides stop-upload and individual cancel/retry controls; their outcome depends
+on the current intake state. Interrupted uploads are not admitted; failed or
+interrupted preparation is recorded for explicit review or retry. If the connection
+is lost, refresh the task/intake list and reconcile its state before retrying;
+do not assume an unknown request failed or blindly submit a duplicate.
 
 Select a task, enter a label and interval, then save. An unchanged time field
 retains its original rational value and frame anchor. Editing a time manually

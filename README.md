@@ -13,9 +13,31 @@ The experimental workspace also supports [professional JSON exchange and objecti
 
 Its annotated-video export adds a configurable black panel with white text above, below or beside the complete image. Preview an exact frame, choose font sizes, fields and tracks, then download the verified video and its matching frozen JSON. Use the [workspace workflow](docs/PROFESSIONAL_JSON.md#open-the-workspace) for these features.
 
-![Actual embodied editor, using a synthetic operation fixture](docs/media/embodied-editor.png)
+## Try the multi-video workspace
 
-[Actual editor/QC screenshots and a 12-second browser recording](docs/DEMO_MEDIA.md) show the development workflow. The recording uses synthetic media and explicit scripted labels; it does not establish video semantic accuracy.
+The current `main` branch contains the experimental `1.1.0.dev0` workspace. It is not part of the latest published release, `v1.0.2`. Install Python 3.9 or newer and put FFmpeg 6 or newer and ffprobe on `PATH`, then run:
+
+```bash
+git clone https://github.com/wyregey779-dot/trace-annotate.git
+cd trace-annotate
+python -m venv .venv
+```
+
+Activate the environment with `.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` on Linux/macOS. Choose a new project directory outside the source checkout, on a local filesystem that supports hard links, and run:
+
+```bash
+python -m pip install -e ".[dev]"
+trace-annotate workspace init --project ../traceannotate-workspace
+trace-annotate workspace serve --project ../traceannotate-workspace
+```
+
+Open the local URL printed by the server. Select videos, wait for admission, then create and save annotations in separate tasks. The workspace supports decoded-frame selection, overlapping tracks, professional JSON and optional annotated-video export. Reuse the project directory to resume saved work. Keep the original videos and a verified project backup; a JSON export is not a complete backup of media or historical artifacts. See the [workspace guide](docs/WORKSPACE_DEVELOPMENT.md) and [professional JSON guide](docs/PROFESSIONAL_JSON.md).
+
+![Workspace editor showing a synthetic video and a saved segment](docs/media/workspace-synthetic.png)
+
+An actual browser screenshot using a synthetic test video and test labels. The analysis result shown is a candidate and has not yet been saved as a report. The workspace interface is currently in Chinese.
+
+The older `video-ui` and `embodied-ui` editors remain available as separate workflows; their files and workspace tasks are not automatically shared. The workspace does not automatically identify video content, track objects or certify annotation quality.
 
 ## General video annotation (development version)
 
@@ -30,11 +52,11 @@ trace-annotate video-export examples/annotations/general-video.json --format srt
 
 Open a local video, mark and edit segments, and download native JSON to resume later. Events can overlap without being interpreted as working/idle or correct/incorrect. CSV, SRT and WebVTT are projections; retain JSON for IDs, tags, tracks, review state and metadata. Outputs from the new CLI commands must use new filenames. See [the general video guide](docs/GENERAL_VIDEO_ANNOTATION.md) for importing subtitles, recovery, format boundaries and the planned spatial annotation work.
 
-New browser documents use schema v2 and bind annotations/drafts to the full media SHA-256, computed locally in a cancellable background Worker. Different content with matching filenames, sizes and durations is rejected. Legacy v1 imports require explicit migration and renewed review; verified content can be relinked after a rename. `video-hash` and `video-bind` expose hashing/binding in the CLI. Presented-frame timestamps are displayed separately from seek time; frame-accurate navigation remains planned.
+New browser documents use schema v2 and bind annotations/drafts to the full media SHA-256, computed locally in a cancellable background Worker. Different content with matching filenames, sizes and durations is rejected. Legacy v1 imports require explicit migration and renewed review; verified content can be relinked after a rename. `video-hash` and `video-bind` expose hashing/binding in the CLI. In the separate `video-ui` editor, presented-frame timestamps are displayed separately from seek time; frame-accurate navigation there remains planned.
 
 For local formats the browser cannot play directly, use `video-open SOURCE -o NEW_PROJECT`. Local FFmpeg/ffprobe create an H.264/AAC playback copy, verify decoded frame correspondence and audio offsets, retain source identity, and open the editor through a read-only loopback server. Resume with `video-ui --project PROJECT` and import your downloaded JSON. HDR previews require explicit `--tone-map-hdr`; corrupt, encrypted or unverifiable inputs fail clearly. See the [media compatibility guide](docs/MEDIA_COMPATIBILITY.md).
 
-The feature branch also contains a [persistent multi-video workspace](docs/WORKSPACE_DEVELOPMENT.md). Run `workspace init --project NEW_DIRECTORY`, then `workspace serve --project NEW_DIRECTORY` to import multiple videos, edit and save manual segments, select exact decoded frames, reopen saved tasks and download a development snapshot. Revisions and task conflicts are checked on the server. Its `verify-media` batch processor checks media integrity; it does not infer video labels. Bulk edits, review/evidence workflows and portable project import remain under development.
+The [persistent multi-video workspace](docs/WORKSPACE_DEVELOPMENT.md) also provides server-side revision and conflict checks. Its `verify-media` batch processor checks media integrity; it does not infer video labels. Bulk edits, evidence workflows and portable project import remain under development.
 
 ## Start with a complete example
 
@@ -93,6 +115,10 @@ Core timeline processing runs locally without an OpenAI API key. Installation an
 For development, install `python -m pip install -e ".[dev]"` from a source checkout and follow [CONTRIBUTING](CONTRIBUTING.md).
 
 ## Annotate and review your own video
+
+![Actual embodied editor, using a synthetic operation fixture](docs/media/embodied-editor.png)
+
+[Embodied editor/QC screenshots and a 12-second browser recording](docs/DEMO_MEDIA.md) show this separate embodied workflow, not the newer workspace. The recording uses synthetic media and explicit scripted labels; it does not establish video semantic accuracy.
 
 ```bash
 trace-annotate embodied-ui
