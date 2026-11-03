@@ -7,6 +7,9 @@
 
 [English](README.md) · [中文说明](README_CN.md) · [快速上手](docs/QUICKSTART.md) · [版本发布](https://github.com/wyregey779-dot/trace-annotate/releases)
 
+当前预览版：[v1.1.0.dev1](https://github.com/wyregey779-dot/trace-annotate/releases/tag/v1.1.0.dev1)，包含多视频工作台、专业 JSON 与带标注视频导出。
+最新稳定版仍为 [v1.0.2](https://github.com/wyregey779-dot/trace-annotate/releases/tag/v1.0.2)。
+
 TraceAnnotate 提供本地媒体复核与视频时序标注。开发版新增通用片段模式，支持自由事件标签、文字描述、标签词、多轨道与重叠事件；具身流程继续提供 working/idle、步骤检查与对错判定。Python 库还提供媒体分批暂存、字段来源记录与资产复核辅助功能。
 
 试验工作台新增[专业 JSON 交换与客观媒体分析](docs/PROFESSIONAL_JSON.md)：导出完整当前标注、精确帧锚和已有报告，历史文件需保留项目备份。后台分析明确区分播放代理与原片，结果确认保存后才进入标注修订；测量不会自动证明内容准确或完成声音听审。
@@ -15,7 +18,7 @@ TraceAnnotate 提供本地媒体复核与视频时序标注。开发版新增通
 
 ## 试用多视频工作台
 
-当前 `main` 分支包含试验性的 `1.1.0.dev0` 工作台；已发布的 `v1.0.2` 不包含这一功能。请准备 Python 3.9 或更新版本，并将 FFmpeg 6 或更新版本及 ffprobe 加入 `PATH`，然后运行：
+`1.1.0.dev1` 预览版和 `main` 包含试验性工作台；稳定版 `v1.0.2` 不包含这一功能。请准备 Python 3.9 或更新版本，并将 FFmpeg 与 ffprobe 加入 `PATH`（参见[实测工具链与兼容边界](docs/MEDIA_COMPATIBILITY.md)），然后运行：
 
 ```bash
 git clone https://github.com/wyregey779-dot/trace-annotate.git
@@ -41,7 +44,7 @@ trace-annotate workspace serve --project ../traceannotate-workspace
 
 ## 普通视频片段标注（开发版）
 
-新功能位于 `1.1.0.dev0`，下文已发布的 `v1.0.2` 尚不包含。请在当前源码目录安装 `python -m pip install -e ".[dev]"`，然后运行：
+新功能位于 `1.1.0.dev1` 预览版，稳定版 `v1.0.2` 尚不包含。请在当前源码目录安装 `python -m pip install -e ".[dev]"`，然后运行：
 
 ```bash
 trace-annotate video-ui
@@ -99,6 +102,15 @@ Verified: 2 working segments, 3 idle intervals, 5 subtitle entries.
 | CLIP 推理 | 规划中；适配器返回 `not_run` | 尚未实现完整图像/文本推理 |
 
 ## 安装发行版
+
+使用新版工作台时，在虚拟环境中安装固定版本预览包：
+
+```bash
+python -m pip install "https://github.com/wyregey779-dot/trace-annotate/releases/download/v1.1.0.dev1/trace_annotate-1.1.0.dev1-py3-none-any.whl"
+trace-annotate --version
+```
+
+版本输出应为 `1.1.0.dev1`。视频处理还需单独安装 FFmpeg/ffprobe；预览版存储和流程仍在演进，请保留原片与经过验证的项目备份。
 
 使用 Python 3.9 或更新版本，核心依赖为 NumPy、Pillow 和 tqdm。不需要源码目录时，可在虚拟环境中安装固定版本源码包：
 

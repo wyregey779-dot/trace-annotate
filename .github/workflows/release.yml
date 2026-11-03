@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  TRACEANNOTATE_REQUIRE_MEDIA_TOOLS: "1"
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -14,6 +17,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -21,6 +26,18 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+      - name: Set up Node for cross-runtime JSON regression tests
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+      - name: Install verified media toolchain
+        run: python .github/scripts/install_ci_media.py
+      - name: Require release test prerequisites
+        run: |
+          python -c "import shutil; assert shutil.which('ffmpeg') and shutil.which('ffprobe') and shutil.which('node'), 'FFmpeg, ffprobe and Node are required for release regressions'"
+          ffmpeg -version
+          ffprobe -version
+          node --version
       - name: Build and validate release files
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -29,14 +46,34 @@ jobs:
           python -m build
           python -m twine check dist/*
           python scripts/release_assets.py --expected-tag "$RELEASE_TAG"
+      - name: Identify preview versions
+        id: version
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          from packaging.version import Version
+          version = Version(tomllib.loads(Path('pyproject.toml').read_text())['project']['version'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'prerelease={str(version.is_prerelease or version.is_devrelease).lower()}\n')
+          PY
       - name: Install and verify built wheel
         run: |
           python -m pip install dist/*.whl
           python scripts/check_installed_package.py
-          python -m pytest tests -q
+          python -m pytest tests -q -rs --junitxml=output/release-tests.xml
           python examples/demo_asset_pipeline.py
           python examples/demo_embodied_pipeline.py
           python examples/run_quickstart.py --output output/quickstart-release
+      - name: Preserve release validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-validation
+          path: |
+            output/release-tests.xml
+            output/quickstart-release
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v7
         with:
           name: release-packages
@@ -62,12 +99,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
         run: |
           cd dist
           sha256sum --check SHA256SUMS
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            release_flags=()
+            if [ "$PRERELEASE" = "true" ]; then
+              release_flags+=(--prerelease --latest=false)
+            fi
             gh release create "$RELEASE_TAG" --draft --verify-tag \
               --title "TraceAnnotate $RELEASE_TAG" \
-              --notes "Validated Python wheel and source distribution. Maintainer release notes are pending."
+              --notes "Validated Python wheel and source distribution. Maintainer release notes are pending." \
+              "${release_flags[@]}"
           fi
           gh release upload "$RELEASE_TAG" ./*.whl ./*.tar.gz SHA256SUMS

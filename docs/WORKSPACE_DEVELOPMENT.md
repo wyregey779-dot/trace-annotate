@@ -1,7 +1,7 @@
 # Persistent workspace development slice
 
-This is part of the `1.1.0.dev0` development code on `main`. It is not included
-in the `v1.0.2` release or a finished batch annotation product. `workspace serve`
+This is part of the `1.1.0.dev1` preview and development code on `main`. It is not included
+in stable `v1.0.2` or a finished batch annotation product. `workspace serve`
 opens the persistent multi-video segment editor. The existing `video-ui` and
 embodied editor remain separate, compatible annotation interfaces.
 
@@ -216,8 +216,10 @@ verified workflow. Old temporal v1/v2 files and prepared-media v1 are unaffected
 On open, registered object bytes and admitted-media references are verified.
 Missing/corrupt data refuses writes with `RECOVERY_REQUIRED`. A recovery viewer
 and repair UI are not yet implemented. Published orphan objects can remain after
-a failed transaction; their presence is not a successful job. No automatic
-garbage collection removes them.
+a failed transaction; their presence is not a successful job. The explicit
+`sweep_unbound_artifacts` Python API defaults to a dry run and checks registered
+references before deletion. Applied cleanup records a durable deletion journal;
+startup recovers pending journal entries. This is not a disk-quota policy.
 
 `workspace export` writes a new immutable development snapshot, including
 queue state. It is not yet the frozen workspace-v3 exchange contract or W08
@@ -237,11 +239,13 @@ power-loss safety or semantic video accuracy. The workbench browser regression
 checks actual displayed pixel markers for encoded CFR/VFR/audio-offset fixtures,
 then verifies saved anchors, reload, task isolation and revision conflicts.
 
-The next slice must integrate evidence and review history, candidate adoption,
-complete-partition QC, bulk edits, migration and portable exports. Intake
-scheduling is still synchronous; its cancellation/retry protocol is not yet
-unified with task jobs. A mapped anchor establishes a frame reference, not a
-reviewed or portable evidence artifact. The complete W04/W09 acceptance matrix
+Current-task professional JSON, explicit content-bound review, candidate reports
+and frozen annotation-video exports are described in [PROFESSIONAL_JSON.md](PROFESSIONAL_JSON.md).
+Broader evidence interchange, complete-partition QC, bulk edits, migration and
+portable project exports still need further qualification. Intake preparation
+runs in a background queue; its cancel/retry controls are separate from task jobs.
+A mapped anchor establishes a frame reference, not independent semantic approval.
+The complete W04/W09 acceptance matrix
 (including real-media scale/performance and release qualification) remains open.
 Real sample reference labels, quality thresholds, performance limits and the
-release acceptance matrix still require measured validation before release.
+release acceptance matrix still require measured validation before a stable release.

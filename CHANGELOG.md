@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased — 1.1.0.dev0
+## 1.1.0.dev1 — development preview
+
+- Publish the accumulated workspace and general-video features below as an
+  installable development preview. The stable release remains v1.0.2.
+- Require the digest-verified FFmpeg/ffprobe toolchain and Node in the release
+  workflow, retain test evidence, and identify development versions as pre-releases.
+  The v1.1.0.dev0 release attempt failed because its runner lacked media tools;
+  its tag is retained and is not moved to this commit.
+
+### Features since v1.0.2
 
 - Add complete-current-task professional JSON exchange with exact anchors,
   typed analysis reports, revision receipts and explicit history-index scope.

@@ -9,5 +9,5 @@ Features:
   - General temporal segments with custom labels, descriptions, tags and tracks
 """
 
-__version__ = "1.1.0.dev0"
+__version__ = "1.1.0.dev1"
 __author__ = "TraceAnnotate Contributors"

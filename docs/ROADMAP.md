@@ -23,7 +23,7 @@ The next work focuses on filesystem behavior, annotation interchange and optiona
 
 ## General and spatial video annotation
 
-The `1.1.0.dev0` development line adds general temporal segments, custom labels/text/tags, overlapping tracks, review status, native JSON recovery and CSV/SRT/WebVTT projections. [The guide](GENERAL_VIDEO_ANNOTATION.md) defines what is retained or rejected. This is manual annotation, with no automatic recognition or transcription claim.
+The `1.1.0.dev1` preview adds general temporal segments, custom labels/text/tags, overlapping tracks, review status, native JSON recovery and CSV/SRT/WebVTT projections. [The guide](GENERAL_VIDEO_ANNOTATION.md) defines what is retained or rejected. This is manual annotation, with no automatic recognition or transcription claim.
 
 The media-identity part of gate 1 is implemented in the development line: full streaming SHA-256, v2 media binding, explicit v1 migration, cancellation and verified rename recovery. Presented-frame PTS is visible, but a complete frame index, verified adjacent-frame navigation and VFR precision remain open. Gates 2–6 are not completed by this work.
 

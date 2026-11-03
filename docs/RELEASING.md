@@ -18,8 +18,8 @@ repository does not claim a PyPI publication.
    python -m pip install build twine pytest tomli
    python -m build --outdir release-dist
    python -m twine check release-dist/*
-   python scripts/release_assets.py --dist release-dist --expected-tag v1.0.2
-   python -m pip install release-dist/trace_annotate-1.0.2-py3-none-any.whl
+   python scripts/release_assets.py --dist release-dist --expected-tag v1.1.0.dev1
+   python -m pip install release-dist/trace_annotate-1.1.0.dev1-py3-none-any.whl
    python scripts/check_installed_package.py
    python -m pytest tests -q
    ```
@@ -40,10 +40,19 @@ examples. A separate job with repository-content write permission verifies the
 checksums and uploads those files using the repository's built-in GitHub token.
 No additional token or PyPI credential is required.
 
+The release runner installs the same digest-verified Linux FFmpeg/ffprobe build
+as CI, explicitly installs Node, and fails before testing if any tool is absent.
+Media regressions must execute; dependency-based skips are not a release pass.
+The workflow retains its JUnit result and quickstart outputs as validation evidence.
+
 If a release already exists, its title, notes and publication state are preserved.
 Otherwise, the workflow creates a **draft** release for the maintainer to finish.
 Review the assets and write concrete release notes before publishing that draft.
 Only report checks that actually passed, and describe remaining limitations.
+Development and other preview versions are created with the pre-release flag
+and do not replace the latest stable release. The README links the current preview
+explicitly. Keep failed tags immutable; fix the workflow on main and use a new
+version for changed distributions.
 
 Uploads do not overwrite existing assets. If a rerun encounters a same-named
 asset, inspect the existing release and workflow artifacts before deciding how
