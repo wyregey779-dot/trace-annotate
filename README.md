@@ -167,8 +167,8 @@ From a source checkout, install only the extras needed for your workflow:
 
 The `clip` extra installs PyTorch/torchvision and open_clip for real zero-shot
 inference; the first construction downloads the openai ViT-B-32 weights into the
-user cache. The `vlm` extra installs transformers and einops for local caption
-drafts through Florence-2. Every adapter follows the same honesty contract:
+user cache. The `vlm` extra installs transformers 4.49.x (the tested window; Florence-2
+remote code breaks on newer releases), einops and timm for local caption drafts. Every adapter follows the same honesty contract:
 missing weights report `not_run`, a crash reports `failed`, and only a real
 forward pass reports `success` — the workspace `vision-jobs` pipeline keeps all
 model output in `model_candidate`/`unreviewed` candidates until a human
