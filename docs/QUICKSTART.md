@@ -30,6 +30,41 @@ trace-annotate --version
 
 The version command should match `project.version` in this checkout's `pyproject.toml` (currently `1.1.0.dev1`). If PowerShell policy blocks activation, use `.venv\Scripts\python.exe -m pip install .`. Run the example through `.venv\Scripts\python.exe`, or invoke CLI commands through `.venv\Scripts\trace-annotate.exe`; changing the machine's execution policy is not required.
 
+### 1a. Optional: local visual assistance
+
+The workspace `vision-jobs` pipeline (scene cuts, keyframes, face, OCR, CLIP
+classification, VLM caption drafts) needs extras plus real FFmpeg binaries:
+
+```bash
+python -m pip install -e ".[cv]"     # OpenCV / HEIF support
+python -m pip install -e ".[ocr]"    # RapidOCR
+python -m pip install -e ".[clip]"   # torch, torchvision, open_clip
+python -m pip install -e ".[vlm]"    # transformers 4.49.x, einops, timm
+```
+
+`python -m pip install -e ".[full]"` installs every extra above plus
+`scenedetect`. Nothing is downloaded at import time: the first CLIP/VLM run
+fetches weights into `~/.cache/traceannotate/{clip,vlm}`, and those
+directories can be moved with `TRACE_ANNOTATE_CLIP_CACHE` /
+`TRACE_ANNOTATE_VLM_CACHE`.
+
+FFmpeg and ffprobe are not pip packages and the repository never downloads
+them for you. Install both and make sure they resolve on `PATH` before you
+run a video workflow. On Windows the `static-ffmpeg` wheel fetches a build and
+prints the folder that holds both executables:
+
+```bash
+python -m pip install static-ffmpeg
+python -c "from static_ffmpeg import run; print(run.get_or_fetch_platform_executables_else_raise())"
+$env:PATH = "<the printed folder>;" + $env:PATH   # current session only
+```
+
+If a tool is still missing, every caller fails with an explicit dependency
+error naming the tool; none of them silently skips the analysis. No model
+result is authoritative either: every vision candidate is written as
+`model_candidate` with `unreviewed` status and only becomes annotation truth
+after a human review command.
+
 ## 2. Run the workflow
 
 From the repository root:

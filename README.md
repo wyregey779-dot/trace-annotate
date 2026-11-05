@@ -163,7 +163,7 @@ From a source checkout, install only the extras needed for your workflow:
 | --- | --- |
 | `python -m pip install -e ".[cv]"` | OpenCV video/motion processing and optional HEIF support; YuNet face detection also needs compatible local ONNX weights |
 | `python -m pip install -e ".[ocr]"` | RapidOCR integration; model/runtime availability depends on the installed package |
-| `ffmpeg` executable on `PATH` | Scene-cut helper; pip does not install this executable |
+| `ffmpeg` and `ffprobe` folders on `PATH` | The binaries are not pip packages; on Windows the `static-ffmpeg` wheel unpacks them under `...\site-packages\static_ffmpeg\bin\win32`, which you prepend to `PATH` |
 
 The `clip` extra installs PyTorch/torchvision and open_clip for real zero-shot
 inference; the first construction downloads the openai ViT-B-32 weights into the
@@ -173,6 +173,11 @@ missing weights report `not_run`, a crash reports `failed`, and only a real
 forward pass reports `success` — the workspace `vision-jobs` pipeline keeps all
 model output in `model_candidate`/`unreviewed` candidates until a human
 upgrades them.
+
+No FFmpeg binary ships with this repository and the workspace never downloads
+one behind your back. `ffmpeg` and `ffprobe` must both resolve on `PATH`;
+scene cuts, keyframes, media import, analysis and rendering all fail with an
+explicit dependency error instead of skipping the work when they do not.
 
 ## Validation and current limits
 
