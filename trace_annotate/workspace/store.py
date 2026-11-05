@@ -949,15 +949,19 @@ class WorkspaceStore:
                 copy.deepcopy(current["annotations"]), "replace_annotations", {"annotations": payload["annotations"]})
             new_task["legacy_document_metadata"] = copy.deepcopy(payload["legacy_document_metadata"])
             new_task.setdefault("extensions", {})["temporal_source"] = copy.deepcopy(payload["legacy_document_envelope"])
-        elif operation in {"import_professional", "set_analysis_report", "set_analysis_reports"}:
+        elif operation in {"import_professional", "set_analysis_report", "set_analysis_reports", "import_vision_candidates"}:
             from .professional_store import prepare_task
             new_task = prepare_task(self, current, operation, payload, command_id=command_id)
         elif operation == "review_annotation":
             if set(payload) != {"annotation_id", "reviewed"} or type(payload["reviewed"]) is not bool:
                 raise SchemaInvalid("SCHEMA_INVALID", "Review requires annotation_id and a boolean")
             S.require_id(payload["annotation_id"], "annotation_id")
-            if not any(a["id"] == payload["annotation_id"] for a in new_task["annotations"]):
+            target = next((a for a in new_task["annotations"] if a["id"] == payload["annotation_id"]), None)
+            if target is None:
                 raise NotFound("ANNOTATION_NOT_FOUND", "Annotation to review is missing")
+            if target.get("provenance", {}).get("origin") == "model_candidate":
+                raise SchemaInvalid("SCHEMA_INVALID",
+                                    "Model candidate must be upgraded to a manual origin before review")
         else:
             new_task["annotations"] = self._apply_operation(copy.deepcopy(current["annotations"]), operation, payload)
         new_task["revision"] = current_rev + 1
@@ -1007,6 +1011,8 @@ class WorkspaceStore:
             response["report_count"] = len(payload["reports"])
         elif operation == "import_professional":
             response["imported_count"] = len(new_task["annotations"])
+        elif operation == "import_vision_candidates":
+            response["candidate_count"] = len(payload["candidates"])
         ts = _now()
         with self.transaction():
             self.conn.execute("UPDATE tasks SET revision=? WHERE id=?",
@@ -1134,8 +1140,17 @@ class WorkspaceStore:
             raise SchemaInvalid("UNSUPPORTED_OPERATION", "Evidence and custom attributes need their own admission workflow")
         provenance = ann["provenance"]
         if (not isinstance(provenance, dict) or set(provenance) != {"origin", "actor_id", "job_id"}
-                or provenance["origin"] not in {"manual", "imported"} or provenance["job_id"] is not None):
+                or provenance["origin"] not in {"manual", "imported", "model_candidate"}):
             raise SchemaInvalid("SCHEMA_INVALID", "Unsupported annotation provenance")
+        if provenance["origin"] == "model_candidate":
+            # A machine candidate is never authority: it must stay unreviewed
+            # and must record the vision job that produced it. Human upgrade is
+            # an explicit edit of the origin, not an automatic side effect.
+            if ann["review_status"] != "unreviewed":
+                raise SchemaInvalid("SCHEMA_INVALID", "Model candidate cannot carry a completed local review")
+            S.require_id(provenance.get("job_id"))
+        elif provenance["job_id"] is not None:
+            raise SchemaInvalid("SCHEMA_INVALID", "Manual and imported provenance cannot carry a job id")
         S.require_id(provenance.get("actor_id"))
         times = {"whole_clip": set(), "event": {"at"}, "segment": {"start", "end"}}[kind]
         if {"start", "end", "at"}.intersection(ann) != times:

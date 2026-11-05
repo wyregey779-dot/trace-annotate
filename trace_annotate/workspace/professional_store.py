@@ -23,6 +23,8 @@ def prepare_task(store, current, operation, payload, *, command_id):
 
     task = copy.deepcopy(current)
     media = store.get_media(task['media_id'])
+    template = next(t for t in store.list_templates()
+                    if (t['id'], t['version']) == (task['template_id'], task['template_version']))
     if operation == 'import_professional':
         if set(payload) != {'document'}:
             raise SchemaInvalid('SCHEMA_INVALID', 'Professional import requires one document')
@@ -36,6 +38,27 @@ def prepare_task(store, current, operation, payload, *, command_id):
         # project storage. Embedding it in every later task/export recursively
         # doubles the file on repeated round trips.
         archive['document_artifact'] = store._put_artifact(S.canonical_json(source_document))
+    elif operation == 'import_vision_candidates':
+        candidates = payload.get('candidates')
+        source_job_id = payload.get('source_job_id')
+        if (set(payload) != {'candidates', 'source_job_id'} or not isinstance(candidates, list)
+                or not 1 <= len(candidates) <= 4096 or not isinstance(source_job_id, str)):
+            raise SchemaInvalid('SCHEMA_INVALID', 'Vision import requires a bounded candidate list and source job')
+        S.require_id(source_job_id)
+        seen = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise SchemaInvalid('SCHEMA_INVALID', 'Vision candidate must be an object')
+            if candidate['id'] in seen:
+                raise SchemaInvalid('SCHEMA_INVALID', 'Vision candidate list contains duplicate identities')
+            seen.add(candidate['id'])
+            provenance = candidate.get('provenance')
+            if (not isinstance(provenance, dict) or provenance.get('origin') != 'model_candidate'
+                    or provenance.get('job_id') != source_job_id):
+                raise SchemaInvalid('SCHEMA_INVALID',
+                                    'Vision candidate must carry model_candidate provenance from its source job')
+            PS.validate_annotation(candidate, media, template)
+            task['annotations'].append(candidate)
     elif operation == 'set_analysis_reports':
         reports = payload.get('reports')
         if (set(payload) != {'reports'} or not isinstance(reports, list)
@@ -96,6 +119,15 @@ def apply_analysis(store, task_id, *, command_id, expected_revision, expected_sh
         command_id=command_id, task_id=task_id, expected_revision=expected_revision,
         expected_sha256=expected_sha256, operation='set_analysis_report',
         payload={'report': report}, request_body=request_body)['response']
+
+
+def apply_vision_candidates(store, task_id, *, command_id, expected_revision, expected_sha256,
+                            candidates, source_job_id, request_body):
+    return store.apply_task_command(
+        command_id=command_id, task_id=task_id, expected_revision=expected_revision,
+        expected_sha256=expected_sha256, operation='import_vision_candidates',
+        payload={'candidates': candidates, 'source_job_id': source_job_id},
+        request_body=request_body)['response']
 
 
 def export_professional(store, task_id):

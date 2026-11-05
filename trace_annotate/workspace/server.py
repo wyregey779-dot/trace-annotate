@@ -150,6 +150,9 @@ class WorkspaceHTTPServer(ThreadingHTTPServer):
         analysis_jobs = getattr(self, "analysis_jobs", None)
         if analysis_jobs is not None:
             report["analysis_worker"] = analysis_jobs.close(timeout=CLOSE_WORKER_SECONDS)
+        vision_jobs = getattr(self, "vision_jobs", None)
+        if vision_jobs is not None:
+            report["vision_worker"] = vision_jobs.close(timeout=CLOSE_WORKER_SECONDS)
         render_jobs = getattr(self, "render_jobs", None)
         if render_jobs is not None:
             report["render_worker"] = render_jobs.close(timeout=CLOSE_WORKER_SECONDS)
@@ -625,6 +628,24 @@ class _Handler(BaseHTTPRequestHandler):
                 _require_id(parts[1], "job_id")
                 self._send_json(200, self.server.analysis_jobs.result(parts[1]))
                 return
+            if parts == ["vision-options"]:
+                self._send_json(200, self.server.vision_jobs.options())
+                return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "vision-result":
+                _require_id(parts[1], "job_id")
+                self._send_json(200, self.server.vision_jobs.result(parts[1]))
+                return
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "vision-status":
+                _require_id(parts[1], "task_id")
+                with store.transaction():
+                    task = store.get_task(parts[1])
+                    candidates = [a for a in task["annotations"]
+                                  if a.get("provenance", {}).get("origin") == "model_candidate"]
+                    result = {"task_id": task["id"], "revision": task["revision"],
+                        "content_sha256": task["content_sha256"],
+                        "candidate_count": len(candidates), "candidates": candidates}
+                self._send_json(200, result)
+                return
             if parts == ["drafts"]:
                 self._send_json(200, {"drafts": self.server.drafts.list()})
                 return
@@ -685,10 +706,13 @@ class _Handler(BaseHTTPRequestHandler):
             professional_write = len(parts) == 3 and parts[0] == "tasks" and parts[2] in {"professional-import", "analysis-reports"}
             analysis_submit = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "analysis-jobs"
             analysis_apply = len(parts) == 3 and parts[0] == "jobs" and parts[2] == "apply-analysis"
+            vision_submit = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "vision-jobs"
+            vision_apply = len(parts) == 3 and parts[0] == "jobs" and parts[2] == "apply-vision"
+            vision_import = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "vision-import"
             render_submit = len(parts) == 3 and parts[0] == "tasks" and parts[2] == "render-jobs"
             control = len(parts) == 3 and parts[0] in ("batches", "jobs") and parts[2] == "control"
             intake_control = len(parts) == 3 and parts[0] == "intakes" and parts[2] in {"cancel", "retry"}
-            if not (task_command or task_import_temporal or professional_write or analysis_submit or analysis_apply or render_submit or control or intake_control
+            if not (task_command or task_import_temporal or professional_write or analysis_submit or analysis_apply or vision_submit or vision_apply or vision_import or render_submit or control or intake_control
                     or parts in (["batches"], ["drafts"])):
                 raise NotFound("NOT_FOUND", "Unknown route")
             if len(parts) > 1:
@@ -707,6 +731,19 @@ class _Handler(BaseHTTPRequestHandler):
                         raise SchemaInvalid("SCHEMA_INVALID", "Analysis apply accepts only its fixed server-loaded candidate")
                     result = self.server.analysis_jobs.apply(parts[1], command_id=body["command_id"],
                         expected_revision=body["expected_revision"], expected_sha256=body["expected_sha256"], request_body=raw)
+                elif vision_submit:
+                    _fields(body, {"command_id", "expected_revision", "expected_sha256", "window", "subject_annotation_id"})
+                    result = self.server.vision_jobs.submit(parts[1], **body)
+                elif vision_apply:
+                    _fields(body, {"command_id", "expected_revision", "expected_sha256", "operation", "payload"})
+                    if body["operation"] != "apply_vision_job" or body["payload"] != {}:
+                        raise SchemaInvalid("SCHEMA_INVALID", "Vision apply accepts only its fixed server-loaded candidate")
+                    result = self.server.vision_jobs.apply(parts[1], command_id=body["command_id"],
+                        expected_revision=body["expected_revision"], expected_sha256=body["expected_sha256"], request_body=raw)
+                elif vision_import:
+                    _fields(body, {"command_id", "expected_revision", "expected_sha256", "candidates", "source_job_id"})
+                    from .professional_store import apply_vision_candidates
+                    result = apply_vision_candidates(store, parts[1], request_body=raw, **body)
                 elif intake_control:
                     # A control body is exactly "optionally one command_id".
                     # Arrays, null, unknown fields and non-identifier ids are
@@ -862,6 +899,9 @@ def make_server(store: WorkspaceStore, host: str = "127.0.0.1", port: int = 0) -
     from .analysis_jobs import AnalysisJobs
     server.analysis_jobs = AnalysisJobs(store, queue=queue, closing=server.closing)
     server.analysis_jobs.start()
+    from .vision_jobs import VisionJobs
+    server.vision_jobs = VisionJobs(store, queue=queue, closing=server.closing)
+    server.vision_jobs.start()
     from .render_jobs import RenderJobs
     server.render_preview_lock = threading.Lock()
     server.render_jobs = RenderJobs(store, queue=queue, closing=server.closing)

@@ -1,0 +1,691 @@
+"""Durable playback-only vision candidate jobs.
+
+A vision job runs local extractors (scene cuts, face, OCR, CLIP) against the
+registered immutable playback and returns a candidate artifact. It never edits
+annotations, never claims to measure the original source, and never treats a
+model result as reviewed ground truth. Saving candidates as task annotations
+remains an explicit revision/CAS command with model_candidate provenance.
+"""
+from __future__ import annotations
+
+import json
+import math
+import re
+import shutil
+import stat
+import subprocess
+import threading
+from fractions import Fraction
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Optional
+
+from ..config import MetricThresholds
+from ..extractors.clip_engine import CLIPExtractor
+from ..extractors.faces import FaceExtractor
+from ..extractors.ocr import OCRExtractor
+from ..extractors.scene import SceneDetector, SceneDetectionError
+from ..extractors.vlm import VLMExtractor
+from ..temporal.media import stream_sha256
+from . import professional_schema as PS
+from . import schema as S
+from .errors import Conflict, SchemaInvalid, WorkspaceError
+from .http_media import resolve_media_object
+from .queue import DurableQueue, MAX_RESULT_BYTES
+from .slots import SlotClosed, SlotTimeout, get_prepare_slot
+from .store import _safe
+
+OPERATION = "vision-media"
+VERSION = "1"
+RESULT_KIND = "traceannotate.vision-candidate"
+DOMAIN = "playback_seconds"
+MAX_SCENES = 512
+MAX_KEYFRAMES = 512
+MAX_FRAME_BYTES = 16 * 1024 * 1024
+FRAME_QUALITY = 3
+CANDIDATE_LABEL_PREFIX = "镜头候选"
+CANDIDATE_TRACK = "镜头"
+
+
+def _finite(value: Any, name: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result) or (positive and result <= 0):
+        raise ValueError(f"{name} must be finite{' positive' if positive else ''}")
+    return result
+
+
+def _parameters(window: Optional[Dict[str, Any]] = None,
+                subject_annotation_id: Optional[str] = None) -> Dict[str, Any]:
+    if subject_annotation_id is not None:
+        S.require_id(subject_annotation_id)
+        if window is None:
+            raise SchemaInvalid("SCHEMA_INVALID", "An annotation subject requires an interval")
+    if window is not None:
+        if (not isinstance(window, dict) or set(window) != {"start", "end"}
+                or any(S.rational(window[key]) != window[key] for key in ("start", "end"))
+                or not 0 <= S.rational_value(window["start"]) < S.rational_value(window["end"])):
+            raise SchemaInvalid("SCHEMA_INVALID", "window must be a reduced rational half-open interval")
+    return json.loads(S.canonical_json({"window": window, "subject_annotation_id": subject_annotation_id,
+                                        "time_domain": DOMAIN}))
+
+
+def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    if job["operation"] != OPERATION or job["processor_version"] != VERSION:
+        raise WorkspaceError("UNSUPPORTED_PROCESSOR", "No installed vision processor matches this frozen job")
+    parameters = job["parameters"]
+    if (not isinstance(parameters, dict) or set(parameters) != {"window", "subject_annotation_id", "time_domain"}
+            or parameters["time_domain"] != DOMAIN
+            or parameters != _parameters(parameters["window"], parameters["subject_annotation_id"])):
+        raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
+    media, task = job["media_snapshot"], job["task_snapshot"]
+    spec = {key: job[key] for key in ("task_id", "operation", "input_revision", "input_sha256", "processor_version", "parameters")}
+    if S.sha256_text(spec) != job["idempotency_key"] or job["id"] != "job-" + job["idempotency_key"]:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Vision configuration identity is inconsistent")
+    PS.validate_media(media)
+    if task["id"] != job["task_id"] or task["media_id"] != media["id"] or task["revision"] != job["input_revision"]:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Vision snapshot identity is inconsistent")
+    window = parameters["window"]
+    if window is not None and S.rational_value(window["end"]) > S.rational_value(media["duration"]):
+        raise SchemaInvalid("SCHEMA_INVALID", "Vision interval exceeds playback duration")
+    subject = parameters["subject_annotation_id"]
+    if subject is not None:
+        annotation = next((a for a in task["annotations"] if a["id"] == subject), None)
+        if (annotation is None or annotation["type"] != "segment" or window != {
+                "start": annotation["start"]["seconds"], "end": annotation["end"]["seconds"]}):
+            raise SchemaInvalid("SCHEMA_INVALID", "Vision interval must match its frozen segment subject")
+    return parameters
+
+
+def _seconds_ratio(seconds: float) -> Dict[str, str]:
+    value = Fraction(seconds).limit_denominator(1_000_000)
+    return {"n": str(value.numerator), "d": str(value.denominator)}
+
+
+def _frame_timestamp(seconds: float) -> str:
+    """Format a ffmpeg -ss timestamp from seconds with microsecond precision."""
+    return f"{float(seconds):.6f}"
+
+
+def _extract_keyframe(ffmpeg: str, video_path: Path, seconds: float, output: Path) -> None:
+    """Decode exactly one frame at a verified timestamp into a JPEG file."""
+    if output.exists():
+        raise WorkspaceError("RECOVERY_REQUIRED", "Vision frame output already exists")
+    command = [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "error",
+               "-xerror", "-err_detect", "explode", "-ss", _frame_timestamp(seconds),
+               "-i", str(video_path), "-map", "0:v:0", "-frames:v", "1",
+               "-q:v", str(FRAME_QUALITY), "-y", str(output)]
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=60, encoding="utf-8", errors="replace")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkspaceError("VISION_FRAME_FAILED", f"Keyframe extraction could not complete: {exc}") from exc
+    if result.returncode != 0 or not output.is_file() or output.stat().st_size <= 0:
+        detail = result.stderr.strip()[-2000:] or "no diagnostic output"
+        raise WorkspaceError("VISION_FRAME_FAILED", f"Keyframe extraction failed: {detail}")
+    if output.stat().st_size > MAX_FRAME_BYTES:
+        raise WorkspaceError("ANALYSIS_LIMIT_EXCEEDED", "Vision keyframe exceeds the frame size budget")
+
+
+def _run_scenes(scene_detector: SceneDetector, video_path: Path,
+                thresholds: Any) -> Dict[str, Any]:
+    try:
+        segments = scene_detector.detect_scenes_ffmpeg(str(video_path))
+    except (SceneDetectionError, ValueError, OSError) as exc:
+        return {"status": "failed", "error": str(exc), "scenes": []}
+    if len(segments) > MAX_SCENES:
+        return {"status": "failed", "error": f"scene count exceeds {MAX_SCENES}", "scenes": []}
+    return {"status": "success", "scenes": segments, "error": None}
+
+
+def _run_face(frame: Any, face_extractor: Optional[FaceExtractor]) -> Dict[str, Any]:
+    if face_extractor is None:
+        return {"status": "not_run", "reason": "face_weights_unavailable"}
+    try:
+        result = face_extractor.detect_faces(frame)
+    except Exception as exc:  # A vision helper must never crash the whole job.
+        return {"status": "failed", "error": str(exc)}
+    return result
+
+
+def _run_ocr(frame: Any, ocr_extractor: Optional[OCRExtractor]) -> Dict[str, Any]:
+    if ocr_extractor is None or ocr_extractor.engine is None:
+        return {"status": "not_run", "reason": "ocr_runtime_unavailable"}
+    try:
+        result = ocr_extractor.extract_text(frame)
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)}
+    result["status"] = "success"
+    return result
+
+
+def _run_clip(frame: Any, clip_extractor: Optional[CLIPExtractor]) -> Dict[str, Any]:
+    if clip_extractor is None:
+        return {"status": "not_run", "reason": "clip_weights_unavailable"}
+    try:
+        result = clip_extractor.classify(frame)
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)}
+    return result
+
+
+def _run_vlm(frame: Any, vlm_extractor: Optional[VLMExtractor]) -> Dict[str, Any]:
+    if vlm_extractor is None:
+        return {"status": "not_run", "reason": "vlm_weights_unavailable", "caption": ""}
+    try:
+        result = vlm_extractor.caption(frame)
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc), "caption": ""}
+    return result
+
+
+class VisionJobs:
+    """One optional drainer sharing durable leases; wrappers never write tasks.
+
+    close() reports actual runner liveness. Queued jobs survive shutdown and
+    resume on reopening. A successful job is a candidate, never a review.
+    """
+
+    def __init__(self, store: Any, *, queue: Optional[DurableQueue] = None,
+                 closing: Optional[threading.Event] = None, poll_seconds: float = .1,
+                 slot_wait_seconds: float = 900, face_model_path: Optional[str] = None,
+                 clip_model_path: Optional[str] = None, vlm_model_path: Optional[str] = None):
+        for value in (poll_seconds, slot_wait_seconds):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise SchemaInvalid("SCHEMA_INVALID", "Vision waits must be finite positive seconds")
+        if closing is not None and not isinstance(closing, threading.Event):
+            raise SchemaInvalid("SCHEMA_INVALID", "closing must be a threading.Event")
+        self.store = store
+        self.queue = queue if queue is not None else DurableQueue(store)
+        if self.queue.store is not store:
+            raise SchemaInvalid("SCHEMA_INVALID", "Vision queue belongs to another workspace")
+        self._external_closing = closing
+        self._closing = threading.Event()
+        self._condition = threading.Condition()
+        self._runners = set()
+        self._active_jobs = set()
+        self._heartbeats = set()
+        self._drainer = None
+        self._drainer_error = None
+        self.poll_seconds, self.slot_wait_seconds = float(poll_seconds), float(slot_wait_seconds)
+        self.face_model_path = face_model_path
+        self.clip_model_path = clip_model_path
+        self.vlm_model_path = vlm_model_path
+        self._extractors = None
+        self._extractor_error = None
+
+    def is_closing(self) -> bool:
+        return self._closing.is_set() or (self._external_closing is not None and self._external_closing.is_set())
+
+    def options(self) -> Dict[str, Any]:
+        thresholds = MetricThresholds()
+        self._load_extractors(thresholds)
+        extractors = self._extractors or {"face": None, "ocr": None, "clip": None, "vlm": None}
+        capabilities = {
+            "scene": bool(shutil.which("ffmpeg")),
+            "face": extractors["face"] is not None and extractors["face"].detector is not None,
+            "ocr": extractors["ocr"] is not None and extractors["ocr"].engine is not None,
+            "clip": extractors["clip"] is not None and extractors["clip"].model is not None,
+            "vlm": extractors["vlm"] is not None and extractors["vlm"].model is not None,
+        }
+        return {"operation": OPERATION, "version": VERSION, "domain": DOMAIN,
+                "capabilities": capabilities, "extractor_error": self._extractor_error,
+                "closing": self.is_closing()}
+
+    def submit(self, task_id: str, *, command_id: str, expected_revision: int,
+               expected_sha256: str, window: Optional[Dict[str, Any]] = None,
+               subject_annotation_id: Optional[str] = None) -> Dict[str, Any]:
+        S.require_id(command_id)
+        parameters = _parameters(window, subject_annotation_id)
+        items = [{"task_id": task_id, "expected_revision": expected_revision, "expected_sha256": expected_sha256}]
+        request = {"kind": "queue.create_batch", "items": items, "operation": OPERATION,
+                   "processor_version": VERSION, "parameters": parameters}
+        with self.store.transaction():
+            replay = self.queue._receipt(command_id, request)
+            if replay is not None:
+                return replay
+            if self.is_closing():
+                raise Conflict("WORKSPACE_CLOSING", "Workspace accepts no new vision jobs")
+            batch = self.queue.create_batch(items, operation=OPERATION, processor_version=VERSION,
+                                             parameters=parameters, command_id=command_id)
+            for job in batch["jobs"]:
+                _validate_job(job)
+            return batch
+
+    def _batches(self, batch_id: Optional[str] = None) -> List[str]:
+        batches = [self.queue.get_batch(batch_id)] if batch_id is not None else self.queue.list_batches()
+        selected = []
+        for batch in batches:
+            matching = [job["operation"] == OPERATION for job in batch["jobs"]]
+            if any(matching) and not all(matching):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Mixed-operation vision batch is inconsistent")
+            if matching and all(matching):
+                if not batch["dispatch_paused"] and any(job["state"] == "queued" for job in batch["jobs"]):
+                    selected.append(batch["id"])
+            elif batch_id is not None:
+                raise Conflict("UNSUPPORTED_PROCESSOR", "Batch is not a vision batch")
+        return selected
+
+    def _load_extractors(self, thresholds: Any) -> None:
+        """Build extractor instances once; missing weights degrade to not_run.
+
+        Each extractor swallows its own load failure internally (model=None),
+        so one broken adapter never disables the other extractors.
+        """
+        if self._extractors is not None:
+            return
+        try:
+            face = FaceExtractor(model_path=self.face_model_path, thresholds=thresholds)
+            ocr = OCRExtractor(thresholds=thresholds)
+            clip = CLIPExtractor(model_name_or_path=self.clip_model_path, thresholds=thresholds)
+            vlm = VLMExtractor(model_path=self.vlm_model_path)
+            self._extractors = {"face": face, "ocr": ocr, "clip": clip, "vlm": vlm}
+        except Exception as exc:
+            self._extractor_error = str(exc)
+            self._extractors = {"face": None, "ocr": None, "clip": None, "vlm": None}
+
+    def _processor(self, job: Dict[str, Any], context: Any) -> Dict[str, Any]:
+        parameters = _validate_job(job)
+        self._validate_snapshot(job)
+        stop = threading.Event()
+        lost = threading.Event()
+
+        def renew() -> None:
+            try:
+                while not stop.wait(min(5.0, self.queue.lease_seconds / 3.0)):
+                    try:
+                        if context.heartbeat()["cancel_requested"]:
+                            return
+                    except Exception:
+                        lost.set()
+                        return
+            finally:
+                with self._condition:
+                    self._heartbeats.discard(threading.current_thread())
+                    self._condition.notify_all()
+
+        def cancelled() -> bool:
+            if self.is_closing():
+                try:
+                    self.queue.cancel(job["id"])
+                except Conflict as exc:
+                    if exc.code != "ALREADY_COMMITTED":
+                        raise
+                return True
+            if lost.is_set():
+                raise Conflict("LEASE_LOST", "Vision lease renewal failed")
+            return context.cancelled()
+
+        with self._condition:
+            self._active_jobs.add(job["id"])
+        heartbeat = threading.Thread(target=renew, name="vision-heartbeat", daemon=True)
+        with self._condition:
+            self._heartbeats.add(heartbeat)
+        heartbeat.start()
+        try:
+            if cancelled():
+                raise WorkspaceError("CANCELLED", "Vision was cancelled before resolving playback")
+            source, digest, size = resolve_media_object(self.store, job["media_snapshot"]["id"], "playback_path")
+            if (digest, str(size)) != (job["media_snapshot"]["playback"]["sha256"],
+                                       job["media_snapshot"]["playback"]["size_bytes"]):
+                raise Conflict("MEDIA_CHANGED", "Playback binding differs from the frozen vision input")
+            relative = f"tmp/vision/jobs/{job['id']}/{job['attempt']}-{job['lease_generation']}"
+            work = self.store.root / relative
+            _safe(work)
+            work.mkdir(parents=True, exist_ok=False)
+            try:
+                ffmpeg = _find_ffmpeg()
+                thresholds = MetricThresholds()
+                self._load_extractors(thresholds)
+                extractors = self._extractors or {"face": None, "ocr": None, "clip": None}
+                detector = SceneDetector(thresholds=thresholds)
+                scene_result = _run_scenes(detector, Path(source), thresholds)
+                keyframes: List[Dict[str, Any]] = []
+                window = parameters["window"]
+                scenes = scene_result["scenes"]
+                if window is not None:
+                    start = S.rational_value(window["start"])
+                    end = S.rational_value(window["end"])
+                    scenes = [scene for scene in scenes
+                              if scene["end"] > start and scene["start"] < end]
+                if scene_result["status"] == "success":
+                    for index, scene in enumerate(scenes):
+                        if cancelled():
+                            raise WorkspaceError("CANCELLED", "Vision cancelled while extracting keyframes")
+                        if len(keyframes) >= MAX_KEYFRAMES:
+                            break
+                        mid = (float(scene["start"]) + float(scene["end"])) / 2.0
+                        if window is not None:
+                            mid = max(float(start), min(float(end), mid))
+                        frame_path = work / f"keyframe-{index:04d}.jpg"
+                        _extract_keyframe(ffmpeg, Path(source), mid, frame_path)
+                        frame = _load_frame(frame_path)
+                        face_result = _run_face(frame, extractors["face"])
+                        ocr_result = _run_ocr(frame, extractors["ocr"])
+                        clip_result = _run_clip(frame, extractors["clip"])
+                        vlm_result = _run_vlm(frame, extractors["vlm"])
+                        keyframes.append({
+                            "scene_index": index,
+                            "timestamp": _seconds_ratio(mid),
+                            "face": face_result,
+                            "ocr": ocr_result,
+                            "clip": clip_result,
+                            "vlm": vlm_result,
+                        })
+                extractor_status = {
+                    "scene": scene_result["status"],
+                    "face": _aggregate_status(keyframes, "face"),
+                    "ocr": _aggregate_status(keyframes, "ocr"),
+                    "clip": _aggregate_status(keyframes, "clip"),
+                    "vlm": _aggregate_status(keyframes, "vlm"),
+                }
+                if self._extractor_error is not None:
+                    extractor_status["extractor_error"] = self._extractor_error
+                evidence = []
+                for path in sorted(work.iterdir()):
+                    if cancelled():
+                        raise WorkspaceError("CANCELLED", "Vision cancelled while hashing evidence")
+                    _safe(path)
+                    if not stat.S_ISREG(path.stat().st_mode):
+                        raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence is not a regular file")
+                    evidence.append({"relative_path": relative + "/" + path.name,
+                                     "sha256": stream_sha256(path, cancelled=cancelled),
+                                     "size_bytes": str(path.stat().st_size)})
+                candidate = {"kind": RESULT_KIND, "version": 1, "processor_version": VERSION,
+                    "job_id": job["id"], "task_id": job["task_id"], "media_id": job["media_snapshot"]["id"],
+                    "input_revision": job["input_revision"], "input_sha256": job["input_sha256"],
+                    "file_sha256": digest, "time_domain": DOMAIN, "window": window,
+                    "subject_annotation_id": parameters["subject_annotation_id"],
+                    "scenes": scenes, "keyframes": keyframes,
+                    "extractor_status": extractor_status, "evidence": evidence,
+                    "semantic_listening": "not_performed", "source_unchanged": True,
+                    "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
+                self._validate_candidate(candidate, job)
+                context.raise_if_cancelled()
+                return candidate
+            finally:
+                # Evidence has already been hashed; the work directory remains
+                # referenced by immutable artifact bindings under the store root.
+                pass
+        except InterruptedError as exc:
+            raise WorkspaceError("CANCELLED", "Vision was cancelled") from exc
+        finally:
+            stop.set()
+            heartbeat.join(timeout=6)
+            with self._condition:
+                self._active_jobs.discard(job["id"])
+                self._condition.notify_all()
+
+    def run_pending(self, *, batch_id: Optional[str] = None, worker_id: str = "vision-local") -> List[Dict[str, Any]]:
+        with self._condition:
+            if self.is_closing():
+                return []
+            token = object()
+            self._runners.add(token)
+        results = []
+        slot = get_prepare_slot(self.store.root)
+        try:
+            for ident in self._batches(batch_id):
+                while not self.is_closing():
+                    try:
+                        with slot.hold(closing=self.is_closing, timeout=self.slot_wait_seconds):
+                            if self.is_closing():
+                                break
+                            result = self.queue.execute_once(self._processor, batch_id=ident, worker_id=worker_id)
+                    except (SlotClosed, SlotTimeout):
+                        return results
+                    if result is None:
+                        break
+                    results.append(result)
+            return results
+        finally:
+            with self._condition:
+                self._runners.discard(token)
+                self._condition.notify_all()
+
+    def start(self) -> "VisionJobs":
+        with self._condition:
+            if self.is_closing():
+                raise Conflict("WORKSPACE_CLOSING", "Cannot start a closing vision drainer")
+            if self._drainer is not None and self._drainer.is_alive():
+                return self
+
+            def drain() -> None:
+                try:
+                    while not self.is_closing():
+                        self.run_pending()
+                        self._closing.wait(self.poll_seconds)
+                except Exception as exc:
+                    self._drainer_error = type(exc).__name__
+                finally:
+                    with self._condition:
+                        self._condition.notify_all()
+
+            self._drainer = threading.Thread(target=drain, name="vision-drainer", daemon=True)
+            self._drainer.start()
+        return self
+
+    def close(self, *, timeout: float = 60) -> Dict[str, Any]:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0:
+            raise SchemaInvalid("SCHEMA_INVALID", "close timeout must be finite nonnegative seconds")
+        import time
+        self._closing.set()
+        with self._condition:
+            ids = list(self._active_jobs)
+        for ident in ids:
+            try:
+                self.queue.cancel(ident)
+            except Conflict as exc:
+                if exc.code != "ALREADY_COMMITTED":
+                    raise
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._runners or self._heartbeats or (self._drainer is not None and self._drainer.is_alive()):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._condition.wait(min(left, .05))
+            return {"stopped": not self._runners and not self._heartbeats and not (self._drainer is not None and self._drainer.is_alive()),
+                    "active_jobs": sorted(self._active_jobs), "closing": True, "drainer_error": self._drainer_error}
+
+    def _validate_candidate(self, value: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
+        parameters = _validate_job(job)
+        fixed = {"kind": RESULT_KIND, "version": 1, "processor_version": VERSION,
+            "job_id": job["id"], "task_id": job["task_id"], "media_id": job["media_snapshot"]["id"],
+            "input_revision": job["input_revision"], "input_sha256": job["input_sha256"],
+            "file_sha256": job["media_snapshot"]["playback"]["sha256"], "time_domain": DOMAIN,
+            "semantic_listening": "not_performed", "source_unchanged": True,
+            "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
+        expected = set(fixed) | {"window", "subject_annotation_id", "scenes", "keyframes",
+                                 "extractor_status", "evidence"}
+        if (not isinstance(value, dict) or set(value) != expected
+                or any(value[key] != item for key, item in fixed.items())
+                or value["window"] != parameters["window"]
+                or value["subject_annotation_id"] != parameters["subject_annotation_id"]):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate identity is inconsistent")
+        if (not isinstance(value["scenes"], list) or len(value["scenes"]) > MAX_SCENES
+                or not isinstance(value["keyframes"], list) or len(value["keyframes"]) > MAX_KEYFRAMES):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate scene list is inconsistent")
+        for scene in value["scenes"]:
+            if (not isinstance(scene, dict) or set(scene) != {"start", "end", "duration"}
+                    or any(not isinstance(scene[key], (int, float)) or not math.isfinite(scene[key]) for key in scene)):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision scene descriptor is invalid")
+            if not 0 <= scene["start"] < scene["end"]:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision scene interval is invalid")
+        prefix = f"tmp/vision/jobs/{job['id']}/{job['attempt']}-{job['lease_generation']}/"
+        paths = set()
+        for evidence in value["evidence"]:
+            if (not isinstance(evidence, dict) or set(evidence) != {"relative_path", "sha256", "size_bytes"}
+                    or not isinstance(evidence["relative_path"], str) or not evidence["relative_path"].startswith(prefix)):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence descriptor is invalid")
+            path = evidence["relative_path"]
+            name = path[len(prefix):]
+            if (not name or PurePosixPath(name).name != name or "\\" in name or ":" in name or name in {".", ".."}
+                    or path in paths or not isinstance(evidence["sha256"], str) or S.HASH_RE.fullmatch(evidence["sha256"]) is None
+                    or not isinstance(evidence["size_bytes"], str) or not evidence["size_bytes"].isdigit()):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence path or identity is invalid")
+            paths.add(path)
+        return value
+
+    def _validate_snapshot(self, job: Dict[str, Any]) -> None:
+        with self.store.transaction():
+            if (self.store.get_media(job["media_snapshot"]["id"]) != job["media_snapshot"]
+                    or self.store.task_digest(job["task_snapshot"]) != job["input_sha256"]):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision frozen input was altered")
+
+    def result(self, job_id: str) -> Dict[str, Any]:
+        S.require_id(job_id)
+        try:
+            return self._read_result(job_id)
+        except (OSError, ValueError, KeyError, TypeError, RecursionError, SchemaInvalid) as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate or commit is corrupt") from exc
+
+    def _read_result(self, job_id: str) -> Dict[str, Any]:
+        S.require_id(job_id)
+        with self.store.transaction():
+            job = self.queue.get_job(job_id)
+            if job["operation"] != OPERATION:
+                raise Conflict("UNSUPPORTED_PROCESSOR", "Job is not a vision job")
+            if job["state"] != "succeeded" or job["commit"] is None:
+                raise Conflict("VISION_NOT_READY", "Vision has no committed successful candidate")
+            _validate_job(job)
+            self._validate_snapshot(job)
+            commit = job["commit"]
+            durable = self.store.conn.execute("SELECT body FROM durable_commits WHERE id=?", (commit["id"],)).fetchone()
+            descriptor = commit["artifact"]
+            row = self.store.conn.execute("SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?", (descriptor["id"],)).fetchone()
+            if (durable is None or json.loads(durable[0]) != commit or commit["job_id"] != job_id
+                    or commit["disposition"] != "candidate" or row is None or row[0] != "objects/" + row[1]
+                    or any(commit[key] != job[key] for key in ("task_id", "input_revision", "input_sha256",
+                                                               "processor_version", "idempotency_key", "lease_generation", "worker_id"))
+                    or descriptor != {"id": descriptor["id"], "relative_path": row[0], "sha256": row[1], "size_bytes": str(row[2])}
+                    or not 0 < row[2] <= MAX_RESULT_BYTES):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision commit or artifact binding is inconsistent")
+            path = self.store.root / row[0]
+            _safe(path)
+            try:
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode) or info.st_size != row[2]:
+                    raise ValueError("Candidate is not the registered regular file")
+                with path.open("rb") as stream:
+                    data = stream.read(MAX_RESULT_BYTES + 1)
+                if len(data) != row[2] or S.sha256_bytes(data) != row[1]:
+                    raise ValueError("Candidate identity mismatch")
+                value = json.loads(data)
+                if S.canonical_json(value) != data:
+                    raise ValueError("Candidate is not canonical finite JSON")
+                try:
+                    self._validate_candidate(value, job)
+                except SchemaInvalid as exc:
+                    raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate schema is corrupt") from exc
+                return value
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate is unavailable or corrupt") from exc
+
+    def apply(self, job_id: str, *, command_id: str, expected_revision: int,
+              expected_sha256: str, request_body: bytes) -> Dict[str, Any]:
+        """Commit server-loaded vision candidates as model_candidate annotations.
+
+        Every annotation carries provenance origin=model_candidate and an
+        unreviewed review status; a completed local review is refused by the
+        professional schema. Upgrading to human-reviewed ground truth is a
+        separate explicit command, never an automatic side effect.
+        """
+        from .professional_store import apply_vision_candidates
+
+        with self.store.transaction():
+            result = self.result(job_id)
+            annotations = _candidate_annotations(result)
+            arguments = dict(store=self.store, command_id=command_id, task_id=result["task_id"],
+                expected_revision=expected_revision, expected_sha256=expected_sha256,
+                candidates=annotations, source_job_id=result["job_id"], request_body=request_body)
+            if self.store.conn.execute("SELECT 1 FROM command_receipts WHERE command_id=?", (command_id,)).fetchone():
+                return self.store.apply_task_command(command_id=command_id, task_id=result["task_id"],
+                    expected_revision=expected_revision, expected_sha256=expected_sha256,
+                    operation="import_vision_candidates", payload={"candidates": annotations,
+                    "source_job_id": result["job_id"]}, request_body=request_body)["response"]
+            return apply_vision_candidates(**arguments)
+
+
+def _find_ffmpeg() -> str:
+    import shutil
+    executable = shutil.which("ffmpeg")
+    if executable is None:
+        raise WorkspaceError("DEPENDENCY_UNAVAILABLE", "ffmpeg is required for vision keyframe extraction")
+    return executable
+
+
+def _load_frame(path: Path) -> Any:
+    from ..core.hasher import safe_load_image
+    frame = safe_load_image(str(path))
+    if frame is None:
+        raise WorkspaceError("VISION_FRAME_FAILED", "Keyframe could not be decoded for analysis")
+    return frame
+
+
+def _aggregate_status(keyframes: List[Dict[str, Any]], extractor: str) -> str:
+    if not keyframes:
+        return "skipped"
+    statuses = [frame[extractor].get("status", "failed") for frame in keyframes]
+    if all(status == "success" for status in statuses):
+        return "success"
+    if all(status == "not_run" for status in statuses):
+        return "not_run"
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    return "partial"
+
+
+def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Map a vision candidate into model_candidate segment annotations.
+
+    Only time boundaries and objective extractor evidence are carried over.
+    A VLM caption is copied in as a text *draft* when present, but the
+    annotation stays provenance=model_candidate and review_status=unreviewed:
+    the human reviews and upgrades each candidate before it becomes
+    authoritative. A caption is never treated as a fact.
+    """
+    annotations = []
+    for index, scene in enumerate(candidate["scenes"]):
+        start = _seconds_ratio(float(scene["start"]))
+        end = _seconds_ratio(float(scene["end"]))
+        keyframe = next((frame for frame in candidate["keyframes"]
+                         if frame["scene_index"] == index), None)
+        tags = ["vision-candidate", "auto-scene-cut"]
+        text_draft = ""
+        if keyframe is not None:
+            face = keyframe.get("face", {})
+            if face.get("status") == "success" and face.get("face_count"):
+                tags.append("vision-face")
+                if face.get("crowd_level"):
+                    tags.append(face["crowd_level"])
+            ocr = keyframe.get("ocr", {})
+            if ocr.get("status") == "success" and ocr.get("ocr_readable"):
+                tags.append("vision-text")
+            clip = keyframe.get("clip", {})
+            if clip.get("status") == "success":
+                if clip.get("indoor_outdoor"):
+                    tags.append(clip["indoor_outdoor"])
+                if clip.get("screen_type") and clip["screen_type"] != "无屏":
+                    tags.append(clip["screen_type"])
+            vlm = keyframe.get("vlm", {})
+            if vlm.get("status") == "success" and vlm.get("caption"):
+                text_draft = vlm["caption"]
+                tags.append("vision-caption")
+        annotation = {
+            "id": S.make_id("ann", candidate["job_id"] + ":" + str(index)),
+            "type": "segment",
+            "label": f"{CANDIDATE_LABEL_PREFIX} {index + 1}",
+            "text": text_draft,
+            "tags": tags,
+            "track": CANDIDATE_TRACK,
+            "attributes": {},
+            "evidence_ids": [],
+            "provenance": {"origin": "model_candidate", "actor_id": "vision-worker",
+                           "job_id": candidate["job_id"]},
+            "review_status": "unreviewed",
+            "start": {"seconds": start},
+            "end": {"seconds": end},
+        }
+        annotations.append(annotation)
+    return annotations

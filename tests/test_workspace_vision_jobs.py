@@ -1,0 +1,283 @@
+"""Durable vision candidate jobs: scene cuts, keyframes, honest extractor status,
+candidate-only imports and the human upgrade path.
+
+The actual extractors (scene/face/ocr/clip) follow their own real behavior; this
+suite exercises the durable queue boundary, the candidate contract and the
+review discipline with a real ffmpeg fixture so scene detection runs for real.
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import threading
+
+import pytest
+
+from trace_annotate.workspace import schema as S
+from trace_annotate.workspace import vision_jobs as V
+from trace_annotate.workspace.errors import Conflict, SchemaInvalid, WorkspaceError
+from trace_annotate.workspace.queue import DurableQueue
+from trace_annotate.workspace.store import WorkspaceStore
+
+
+@pytest.fixture(scope="module")
+def clip(tmp_path_factory):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for vision fixtures")
+    source = tmp_path_factory.mktemp("vision-jobs-source") / "source.mp4"
+    # Two distinct scene blocks (blue, then red) so scene detection has a real cut.
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin",
+        "-f", "lavfi", "-i", "color=blue:s=64x64:r=10:d=0.5",
+        "-f", "lavfi", "-i", "color=red:s=64x64:r=10:d=0.5",
+        "-f", "lavfi", "-i", "sine=frequency=997:sample_rate=48000:duration=1.0",
+        "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+        "-map", "[v]", "-map", "2:a",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+    ], check=True, capture_output=True, timeout=60)
+    return source
+
+
+@pytest.fixture
+def store(tmp_path, clip):
+    project = WorkspaceStore(tmp_path / "workspace")
+    project.create()
+    try:
+        project.import_source(clip)
+        yield project
+    finally:
+        project.close()
+
+
+def task(store):
+    return store.get_task(store.list_tasks()[0]["task_id"])
+
+
+def submit(jobs, *, command_id="vision-first", **kwargs):
+    current = task(jobs.store)
+    return jobs.submit(current["id"], command_id=command_id, expected_revision=current["revision"],
+                       expected_sha256=jobs.store.task_digest(current), **kwargs)
+
+
+def fail_code(code, call):
+    with pytest.raises(WorkspaceError) as exc:
+        call()
+    assert exc.value.code == code
+
+
+def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    initial = task(store)
+    queued = submit(jobs)["jobs"][0]
+    assert queued["parameters"]["time_domain"] == "playback_seconds"
+    fail_code("VISION_NOT_READY", lambda: jobs.result(queued["id"]))
+    done = jobs.run_pending()[0]
+    assert done["state"] == "succeeded"
+    result = jobs.result(queued["id"])
+    assert result["file_sha256"] == store.get_media(initial["media_id"])["playback"]["sha256"]
+    assert result["scope"] == "registered_playback_only; original_source_not_measured; candidate_not_applied"
+    assert result["semantic_listening"] == "not_performed"
+    assert result["extractor_status"]["scene"] in {"success", "failed"}
+    assert len(result["scenes"]) >= 1
+    assert all({"start", "end", "duration"} <= set(scene) for scene in result["scenes"])
+    assert result["evidence"] and all(item["relative_path"].startswith("tmp/vision/jobs/") for item in result["evidence"])
+    assert str(store.root) not in json.dumps(result)
+    assert task(store) == initial
+    assert jobs.close()["stopped"]
+
+
+def test_vision_result_requires_success_and_correct_operation(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    other = DurableQueue(store)
+    batch = other.create_batch(items=[{"task_id": task(store)["id"],
+                                       "expected_revision": task(store)["revision"],
+                                       "expected_sha256": store.task_digest(task(store))}],
+                               operation="not-vision", processor_version="1", parameters={},
+                               command_id="other-op")
+    fail_code("UNSUPPORTED_PROCESSOR", lambda: jobs.result(batch["jobs"][0]["id"]))
+    fail_code("JOB_NOT_FOUND", lambda: jobs.result("job-does-not-exist"))
+    jobs.close()
+
+
+def test_submit_requires_reduced_interval_and_known_subject(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    current = task(store)
+    base = dict(command_id="receipt", expected_revision=current["revision"],
+                expected_sha256=store.task_digest(current))
+    fail_code("SCHEMA_INVALID", lambda: jobs.submit(current["id"], **base, window={"start": {"n": "0", "d": "1"}, "end": {"n": "2", "d": "2"}}))
+    fail_code("SCHEMA_INVALID", lambda: jobs.submit(current["id"], **base, window={"start": {"n": "1", "d": "2"}, "end": {"n": "1", "d": "2"}}))
+    fail_code("SCHEMA_INVALID", lambda: jobs.submit(current["id"], **base, window={"start": {"n": "0", "d": "1"}, "end": {"n": "1", "d": "1"}}, subject_annotation_id="ann-missing"))
+    jobs.close()
+
+
+def test_submit_is_idempotent_after_task_edit_and_shutdown(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    current = task(store)
+    arguments = dict(command_id="receipt", expected_revision=current["revision"], expected_sha256=store.task_digest(current))
+    first = jobs.submit(current["id"], **arguments)
+    with store.transaction():
+        result = store.apply_task_command(
+            command_id="edit-after-submit", task_id=current["id"], expected_revision=current["revision"],
+            expected_sha256=store.task_digest(current), operation="add_annotation",
+            payload={"annotation": {"id": "ann-touch", "type": "segment", "label": "touched",
+                                    "start": {"seconds": {"n": "0", "d": "1"}}, "end": {"seconds": {"n": "4", "d": "5"}}}},
+            request_body=b'{}')["response"]
+    jobs.close()
+    assert jobs.submit(current["id"], **arguments) == first
+    fail_code("WORKSPACE_CLOSING", lambda: jobs.submit(current["id"], command_id="new-after-close",
+                                                       expected_revision=current["revision"],
+                                                       expected_sha256=store.task_digest(current)))
+    fail_code("IDEMPOTENCY_CONFLICT", lambda: jobs.submit(current["id"], command_id="receipt",
+                                                          expected_revision=current["revision"],
+                                                          expected_sha256=store.task_digest(current),
+                                                          window={"start": {"n": "0", "d": "1"}, "end": {"n": "1", "d": "1"}}))
+    fail_code("IDEMPOTENCY_CONFLICT", lambda: submit(jobs, command_id="receipt"))
+    jobs.close()
+
+
+def test_apply_imports_candidates_as_model_candidate_and_refuses_reviewed(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    current = task(store)
+    queued = submit(jobs, command_id="vision-apply")["jobs"][0]
+    done = jobs.run_pending()[0]
+    assert done["state"] == "succeeded"
+    result = jobs.result(queued["id"])
+    annotations = V._candidate_annotations(result)
+    assert annotations and all(a["provenance"]["origin"] == "model_candidate" for a in annotations)
+    assert all(a["provenance"]["job_id"] == queued["id"] for a in annotations)
+    assert all(a["review_status"] == "unreviewed" for a in annotations)
+    body = json.dumps({"candidates": annotations, "source_job_id": queued["id"]}).encode("utf-8")
+    applied = jobs.apply(queued["id"], command_id="apply-cmd",
+                         expected_revision=current["revision"], expected_sha256=store.task_digest(current),
+                         request_body=body)
+    assert applied["candidate_count"] == len(annotations)
+    after = task(store)
+    assert len(after["annotations"]) == len(annotations)
+    assert all(a["review_status"] == "unreviewed" for a in after["annotations"])
+    # Review attempt on a model candidate is refused by the store path.
+    for annotation in after["annotations"]:
+        fail_code("SCHEMA_INVALID", lambda a=annotation: store.apply_task_command(
+            command_id="review-candidate", task_id=after["id"], expected_revision=after["revision"],
+            expected_sha256=store.task_digest(after), operation="review_annotation",
+            payload={"annotation_id": a["id"], "reviewed": True}, request_body=b'{}'))
+    jobs.close()
+
+
+def test_human_upgrade_rewrites_origin_then_reviews(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    current = task(store)
+    queued = submit(jobs, command_id="vision-upgrade")["jobs"][0]
+    jobs.run_pending()
+    result = jobs.result(queued["id"])
+    annotations = V._candidate_annotations(result)
+    body = json.dumps({"candidates": annotations, "source_job_id": queued["id"]}).encode("utf-8")
+    jobs.apply(queued["id"], command_id="apply-upgrade",
+               expected_revision=current["revision"], expected_sha256=store.task_digest(current), request_body=body)
+    after = task(store)
+    candidate = after["annotations"][0]
+    upgraded = store.apply_task_command(
+        command_id="human-edit", task_id=after["id"], expected_revision=after["revision"],
+        expected_sha256=store.task_digest(after), operation="update_annotation",
+        payload={"annotation_id": candidate["id"],
+                 "changes": {"label": "人工确认的镜头", "provenance": {"origin": "manual", "actor_id": "local-user", "job_id": None}}},
+        request_body=b'{}')["response"]
+    after = store.get_task(after["id"])
+    reviewed = store.apply_task_command(
+        command_id="human-review", task_id=after["id"], expected_revision=after["revision"],
+        expected_sha256=store.task_digest(after), operation="review_annotation",
+        payload={"annotation_id": candidate["id"], "reviewed": True}, request_body=b'{}')["response"]
+    final = store.get_task(after["id"])
+    upgraded_ann = next(a for a in final["annotations"] if a["id"] == candidate["id"])
+    assert upgraded_ann["label"] == "人工确认的镜头"
+    assert upgraded_ann["provenance"]["origin"] == "manual"
+    assert upgraded_ann["review_status"] == "reviewed"
+    assert isinstance(upgraded_ann.get("review_binding"), dict)
+    assert upgraded_ann["review_binding"]["actor_id"] == "local-user"
+    jobs.close()
+
+
+def test_close_stops_runner_and_cancels_active(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    submit(jobs)
+    started = threading.Event()
+
+    def run():
+        jobs.run_pending()
+    thread = threading.Thread(target=run)
+    thread.start()
+    started.set()
+    report = jobs.close(timeout=5)
+    thread.join(timeout=5)
+    assert report["closing"] is True
+    assert report["stopped"] is True
+
+
+def test_http_vision_chain_submit_result_apply_status(store, clip):
+    """Exercise the loopback HTTP vision routes end to end on a real import."""
+    import threading
+    import time
+    import urllib.request
+    from trace_annotate.workspace.server import TOKEN_HEADER, make_server
+
+    server = make_server(store)
+    # Replace the auto-started worker with one that degrades CLIP/VLM to
+    # not_run: this test exercises the HTTP contract, not real model weights.
+    server.vision_jobs.close(timeout=5)
+    server.vision_jobs = V.VisionJobs(store, queue=server.queue, closing=server.closing,
+                                      clip_model_path="nonexistent-clip-weights",
+                                      vlm_model_path="nonexistent-vlm-weights")
+    server.vision_jobs.start()
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    base = f"http://127.0.0.1:{port}/api/v1/projects/current/"
+    headers = {"Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}", TOKEN_HEADER: server.token}
+
+    def get(path):
+        request = urllib.request.Request(base + path, headers=headers)
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read())
+
+    def post(path, body):
+        request = urllib.request.Request(base + path, data=json.dumps(body).encode("utf-8"),
+                                         headers={**headers, "Content-Type": "application/json"})
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read())
+
+    try:
+        options = get("vision-options")
+        assert options["capabilities"]["scene"] is True
+        raw = clip.read_bytes()
+        upload = urllib.request.Request(base + "imports", data=raw, headers={**headers,
+            "Content-Type": "application/octet-stream", "Content-Length": str(len(raw)),
+            "X-TraceAnnotate-Filename": "vision-source.mp4"})
+        with urllib.request.urlopen(upload) as response:
+            admitted = json.loads(response.read())
+        task_id = admitted["task_id"]
+        current = get(f"tasks/{task_id}")
+        submission = {"command_id": "http-vision-submit", "expected_revision": current["revision"],
+                      "expected_sha256": current["content_sha256"], "window": None, "subject_annotation_id": None}
+        batch = post(f"tasks/{task_id}/vision-jobs", submission)
+        job_id = batch["jobs"][0]["id"]
+        result = None
+        for _ in range(80):
+            try:
+                result = get(f"jobs/{job_id}/vision-result")
+                break
+            except Exception:
+                time.sleep(0.1)
+        assert result is not None
+        assert result["kind"] == "traceannotate.vision-candidate"
+        assert result["scenes"]
+        applied = post(f"jobs/{job_id}/apply-vision", {"command_id": "http-vision-apply",
+            "expected_revision": current["revision"], "expected_sha256": current["content_sha256"],
+            "operation": "apply_vision_job", "payload": {}})
+        assert applied["candidate_count"] == len(result["scenes"])
+        status = get(f"tasks/{task_id}/vision-status")
+        assert status["candidate_count"] == len(result["scenes"])
+        assert all(c["provenance"]["origin"] == "model_candidate" for c in status["candidates"])
+    finally:
+        server.shutdown()
+        thread.join(timeout=10)
+        server.server_close()
