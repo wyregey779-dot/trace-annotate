@@ -57,7 +57,8 @@ def prepare_task(store, current, operation, payload, *, command_id):
                     or provenance.get('job_id') != source_job_id):
                 raise SchemaInvalid('SCHEMA_INVALID',
                                     'Vision candidate must carry model_candidate provenance from its source job')
-            PS.validate_annotation(candidate, media, template)
+            declared = {row[0] for row in store.conn.execute("SELECT id FROM artifacts")}
+            PS.validate_annotation(candidate, media, template, artifact_ids=declared)
             task['annotations'].append(candidate)
     elif operation == 'set_analysis_reports':
         reports = payload.get('reports')

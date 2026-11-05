@@ -11,6 +11,7 @@ import re
 from typing import Any
 
 from . import schema as S
+from . import semantic_schema as SS
 from .errors import SchemaInvalid
 
 KIND = "traceannotate.professional-task"
@@ -266,7 +267,8 @@ def task_content_digest(task, media, template, artifacts):
                          "media":media_copy,"template":template,"artifacts":[descriptor]})
 
 
-def validate_annotation(annotation, media, template):
+def validate_annotation(annotation, media, template, *, artifact_ids=None, actor_types=None,
+                        model_run_ids=None):
     _object(annotation, {"id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids", "provenance", "review_status"},
             {"start", "end", "at", "legacy_id", "review_binding"})
     S.require_id(annotation["id"])
@@ -280,8 +282,6 @@ def validate_annotation(annotation, media, template):
         _text(tag)
     if "legacy_id" in annotation:
         _text(annotation["legacy_id"], nonempty=True)
-    if annotation["attributes"] != {} or annotation["evidence_ids"] != []:
-        _invalid("Custom annotation attributes and evidence require their own admission", "UNSUPPORTED_PROFESSIONAL_EVIDENCE")
     _object(annotation["provenance"], {"origin", "actor_id", "job_id"})
     if annotation["provenance"]["origin"] not in ("manual", "imported", "model_candidate", "derived"):
         _invalid("Unknown provenance origin")
@@ -292,6 +292,23 @@ def validate_annotation(annotation, media, template):
         _invalid("Unknown review status")
     if annotation["provenance"]["origin"] == "model_candidate" and annotation["review_status"] == "reviewed":
         _invalid("Model candidate cannot carry a completed local review")
+    # Semantic claims are admitted only through the frozen visual-semantics-v1 contract.
+    declared_artifacts = set(artifact_ids or ())
+    if not isinstance(annotation["attributes"], dict) or set(annotation["attributes"]) - {"semantic"}:
+        _invalid("Annotation attributes may only carry semantic claims", "UNSUPPORTED_PROFESSIONAL_EVIDENCE")
+    if not isinstance(annotation["evidence_ids"], list):
+        _invalid("Annotation evidence must be an array", "UNSUPPORTED_PROFESSIONAL_EVIDENCE")
+    for ref in annotation["evidence_ids"]:
+        if S.require_id(ref) not in declared_artifacts:
+            _invalid("Annotation evidence id is not a declared artifact", "UNSUPPORTED_PROFESSIONAL_EVIDENCE")
+    if annotation["attributes"]:
+        origin = annotation["provenance"]["origin"]
+        actor_type = (actor_types or {}).get(annotation["provenance"]["actor_id"])
+        if actor_type is None:
+            actor_type = "human" if origin == "manual" else "tool"
+        SS.validate_semantic(annotation["attributes"]["semantic"], actor_type=actor_type,
+                             model_run_ids=set(model_run_ids or ()),
+                             evidence_ids=annotation["evidence_ids"])
     if "review_binding" in annotation:
         review=annotation["review_binding"]
         _object(review,{"content_sha256","actor_id","command_id","reviewed_at","task_revision"})
@@ -353,9 +370,33 @@ def _validate_document(document):
     if not isinstance(task["extensions"],dict) or not isinstance(task.get("legacy_document_metadata",{}),dict):
         _invalid("Task extension and legacy metadata must be objects")
     if task.get("evidence",[])!=[]:_invalid("Evidence files require admission","UNSUPPORTED_PROFESSIONAL_EVIDENCE")
+    actor_types={}
+    for actor in _list(document["actors"],4096):
+        _object(actor,{"id","type","display_name","identity_verification"})
+        S.require_id(actor["id"]);_text(actor["display_name"],nonempty=True)
+        if actor["id"] in actor_types or actor["type"] not in ("human","assistant","tool","historical_unverified") or actor["identity_verification"] not in ("local_only","unverified","verified_external"):
+            _invalid("Invalid or duplicate actor")
+        actor_types[actor["id"]]=actor["type"]
+    artifact_ids=set()
+    for artifact in _list(document["artifacts"],50_000):
+        _object(artifact,{"id","relative_path","sha256","size_bytes"})
+        S.require_id(artifact["id"]);S.require_hash(artifact["sha256"]);_decimal(artifact["size_bytes"])
+        if artifact["relative_path"]!="objects/"+artifact["sha256"] or artifact["id"] in artifact_ids:
+            _invalid("Invalid artifact path or duplicate identifier")
+        artifact_ids.add(artifact["id"])
+    if media["frame_map_artifact"] not in artifact_ids:
+        _invalid("Frame-map manifest is required")
+    extension=task["extensions"].get("professional",{})
+    if not isinstance(extension,dict):_invalid("Professional extension must be an object")
+    model_run_ids=set()
+    for run in _list(extension.get("model_runs",[]),SS.MAX_MODEL_RUNS):
+        checked=SS.validate_model_run(run)
+        if checked["id"] in model_run_ids:_invalid("Duplicate model run identifier")
+        model_run_ids.add(checked["id"])
     seen=set()
     for annotation in _list(task["annotations"]):
-        validate_annotation(annotation,media,template)
+        validate_annotation(annotation,media,template,artifact_ids=artifact_ids,
+                            actor_types=actor_types,model_run_ids=model_run_ids)
         if annotation["id"] in seen:_invalid("Duplicate annotation identifier")
         seen.add(annotation["id"])
         if "review_binding" in annotation:
@@ -378,24 +419,8 @@ def _validate_document(document):
         _invalid("Analyses differ from the authoritative saved task reports")
     if document["analysis_assessment"]!=[derived_analysis_status(task,media,r) for r in document["analyses"]]:
         _invalid("Analysis assessment does not match current dependencies")
-    actors=set()
-    for actor in _list(document["actors"],4096):
-        _object(actor,{"id","type","display_name","identity_verification"})
-        S.require_id(actor["id"]);_text(actor["display_name"],nonempty=True)
-        if actor["id"] in actors or actor["type"] not in ("human","assistant","tool","historical_unverified") or actor["identity_verification"] not in ("local_only","unverified","verified_external"):
-            _invalid("Invalid or duplicate actor")
-        actors.add(actor["id"])
-    if any(a["provenance"]["actor_id"] not in actors for a in task["annotations"]):
+    if any(a["provenance"]["actor_id"] not in actor_types for a in task["annotations"]):
         _invalid("Annotation actor is missing from actor declarations")
-    artifact_ids=set()
-    for artifact in _list(document["artifacts"],50_000):
-        _object(artifact,{"id","relative_path","sha256","size_bytes"})
-        S.require_id(artifact["id"]);S.require_hash(artifact["sha256"]);_decimal(artifact["size_bytes"])
-        if artifact["relative_path"]!="objects/"+artifact["sha256"] or artifact["id"] in artifact_ids:
-            _invalid("Invalid artifact path or duplicate identifier")
-        artifact_ids.add(artifact["id"])
-    if media["frame_map_artifact"] not in artifact_ids:
-        _invalid("Frame-map manifest is required")
     if task["content_sha256"]!=task_content_digest(task,media,template,document["artifacts"]):
         _invalid("Task content digest does not match exported media/template/annotation state","TASK_DIGEST_MISMATCH")
     history=document["history"]

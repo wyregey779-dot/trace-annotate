@@ -1,0 +1,107 @@
+{
+  "digest_version": "visual-semantics-v1",
+  "claim": {
+    "fields": [
+      "claim_type",
+      "statement",
+      "subject_ref",
+      "time_window",
+      "evidence_ids",
+      "method",
+      "model_run_id",
+      "score",
+      "score_kind",
+      "uncertainty_reason"
+    ],
+    "excludes": [
+      "id"
+    ],
+    "input": {
+      "digest_version": "visual-semantics-v1",
+      "claim": "<projection>"
+    }
+  },
+  "semantic": {
+    "fields": [
+      "version",
+      "claims"
+    ],
+    "claims_sorted_by": "id",
+    "input": {
+      "digest_version": "visual-semantics-v1",
+      "version": "visual-semantics-v1",
+      "claims": [
+        "<claim digest projections>"
+      ]
+    }
+  },
+  "model_run": {
+    "fields": [
+      "provider",
+      "model_name",
+      "model_version",
+      "weights_sha256",
+      "license",
+      "preprocessing",
+      "parameters",
+      "input_sha256",
+      "code_version",
+      "status",
+      "failure_reason",
+      "score_kind"
+    ],
+    "excludes": [
+      "id",
+      "output_sha256"
+    ],
+    "input": {
+      "digest_version": "visual-semantics-v1",
+      "run": "<projection>"
+    }
+  },
+  "annotation_review": {
+    "fields": [
+      "id",
+      "type",
+      "label",
+      "text",
+      "tags",
+      "track",
+      "attributes",
+      "evidence_ids",
+      "provenance",
+      "start",
+      "end",
+      "at",
+      "legacy_id"
+    ],
+    "excludes": [
+      "review_status",
+      "review_binding"
+    ],
+    "input": {
+      "annotation": "<annotation without review fields>",
+      "media_id": "...",
+      "template_id": "...",
+      "template_version": 1
+    },
+    "note": "identical to the existing workspace/professional review binding"
+  },
+  "task": {
+    "note": "task digest is owned by workspace/schema.task_content_sha256 and professional_schema.task_content_digest; semantic fields travel inside annotations and therefore already participate",
+    "excludes": [
+      "content_sha256",
+      "review_binding"
+    ]
+  },
+  "sample_digests": {
+    "claim_digests": {
+      "claim-0f2a7c1d9b3e5a41": "41099b679f27c4820be83f8bd17ed21adcb636b41c79de24908af755d1ac5ac0",
+      "claim-1a2b3c4d5e6f7a8b": "80ecac02f81518aab2b3be3c90b21729a729e844da11358f6e0fc6ea6c941770",
+      "claim-2b3c4d5e6f7a8b9c": "48868156d8a6d21c1337e0ddb231b5c83184359e8b9fc7c77da49d5490637d57"
+    },
+    "semantic_digest": "aebafb89276c5c65ddf9083ec537dc918ae0f673fb4c5074285a03b04abfbb9d",
+    "model_run_digest": "ca4fa471cc93b83e3f2c5acbd68e32c448113b269e8f5f771d13c6110f53ef9e",
+    "annotation_review_digest": "c5ab8490e877a95d5c91b743f8ba58d1c53359322b692c33ae2da37ccb950f2e"
+  }
+}

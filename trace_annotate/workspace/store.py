@@ -1137,7 +1137,9 @@ class WorkspaceStore:
         if "legacy_id" in ann and (not isinstance(ann["legacy_id"], str) or not ann["legacy_id"].strip()):
             raise SchemaInvalid("SCHEMA_INVALID", "legacy_id must be a nonempty string")
         if ann["evidence_ids"] != [] or ann["attributes"] != {}:
-            raise SchemaInvalid("UNSUPPORTED_OPERATION", "Evidence and custom attributes need their own admission workflow")
+            if not isinstance(ann["attributes"], dict) or set(ann["attributes"]) - {"semantic"}:
+                raise SchemaInvalid("UNSUPPORTED_OPERATION",
+                                    "Only versioned semantic claims are admitted in attributes")
         provenance = ann["provenance"]
         if (not isinstance(provenance, dict) or set(provenance) != {"origin", "actor_id", "job_id"}
                 or provenance["origin"] not in {"manual", "imported", "model_candidate"}):
@@ -1152,6 +1154,24 @@ class WorkspaceStore:
         elif provenance["job_id"] is not None:
             raise SchemaInvalid("SCHEMA_INVALID", "Manual and imported provenance cannot carry a job id")
         S.require_id(provenance.get("actor_id"))
+        if ann["evidence_ids"] or ann["attributes"]:
+            from . import semantic_schema as SS
+            if not isinstance(ann["evidence_ids"], list):
+                raise SchemaInvalid("UNSUPPORTED_OPERATION", "Evidence must be an array of artifact ids")
+            declared = {row[0] for row in self.conn.execute("SELECT id FROM artifacts")}
+            for ref in ann["evidence_ids"]:
+                if S.require_id(ref) not in declared:
+                    raise SchemaInvalid("UNSUPPORTED_PROFESSIONAL_EVIDENCE",
+                                        "Annotation evidence must reference a registered artifact")
+            if ann["attributes"]:
+                SS.validate_semantic(ann["attributes"]["semantic"],
+                                     actor_type="human" if provenance["origin"] == "manual" else "tool",
+                                     model_run_ids=None, evidence_ids=declared)
+                if provenance["origin"] == "model_candidate" and any(
+                        claim["claim_type"] == "interpretation"
+                        for claim in ann["attributes"]["semantic"]["claims"]):
+                    raise SchemaInvalid("INTERPRETATION_REQUIRES_HUMAN",
+                                        "Model candidates cannot store interpretations")
         times = {"whole_clip": set(), "event": {"at"}, "segment": {"start", "end"}}[kind]
         if {"start", "end", "at"}.intersection(ann) != times:
             raise SchemaInvalid("SCHEMA_INVALID", "Invalid time fields for this annotation type")

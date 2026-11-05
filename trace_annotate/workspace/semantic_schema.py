@@ -1,0 +1,316 @@
+"""Versioned semantic contract: Claims, evidence refs, model runs, lineage.
+
+The contract separates four statement kinds and never upgrades a model result
+to a reviewed fact. Validation here is structural: it can prove that a claim is
+labelled, authored and evidenced, not that a sentence is true.
+"""
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from . import schema as S
+from .errors import SchemaInvalid
+
+SEMANTIC_VERSION = "visual-semantics-v1"
+DIGEST_VERSION = "visual-semantics-v1"
+CLAIM_TYPES: Tuple[str, ...] = ("observable", "measured", "interpretation", "unspecified")
+SCORE_KINDS: Tuple[str, ...] = ("similarity", "softmax", "rule_score", "confidence", "none")
+MODEL_RUN_STATUSES: Tuple[str, ...] = ("success", "failed", "not_run")
+ACTOR_TYPES: Tuple[str, ...] = ("human", "assistant", "tool")
+REVIEW_DECISIONS: Tuple[str, ...] = ("accepted", "edited", "rejected")
+MAX_CLAIMS = 32
+MAX_EVIDENCE_PER_CLAIM = 32
+MAX_MODEL_RUNS = 16
+MAX_STATEMENT_CHARS = 2000
+MAX_UNCERTAINTY_CHARS = 500
+
+CLAIM_FIELDS = ("id", "claim_type", "statement", "subject_ref", "time_window",
+                "evidence_ids", "method", "model_run_id", "score", "score_kind",
+                "uncertainty_reason")
+MODEL_RUN_FIELDS = ("id", "provider", "model_name", "model_version", "weights_sha256",
+                    "license", "preprocessing", "parameters", "input_sha256",
+                    "output_sha256", "code_version", "status", "failure_reason",
+                    "score_kind")
+LINEAGE_FIELDS = ("job_id", "model_run_ids", "input_sha256", "result_sha256",
+                  "parameters", "created_at")
+DECISION_FIELDS = ("actor_id", "actor_type", "decision", "reviewed_at",
+                   "content_sha256", "previous_content_sha256", "command_id",
+                   "diff_summary")
+SEMANTIC_FIELDS = ("version", "claims")
+
+# Fields that participate in each digest. Self-referential summaries are excluded.
+CLAIM_DIGEST_FIELDS = ("claim_type", "statement", "subject_ref", "time_window",
+                       "evidence_ids", "method", "model_run_id", "score", "score_kind",
+                       "uncertainty_reason")
+MODEL_RUN_DIGEST_FIELDS = ("provider", "model_name", "model_version", "weights_sha256",
+                           "license", "preprocessing", "parameters", "input_sha256",
+                           "code_version", "status", "failure_reason", "score_kind")
+ANNOTATION_REVIEW_SUBJECT_FIELDS = ("id", "type", "label", "text", "tags", "track",
+                                    "attributes", "evidence_ids", "provenance",
+                                    "start", "end", "at", "legacy_id")
+ANNOTATION_REVIEW_EXCLUDED_FIELDS = ("review_status", "review_binding")
+
+DIGEST_PROJECTIONS = {
+    "digest_version": DIGEST_VERSION,
+    "claim": {"fields": list(CLAIM_DIGEST_FIELDS), "excludes": ["id"],
+              "input": {"digest_version": DIGEST_VERSION, "claim": "<projection>"}},
+    "semantic": {"fields": ["version", "claims"],
+                 "claims_sorted_by": "id",
+                 "input": {"digest_version": DIGEST_VERSION, "version": "visual-semantics-v1",
+                           "claims": ["<claim digest projections>"]}},
+    "model_run": {"fields": list(MODEL_RUN_DIGEST_FIELDS),
+                  "excludes": ["id", "output_sha256"],
+                  "input": {"digest_version": DIGEST_VERSION, "run": "<projection>"}},
+    "annotation_review": {
+        "fields": list(ANNOTATION_REVIEW_SUBJECT_FIELDS),
+        "excludes": list(ANNOTATION_REVIEW_EXCLUDED_FIELDS),
+        "input": {"annotation": "<annotation without review fields>", "media_id": "...",
+                  "template_id": "...", "template_version": 1},
+        "note": "identical to the existing workspace/professional review binding",
+    },
+    "task": {"note": "task digest is owned by workspace/schema.task_content_sha256 and professional_schema.task_content_digest; semantic fields travel inside annotations and therefore already participate",
+             "excludes": ["content_sha256", "review_binding"]},
+}
+
+
+def _invalid(message: str, code: str = "INVALID_SEMANTIC_CLAIM") -> None:
+    raise SchemaInvalid(code, message)
+
+
+def _object(value: Any, fields: Sequence[str], what: str) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(fields):
+        _invalid(f"{what} must contain exactly {list(fields)}")
+    return value
+
+
+def _bounded_text(value: Any, field: str, maximum: int, *, nonempty: bool = True) -> str:
+    if not isinstance(value, str) or len(value) > maximum or (nonempty and not value):
+        _invalid(f"{field} must be a bounded non-empty string")
+    return value
+
+
+def _nullable_id(value: Any, field: str) -> Optional[str]:
+    if value is None:
+        return None
+    return S.require_id(value, field)
+
+
+def _time_window(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    _object(value, ("start", "end"), "time_window")
+    start = value["start"]
+    end = value["end"]
+    _object(start, ("seconds",), "time_window.start")
+    _object(end, ("seconds",), "time_window.end")
+    start_seconds = S.rational(start["seconds"])
+    end_seconds = S.rational(end["seconds"])
+    if start_seconds != start["seconds"] or end_seconds != end["seconds"]:
+        _invalid("time_window seconds must be reduced rationals")
+    if S.rational_value(start_seconds) >= S.rational_value(end_seconds):
+        _invalid("time_window start must precede end")
+    return {"start": {"seconds": start_seconds}, "end": {"seconds": end_seconds}}
+
+
+def _score(value: Any, score_kind: Any) -> Tuple[Optional[float], str]:
+    if score_kind not in SCORE_KINDS:
+        _invalid("score_kind must be one of %s" % (SCORE_KINDS,), "INVALID_SCORE_KIND")
+    if value is None:
+        if score_kind != "none":
+            _invalid("A missing score requires score_kind=none", "INVALID_SCORE_KIND")
+        return None, score_kind
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        _invalid("score must be a finite number or null")
+    if score_kind == "none":
+        _invalid("A present score requires an explicit score kind", "INVALID_SCORE_KIND")
+    return float(value), score_kind
+
+
+def validate_claim(claim: Any, *, actor_type: str = "human", model_run_ids: Iterable[str] = (),
+                   evidence_ids: Iterable[str] = ()) -> Dict[str, Any]:
+    """Validate one claim. Actor type decides whether inference is permitted."""
+    if actor_type not in ACTOR_TYPES:
+        _invalid("Unknown actor type")
+    item = _object(claim, CLAIM_FIELDS, "claim")
+    S.require_id(item["id"], "claim id")
+    claim_type = item["claim_type"]
+    if claim_type not in CLAIM_TYPES:
+        _invalid("claim_type must be one of %s" % (CLAIM_TYPES,), "INVALID_CLAIM_TYPE")
+    statement = _bounded_text(item["statement"], "statement", MAX_STATEMENT_CHARS)
+    subject = _nullable_id(item["subject_ref"], "subject_ref")
+    window = _time_window(item["time_window"])
+    if not isinstance(item["evidence_ids"], list) or len(item["evidence_ids"]) > MAX_EVIDENCE_PER_CLAIM:
+        _invalid("evidence_ids must be a bounded array")
+    allowed_evidence = set(evidence_ids)
+    for value in item["evidence_ids"]:
+        ref = S.require_id(value, "evidence id")
+        if ref not in allowed_evidence:
+            _invalid(f"evidence id {ref} is not declared on the annotation",
+                     "UNSUPPORTED_PROFESSIONAL_EVIDENCE")
+    method = item["method"]
+    _object(method, ("id", "version", "parameters"), "method")
+    S.require_id(method["id"], "method id")
+    _bounded_text(method["version"], "method version", 120)
+    if not isinstance(method["parameters"], dict):
+        _invalid("method parameters must be an object")
+    S.canonical_json(method["parameters"])
+    run_id = _nullable_id(item["model_run_id"], "model_run_id")
+    if model_run_ids is not None and run_id is not None and run_id not in set(model_run_ids):
+        _invalid(f"model run {run_id} is not declared", "INVALID_SEMANTIC_CLAIM")
+    score, score_kind = _score(item["score"], item["score_kind"])
+    uncertainty = item["uncertainty_reason"]
+    if uncertainty is not None:
+        _bounded_text(uncertainty, "uncertainty_reason", MAX_UNCERTAINTY_CHARS)
+    if claim_type == "interpretation" and actor_type != "human":
+        _invalid("Only a human author may store an interpretation",
+                 "INTERPRETATION_REQUIRES_HUMAN")
+    if claim_type == "measured":
+        if score_kind == "none":
+            _invalid("A measured claim requires a score kind, not 'none'", "INVALID_SCORE_KIND")
+        if score is None:
+            _invalid("A measured claim requires its numeric result", "INVALID_SEMANTIC_CLAIM")
+    return {
+        "id": item["id"], "claim_type": claim_type, "statement": statement,
+        "subject_ref": subject, "time_window": window,
+        "evidence_ids": list(item["evidence_ids"]), "method": method,
+        "model_run_id": run_id, "score": score, "score_kind": score_kind,
+        "uncertainty_reason": uncertainty,
+    }
+
+
+def validate_semantic(value: Any, *, actor_type: str = "human",
+                      model_run_ids: Iterable[str] = (),
+                      evidence_ids: Iterable[str] = ()) -> Dict[str, Any]:
+    """Validate the whole attributes.semantic object and freeze its version."""
+    item = _object(value, SEMANTIC_FIELDS, "attributes.semantic")
+    if item["version"] != SEMANTIC_VERSION:
+        _invalid("Unknown semantic version", "UNKNOWN_SEMANTIC_VERSION")
+    claims = item["claims"]
+    if not isinstance(claims, list) or len(claims) > MAX_CLAIMS:
+        _invalid("claims must be a bounded array")
+    seen = set()
+    validated: List[Dict[str, Any]] = []
+    for claim in claims:
+        checked = validate_claim(claim, actor_type=actor_type,
+                                 model_run_ids=model_run_ids, evidence_ids=evidence_ids)
+        if checked["id"] in seen:
+            _invalid("Claim identifiers must be unique")
+        seen.add(checked["id"])
+        validated.append(checked)
+    return {"version": SEMANTIC_VERSION, "claims": validated}
+
+
+def validate_model_run(run: Any) -> Dict[str, Any]:
+    item = _object(run, MODEL_RUN_FIELDS, "model run")
+    S.require_id(item["id"], "model run id")
+    _bounded_text(item["provider"], "provider", 120)
+    _bounded_text(item["model_name"], "model_name", 200)
+    _bounded_text(item["model_version"], "model_version", 120)
+    if item["weights_sha256"] is not None:
+        S.require_hash(item["weights_sha256"], "weights_sha256")
+    _bounded_text(item["license"], "license", 200)
+    S.canonical_json(item["preprocessing"])
+    if not isinstance(item["preprocessing"], dict):
+        _invalid("preprocessing must be an object")
+    if not isinstance(item["parameters"], dict):
+        _invalid("parameters must be an object")
+    S.canonical_json(item["parameters"])
+    S.require_hash(item["input_sha256"], "input_sha256")
+    if item["output_sha256"] is not None:
+        S.require_hash(item["output_sha256"], "output_sha256")
+    _bounded_text(item["code_version"], "code_version", 120)
+    status = item["status"]
+    if status not in MODEL_RUN_STATUSES:
+        _invalid("status must be one of %s" % (MODEL_RUN_STATUSES,))
+    if status == "success":
+        if item["failure_reason"] is not None or item["output_sha256"] is None:
+            _invalid("A successful run needs an output hash and no failure reason")
+    else:
+        _bounded_text(item["failure_reason"], "failure_reason", 500)
+    if item["score_kind"] not in SCORE_KINDS:
+        _invalid("score_kind must be one of %s" % (SCORE_KINDS,), "INVALID_SCORE_KIND")
+    return dict(item)
+
+
+def validate_lineage(value: Any, *, model_run_ids: Iterable[str] = ()) -> Dict[str, Any]:
+    item = _object(value, LINEAGE_FIELDS, "generation lineage")
+    S.require_id(item["job_id"], "job_id")
+    if not isinstance(item["model_run_ids"], list):
+        _invalid("model_run_ids must be an array")
+    allowed = set(model_run_ids)
+    for ref in item["model_run_ids"]:
+        if S.require_id(ref, "model run id") not in allowed:
+            _invalid(f"lineage run {ref} is not declared")
+    S.require_hash(item["input_sha256"], "input_sha256")
+    S.require_hash(item["result_sha256"], "result_sha256")
+    if not isinstance(item["parameters"], dict):
+        _invalid("lineage parameters must be an object")
+    _bounded_text(item["created_at"], "created_at", 80)
+    return dict(item)
+
+
+def validate_review_decision(value: Any, *, content_sha256: Optional[str] = None) -> Dict[str, Any]:
+    item = _object(value, DECISION_FIELDS, "review decision")
+    S.require_id(item["actor_id"], "actor_id")
+    if item["actor_type"] not in ACTOR_TYPES:
+        _invalid("actor_type must be one of %s" % (ACTOR_TYPES,))
+    if item["decision"] not in REVIEW_DECISIONS:
+        _invalid("decision must be one of %s" % (REVIEW_DECISIONS,))
+    _bounded_text(item["reviewed_at"], "reviewed_at", 80)
+    S.require_hash(item["content_sha256"], "content_sha256")
+    if item["previous_content_sha256"] is not None:
+        S.require_hash(item["previous_content_sha256"], "previous_content_sha256")
+    S.require_id(item["command_id"], "command_id")
+    if item["diff_summary"] is not None:
+        _bounded_text(item["diff_summary"], "diff_summary", 500)
+    if content_sha256 is not None and item["content_sha256"] != content_sha256:
+        _invalid("Review decision does not bind current content", "STALE_REVIEW_BINDING")
+    return dict(item)
+
+
+def claim_digest(claim: Dict[str, Any]) -> str:
+    projection = {key: claim[key] for key in CLAIM_DIGEST_FIELDS}
+    return S.sha256_text({"digest_version": DIGEST_VERSION, "claim": projection})
+
+
+def semantic_digest(semantic: Dict[str, Any]) -> str:
+    claims = [claim_digest(claim) for claim in sorted(semantic["claims"], key=lambda c: c["id"])]
+    return S.sha256_text({"digest_version": DIGEST_VERSION, "version": semantic["version"],
+                          "claims": claims})
+
+
+def annotation_review_digest(annotation: Dict[str, Any], *, media_id: str,
+                             template_id: str, template_version: int) -> str:
+    """Same rule as the workspace store: review binds content, not its own summary."""
+    subject = {key: value for key, value in annotation.items()
+               if key not in ("review_status", "review_binding")}
+    return S.sha256_text({"annotation": subject, "media_id": media_id,
+                          "template_id": template_id, "template_version": template_version})
+
+
+def model_run_digest(run: Dict[str, Any]) -> str:
+    projection = {key: run[key] for key in MODEL_RUN_DIGEST_FIELDS}
+    return S.sha256_text({"digest_version": DIGEST_VERSION, "run": projection})
+
+
+def build_semantic(claims: Sequence[Dict[str, Any]], *, actor_type: str = "human",
+                   model_run_ids: Iterable[str] = (), evidence_ids: Iterable[str] = ()) -> Dict[str, Any]:
+    return validate_semantic({"version": SEMANTIC_VERSION, "claims": list(claims)},
+                             actor_type=actor_type, model_run_ids=model_run_ids,
+                             evidence_ids=evidence_ids)
+
+
+def empty_semantic() -> Dict[str, Any]:
+    return {"version": SEMANTIC_VERSION, "claims": []}
+
+
+def claim_requires_human(claim_type: str) -> bool:
+    return claim_type == "interpretation"
+
+
+def semantic_summary(semantic: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {name: 0 for name in CLAIM_TYPES}
+    for claim in (semantic or {}).get("claims", []):
+        counts[claim["claim_type"]] += 1
+    return counts
