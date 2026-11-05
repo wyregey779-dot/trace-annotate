@@ -13,6 +13,8 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
 from trace_annotate.extractors.base import BaseExtractor, ExtractorStatus
+from trace_annotate.extractors.model_loading import (enforce_offline_environment,
+                                                    load_policy)
 from trace_annotate.core.hasher import safe_load_image
 from trace_annotate.config import MetricThresholds
 
@@ -88,17 +90,30 @@ class CLIPExtractor(BaseExtractor):
         self._text_features: Optional[np.ndarray] = None
         self._prompt_layout: List[Tuple[str, List[Any]]] = []
         self.load_error: Optional[str] = None
+        self.load_policy = load_policy()
         self._init_model()
 
     @property
     def name(self) -> str:
         return "clip"
 
+    @property
+    def code_identity(self) -> Dict[str, Any]:
+        """Weight and loader identity for the model-run record."""
+        return {"model_name": self.model_path or DEFAULT_MODEL_NAME,
+                "pretrained": DEFAULT_PRETRAINED,
+                "force_quick_gelu": True,
+                "offline": self.load_policy["offline"],
+                "downloads_allowed": self.load_policy["downloads_allowed"]}
+
     def _init_model(self) -> None:
         """Load weights lazily; every failure degrades to a disabled adapter."""
         self.model = None
         self._text_features = None
         self._prompt_layout = []
+        # Pin the hub to local files before open_clip imports huggingface_hub:
+        # a missing weight must fail fast as not_run, never start a download.
+        enforce_offline_environment()
         try:
             import open_clip  # MIT license
             import torch

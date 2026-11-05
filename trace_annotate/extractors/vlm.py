@@ -14,10 +14,17 @@ from typing import Dict, Any, List, Optional
 import numpy as np
 
 from trace_annotate.extractors.base import BaseExtractor, ExtractorStatus
+from trace_annotate.extractors.model_loading import (enforce_offline_environment,
+                                                    load_policy)
 from trace_annotate.core.hasher import safe_load_image
 
 
 DEFAULT_MODEL_NAME = "microsoft/Florence-2-base"
+# The upstream repository ships processor/model code, so a floating `main`
+# revision would let the executed code change without notice. Operators pin a
+# concrete commit/tag through TRACE_ANNOTATE_VLM_REVISION; when unset the adapter
+# reports "unpinned" in its code identity instead of pretending to be frozen.
+REVISION_ENV = "TRACE_ANNOTATE_VLM_REVISION"
 # The task prompt requests a dense, literal caption (as opposed to a single
 # sentence or a decorative description), which is what an annotation draft needs.
 CAPTION_TASK = "<MORE_DETAILED_CAPTION>"
@@ -34,12 +41,15 @@ class VLMExtractor(BaseExtractor):
     """Local VLM captioner; missing weights degrade to a disabled adapter."""
 
     def __init__(self, model_path: Optional[str] = None,
-                 task_prompt: Optional[str] = None):
+                 task_prompt: Optional[str] = None,
+                 revision: Optional[str] = None):
         self.model_path = model_path or DEFAULT_MODEL_NAME
         self.task_prompt = task_prompt or CAPTION_TASK
+        self.revision = revision or os.environ.get(REVISION_ENV) or None
         self.model = None
         self.processor = None
         self.load_error: Optional[str] = None
+        self.load_policy = load_policy()
         self._init_model()
 
     @property
@@ -58,17 +68,33 @@ class VLMExtractor(BaseExtractor):
             return
         try:
             os.makedirs(_cache_dir(), exist_ok=True)
+            enforce_offline_environment()
             # Florence-2 ships its processor/model code in the repository, so
-            # trust_remote_code=True is the vendor-documented requirement.
+            # trust_remote_code=True is the vendor-documented requirement. The
+            # local_files_only flag keeps a missing weight from reaching the hub.
             self.processor = AutoProcessor.from_pretrained(
-                self.model_path, cache_dir=_cache_dir(), trust_remote_code=True)
+                self.model_path, cache_dir=_cache_dir(), trust_remote_code=True,
+                local_files_only=self.load_policy["offline"],
+                revision=self.revision)
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path, cache_dir=_cache_dir(), trust_remote_code=True)
+                self.model_path, cache_dir=_cache_dir(), trust_remote_code=True,
+                local_files_only=self.load_policy["offline"],
+                revision=self.revision)
             self.model.eval()
         except Exception as exc:  # noqa: BLE001 - download/load failure disables inference
             self.model = None
             self.processor = None
             self.load_error = str(exc)
+
+    @property
+    def code_identity(self) -> Dict[str, Any]:
+        """What code was actually executed, for the model-run record."""
+        return {"model_path": self.model_path,
+                "trust_remote_code": True,
+                "revision": self.revision or "unpinned",
+                "revision_env": REVISION_ENV,
+                "offline": self.load_policy["offline"],
+                "downloads_allowed": self.load_policy["downloads_allowed"]}
 
     def caption(self, img_bgr: np.ndarray) -> Dict[str, Any]:
         """Produce one caption draft for a BGR frame; honest status always."""
