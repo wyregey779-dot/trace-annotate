@@ -252,6 +252,46 @@ class VisionJobs:
                 _validate_job(job)
             return batch
 
+    def submit_many(self, items: List[Dict[str, Any]], *, command_id: str,
+                    window: Optional[Dict[str, Any]] = None,
+                    subject_annotation_id: Optional[str] = None) -> Dict[str, Any]:
+        """Freeze several tasks into one vision batch with independent items.
+
+        Each item keeps its own revision and content digest, so a failure in one
+        task never rewrites another task's result. The batch is not a cross-task
+        transaction: results commit per job, and the same command_id replays the
+        same receipt instead of creating a second set of candidates.
+        """
+        S.require_id(command_id)
+        parameters = _parameters(window, subject_annotation_id)
+        if not isinstance(items, list) or not items:
+            raise SchemaInvalid("SCHEMA_INVALID", "Vision batch needs at least one task")
+        normalized: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {"task_id", "expected_revision", "expected_sha256"}:
+                raise SchemaInvalid("SCHEMA_INVALID", "Vision items need task_id, expected_revision and expected_sha256")
+            S.require_id(item["task_id"])
+            if item["task_id"] in seen:
+                raise SchemaInvalid("SCHEMA_INVALID", "Duplicate task in one vision batch")
+            seen.add(item["task_id"])
+            normalized.append({"task_id": item["task_id"],
+                               "expected_revision": item["expected_revision"],
+                               "expected_sha256": item["expected_sha256"]})
+        request = {"kind": "queue.create_batch", "items": normalized, "operation": OPERATION,
+                   "processor_version": VERSION, "parameters": parameters}
+        with self.store.transaction():
+            replay = self.queue._receipt(command_id, request)
+            if replay is not None:
+                return replay
+            if self.is_closing():
+                raise Conflict("WORKSPACE_CLOSING", "Workspace accepts no new vision jobs")
+            batch = self.queue.create_batch(normalized, operation=OPERATION, processor_version=VERSION,
+                                            parameters=parameters, command_id=command_id)
+            for job in batch["jobs"]:
+                _validate_job(job)
+            return batch
+
     def _batches(self, batch_id: Optional[str] = None) -> List[str]:
         batches = [self.queue.get_batch(batch_id)] if batch_id is not None else self.queue.list_batches()
         selected = []

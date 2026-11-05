@@ -281,3 +281,37 @@ def test_http_vision_chain_submit_result_apply_status(store, clip):
         server.shutdown()
         thread.join(timeout=10)
         server.server_close()
+
+
+def test_submit_many_freezes_each_task_and_replays_the_same_receipt(store):
+    jobs = V.VisionJobs(store, face_model_path="nonexistent-face-weights",
+                        clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        current = task(store)
+        items = [{"task_id": current["id"], "expected_revision": current["revision"],
+                  "expected_sha256": store.task_digest(current)}]
+        batch = jobs.submit_many(items, command_id="vision-many")
+        assert len(batch["jobs"]) == 1
+        job = batch["jobs"][0]
+        assert job["task_id"] == current["id"]
+        assert job["input_revision"] == current["revision"]
+        replay = jobs.submit_many(items, command_id="vision-many")
+        assert replay["id"] == batch["id"]
+        assert [item["id"] for item in replay["jobs"]] == [job["id"]]
+    finally:
+        jobs.close(timeout=5)
+
+
+def test_submit_many_rejects_duplicate_tasks(store):
+    jobs = V.VisionJobs(store, face_model_path="nonexistent-face-weights",
+                        clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        current = task(store)
+        item = {"task_id": current["id"], "expected_revision": current["revision"],
+                "expected_sha256": store.task_digest(current)}
+        with pytest.raises(SchemaInvalid, match="Duplicate task"):
+            jobs.submit_many([item, dict(item)], command_id="vision-many-dup")
+    finally:
+        jobs.close(timeout=5)
