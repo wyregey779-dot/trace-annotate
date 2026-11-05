@@ -49,15 +49,23 @@ Performance gates need repeated short/10-minute/1-hour and 1080p/4K workloads, w
 
 ## CLIP inference
 
-Status: **planned; not implemented**. Installing the `clip` extra does not enable a complete inference path.
+Status: **implemented in the development line `feat/vision-assist-20261103`**, not yet merged or released. The adapter loads `open_clip` ViT-B-32 with the `openai` weights, encodes English prompts against the Chinese labels through a multi-text ensemble, multiplies by `logit_scale.exp()` and applies per-category softmax; thresholds are 0.85 for binary and 0.70 for multiclass decisions, and anything below stays `None` instead of guessing.
 
-Completion requires:
+Still open before this can be called supported: a permitted fixture with a reproducible accuracy check, published score semantics per label set, and an evaluation dataset with a stated method. Missing weights still report `not_run` and a crashed forward pass reports `failed`; neither emits a prediction.
 
-1. A supported backend, package versions, local model format and weight license.
-2. Explicit weight configuration. Any download must be a documented user action.
-3. Actual image/text encoding and scoring, with documented score meaning and output provenance.
-4. Tests for success, missing dependency, missing weights and failed inference. An unrun or failed model must not emit placeholder predictions.
-5. A small permitted fixture and a reproducible inference check. Accuracy claims require a separate evaluation with a defined dataset and method.
+
+## Visual semantics: current status and open work
+
+Each row states what the repository can do today, where that behavior lives, and what is still missing. A capability is not supported because a model file or an adapter name exists; it is supported only when the acceptance check passes with real weights.
+
+| Capability | Current state (with evidence) | Open work | Acceptance check before claiming support |
+| --- | --- | --- | --- |
+| Emotion (valence, arousal, expression, tone) | **Not implemented.** No extractor, no label vocabulary, no schema field: `extractors/` holds scene, faces, ocr, clip, vlm and metrics only; `workspace/professional_schema.validate_annotation` admits `label`, `text`, `tags`, `track`, `attributes` with no emotion slot | Decide the task first (facial expression, voice prosody, or text tone; do not merge them into one number), then add an adapter that writes `tags` plus numeric `attributes` with its own confidence | Real weights on a permitted clip; missing weights report `not_run`, crashes report `failed`; low-confidence frames emit nothing; every output stays `model_candidate`/`unreviewed` and emotion never enters a `reviewed` record without a human edit |
+| Scene change | **Partial.** `extractors/scene.py` cuts on frame differences, so a scene change is only detected when it coincides with a hard cut; CLIP contributes `indoor_outdoor` and `screen_type` tags, which classify a frame rather than measure a change | Scene-level embedding (the existing CLIP encoder can be reused) or a scene classifier; separate hard cuts from gradual changes (fade, dissolve, lighting shift); emit change points with confidence | Fixtures with a dissolve, a lighting ramp and a static shot must be told apart; a static shot must yield no change candidate; confidence and threshold recorded in evidence |
+| Shot (镜头) | **Partial.** Each cut interval becomes one `镜头候选 N` annotation with `track=镜头`; no shot attributes exist | Shot size (远景/全景/中景/近景/特写) and camera motion (推/拉/摇/移) classification, or ship shot size first and report motion as `not_run` | Human-labelled comparison on the same clip, per-class confidence, and a documented refusal path when weights are absent |
+| Action (动作) | **Not implemented.** No video action adapter, no action label set, no time-window mapping | Fix the scope (single-person vs multi-person), choose a model and record its license, define the frame window and the action interval mapping, then write action tags and intervals | Licensed fixture, real inference, start/end agreement report against human labels, `not_run` without weights, `failed` on error |
+| Shot boundary (镜头边界) | **Partial.** Cut points come from the ffmpeg/scenedetect frame-difference pass; a candidate is an interval `(start, end)`, so boundaries are implied rather than emitted as events; no boundary type or confidence is recorded | Emit boundary events with type (cut, gradual, flash), the frame numbers on both sides and their PTS; export them as their own list | CFR and VFR fixtures checked frame-by-frame against human boundaries; VFR boundaries must agree with the indexed PTS, not nominal FPS arithmetic |
+| Fact vs interpretation (事实/解读分离) | **Not implemented.** An annotation has one `text` field and free-form `tags`; a VLM caption and a human judgement can currently land in the same string and the validator cannot tell them apart | Add an explicit discriminator, either `attributes.claim_type=observation|inference` or separate `facts`/`interpretation` fields, and enforce it in validation and export | A mixed record is rejected; `model_candidate` may only carry observations; interpretation requires a human author; round-trip export keeps the field and its author |
 
 ## External annotation round trips
 
