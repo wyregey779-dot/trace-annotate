@@ -40,6 +40,23 @@ class FaceExtractor(BaseExtractor):
     def name(self) -> str:
         return "faces"
 
+    @property
+    def code_identity(self) -> Dict[str, Any]:
+        """Detector and runtime identity for a model-run record.
+
+        YuNet weights are an external file, so their hash is computed by the
+        caller from ``model_path``; this property never invents a digest.
+        """
+        import cv2
+        return {"provider": "opencv",
+                "model_name": ("YuNet" if self.detector_kind == "yunet"
+                               else "Haar cascade" if self.detector_kind == "haar"
+                               else "unavailable"),
+                "model_version": getattr(cv2, "__version__", "unknown"),
+                "weights_path": self.model_path,
+                "detector_kind": self.detector_kind,
+                "license": "OpenCV Apache-2.0; detector weights license not bundled locally"}
+
     def _init_detector(self) -> None:
         """Initialize YuNet ONNX, or OpenCV's bundled Haar cascade.
 
@@ -109,11 +126,11 @@ class FaceExtractor(BaseExtractor):
         """Face count/crowd summary that never turns a large face into a shot size."""
         count = len(detected_list)
         if count == 0:
-            crowd, status = "无人", "无人物"
+            crowd, status = "未检出人脸", "未检出人脸"
         elif count == 1:
             crowd, status = "单人", "单人"
         elif count == 2:
-            crowd, status = "双人", "双人互动"
+            crowd, status = "双人", "双人"
         elif count <= 5:
             crowd, status = "少量3-5人", "小群体"
         else:
@@ -175,8 +192,8 @@ class FaceExtractor(BaseExtractor):
             return {
                 "status": ExtractorStatus.SUCCESS.value,
                 "face_count": 0,
-                "face_status": "无人物",
-                "crowd_level": "无人",
+                "face_status": "未检出人脸",
+                "crowd_level": "未检出人脸",
                 "faces_detected": []
             }
 
@@ -201,14 +218,14 @@ class FaceExtractor(BaseExtractor):
 
         count = len(detected_list)
         if count == 0:
-            crowd = "无人"
-            status = "无人物"
+            crowd = "未检出人脸"
+            status = "未检出人脸"
         elif count == 1:
             crowd = "单人"
             status = "单人"
         elif count == 2:
             crowd = "双人"
-            status = "双人互动"
+            status = "双人"
         elif count <= 5:
             crowd = "少量3-5人"
             status = "小群体"
