@@ -44,8 +44,10 @@ def claim(*, claim_type: str, statement: str, method_id: str, method_version: st
           parameters: Optional[Dict[str, Any]] = None, evidence_ids: Sequence[str] = (),
           subject_ref: Optional[str] = None, start: Any = None, end: Any = None,
           score: Optional[float] = None, score_kind: str = "none",
+          measurement: Optional[Dict[str, Any]] = None,
           uncertainty_reason: Optional[str] = None,
-          model_run_id: Optional[str] = None, token: Optional[str] = None) -> Dict[str, Any]:
+          model_run_id: Optional[str] = None, token: Optional[str] = None,
+          actor_type: str = "tool", version: str = SS.SEMANTIC_VERSION) -> Dict[str, Any]:
     """Build one claim; the caller keeps the token stable for reproducible ids."""
     if claim_type not in SS.CLAIM_TYPES:
         raise SchemaInvalid("INVALID_CLAIM_TYPE", "Unknown claim type")
@@ -67,7 +69,10 @@ def claim(*, claim_type: str, statement: str, method_id: str, method_version: st
         "score_kind": score_kind,
         "uncertainty_reason": uncertainty_reason,
     }
-    return SS.validate_claim(body, actor_type="tool", model_run_ids=(), evidence_ids=evidence_ids)
+    if version != SS.SEMANTIC_VERSION_V1:
+        body["measurement"] = measurement
+    return SS.validate_claim(body, actor_type=actor_type, model_run_ids=(),
+                             evidence_ids=evidence_ids, version=version)
 
 
 def observable(**kwargs: Any) -> Dict[str, Any]:
@@ -79,8 +84,7 @@ def measured(**kwargs: Any) -> Dict[str, Any]:
 
 
 def interpretation(**kwargs: Any) -> Dict[str, Any]:
-    body = claim(claim_type="interpretation", **kwargs)
-    return SS.validate_claim(body, actor_type="human", evidence_ids=body["evidence_ids"])
+    return claim(claim_type="interpretation", actor_type="human", **kwargs)
 
 
 def build_annotation(*, annotation_id: str, kind: str, label: str, text: str,

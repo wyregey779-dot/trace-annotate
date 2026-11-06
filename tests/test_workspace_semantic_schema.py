@@ -24,6 +24,7 @@ def _claim(claim_type="observable", **overrides):
         "model_run_id": None,
         "score": 0.72,
         "score_kind": "rule_score",
+        "measurement": None,
         "uncertainty_reason": None,
     }
     body.update(overrides)
@@ -60,21 +61,32 @@ def test_claim_evidence_must_be_declared_on_the_annotation():
     assert exc.value.code == "UNSUPPORTED_PROFESSIONAL_EVIDENCE"
 
 
-def test_measured_claim_needs_a_numeric_result():
+def test_measured_claim_needs_a_first_class_measurement():
     with pytest.raises(SchemaInvalid):
         SS.validate_claim(_claim("measured", score=None, score_kind="none"), evidence_ids={"art-e1"})
     checked = SS.validate_claim(_claim("measured", statement="窗口 RMS -23.4 dBFS",
-                                       score=-23.4, score_kind="rule_score"),
+                                       score=None, score_kind="none",
+                                       measurement={"value": -23.4, "unit": "dBFS",
+                                                    "basis": "measured", "analysis_window": None}),
                                 evidence_ids={"art-e1"})
-    assert checked["score"] == -23.4
+    assert checked["measurement"]["value"] == -23.4 and checked["score"] is None
+
+
+def test_v1_claim_still_validates_and_new_v2_is_explicit():
+    legacy = _claim("measured", score=-23.4, score_kind="rule_score")
+    legacy.pop("measurement")
+    checked = SS.validate_claim(legacy, evidence_ids={"art-e1"}, version=SS.SEMANTIC_VERSION_V1)
+    assert checked["score"] == -23.4 and "measurement" not in checked
+    with pytest.raises(SchemaInvalid):
+        SS.validate_claim(legacy, evidence_ids={"art-e1"})
 
 
 def test_semantic_version_is_frozen_and_claims_are_unique():
     with pytest.raises(SchemaInvalid) as exc:
-        SS.validate_semantic({"version": "visual-semantics-v2", "claims": []})
+        SS.validate_semantic({"version": "visual-semantics-v3", "claims": []})
     assert exc.value.code == "UNKNOWN_SEMANTIC_VERSION"
     with pytest.raises(SchemaInvalid):
-        SS.validate_semantic({"version": SS.SEMANTIC_VERSION,
+        SS.validate_semantic({"version": SS.SEMANTIC_VERSION_V1,
                               "claims": [_claim(), _claim()]}, evidence_ids={"art-e1"})
 
 
@@ -109,6 +121,7 @@ def test_review_digest_tracks_content_but_not_review_fields():
 
 def test_digest_projection_declares_exclusions():
     assert SS.DIGEST_PROJECTIONS["claim"]["excludes"] == ["id"]
+    assert SS.DIGEST_PROJECTIONS["claim_v2"]["excludes"] == ["id"]
     assert set(SS.DIGEST_PROJECTIONS["annotation_review"]["excludes"]) == {
         "review_status", "review_binding"}
     assert "output_sha256" in SS.DIGEST_PROJECTIONS["model_run"]["excludes"]
@@ -159,4 +172,25 @@ def test_published_examples_match_the_code_digests():
         "annotation_review_digest"]
     projections = json.loads((root / "visual-semantics-v1.digest-projections.json").read_text(encoding="utf-8"))
     assert projections["claim"]["excludes"] == ["id"]
-    assert projections["sample_digests"]["semantic_digest"] == examples["expected"]["semantic_digest"]
+
+
+def test_published_v2_examples_separate_measurement_from_score():
+    import json
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "docs" / "contracts"
+    examples = json.loads((root / "visual-semantics-v2.examples.json").read_text(encoding="utf-8"))
+    semantic = SS.validate_semantic(examples["annotation"]["attributes"]["semantic"],
+                                    actor_type="human",
+                                    model_run_ids=[examples["model_run"]["id"]],
+                                    evidence_ids=examples["annotation"]["evidence_ids"])
+    measured = next(c for c in semantic["claims"] if c["claim_type"] == "measured")
+    assert measured["measurement"]["value"] == -23.4
+    assert measured["measurement"]["unit"] == "dBFS"
+    assert measured["score"] == 0.9
+    assert SS.semantic_digest(semantic) == examples["expected"]["semantic_digest"]
+    for claim in semantic["claims"]:
+        assert SS.claim_digest(claim) == examples["expected"]["claim_digests"][claim["id"]]
+    assert SS.annotation_review_digest(examples["annotation"], media_id="med-example",
+                                       template_id="tpl-example",
+                                       template_version=1) == examples["expected"][
+        "annotation_review_digest"]

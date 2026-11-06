@@ -167,7 +167,8 @@ def _report(store, task, media, template):
         try:
             if not isinstance(annotation, dict):
                 raise SchemaInvalid("SCHEMA_INVALID", "Annotation is not an object")
-            store._validate_annotation(annotation, media, template)
+            store._validate_annotation(annotation, media, template,
+                                       model_run_ids=store._declared_model_run_ids(task))
             if ident in seen:
                 raise SchemaInvalid("DUPLICATE_ANNOTATION_ID", "Annotation ID is duplicated")
             seen.add(ident)

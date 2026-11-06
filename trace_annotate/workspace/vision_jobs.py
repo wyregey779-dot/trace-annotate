@@ -19,7 +19,7 @@ import tempfile
 import threading
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import MetricThresholds
 from ..extractors.camera_motion import analyse_motion
@@ -1005,6 +1005,54 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                     claim["evidence_ids"] = [frame_artifacts[frame_index]]
 
 
+def _frame_seconds(candidate: Dict[str, Any], frame_index: Any) -> Optional[float]:
+    if frame_index is None:
+        return None
+    frames = list(candidate.get("boundary_frames") or []) + list(candidate.get("keyframes") or [])
+    for frame in frames:
+        if str(frame.get("frame_index")) == str(frame_index):
+            value = frame.get("seconds", frame.get("timestamp"))
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _event_time_window(candidate: Dict[str, Any], event: Dict[str, Any],
+                       fallback: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """Use the detector's event interval, never the whole scene window.
+
+    A gradual transition has an explicit interval. A cut normally has no
+    interval, so the two sampled frames immediately around the anchor provide a
+    one-frame bracket. Only when no frame time exists does the claim fall back
+    to the scene context window, and the caller records that in uncertainty.
+    """
+    interval = event.get("interval") or {}
+    try:
+        interval_start = float(interval["start_seconds"])
+        interval_end = float(interval["end_seconds"])
+    except (KeyError, TypeError, ValueError):
+        interval_start = interval_end = None
+    if interval_start is not None and interval_end is not None and interval_start < interval_end:
+        return ({"start": {"seconds": _seconds_ratio(interval_start)},
+                 "end": {"seconds": _seconds_ratio(interval_end)}}, True)
+    anchor_seconds = _frame_seconds(candidate, event.get("anchor_frame"))
+    previous_seconds = _frame_seconds(candidate, event.get("previous_frame"))
+    if anchor_seconds is not None and previous_seconds is not None and previous_seconds < anchor_seconds:
+        return ({"start": {"seconds": _seconds_ratio(previous_seconds)},
+                 "end": {"seconds": _seconds_ratio(anchor_seconds)}}, True)
+    if anchor_seconds is not None:
+        later = [float(frame["seconds"]) for frame in (candidate.get("boundary_frames") or [])
+                 if str(frame.get("frame_index")) != str(event.get("anchor_frame"))
+                 and frame.get("seconds") is not None]
+        later = [value for value in later if value > anchor_seconds]
+        if later:
+            return ({"start": {"seconds": _seconds_ratio(anchor_seconds)},
+                     "end": {"seconds": _seconds_ratio(min(later))}}, True)
+    return fallback, False
+
+
 def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, Any],
                       start: Dict[str, str], end: Dict[str, str],
                       keyframe: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1030,6 +1078,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
         "model_run_id": None,
         "score": None,
         "score_kind": "none",
+        "measurement": None,
         "uncertainty_reason": "算法候选；未进行人工边界复核",
     }]
     if keyframe is not None:
@@ -1047,6 +1096,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
             "model_run_id": None,
             "score": None,
             "score_kind": "none",
+            "measurement": None,
             "uncertainty_reason": "抽样帧只代表该时刻，不覆盖镜头内全部画面",
         })
         framing = keyframe.get("framing") or {}
@@ -1056,7 +1106,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
             ratio = measurements[0].get("height_ratio") if measurements else None
             claims.append({
                 "id": S.make_id("clm", f"{job_id}:{index}:framing"),
-                "claim_type": "measured",
+                "claim_type": "measured" if isinstance(ratio, (int, float)) else "observable",
                 "statement": (f"按关键帧 #{keyframe['frame_index']} 的人脸框高度占比"
                               f"测得景别为{framing['framing']}（仅人脸框，需人物框复核）。"),
                 "subject_ref": None,
@@ -1070,6 +1120,9 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 "model_run_id": None,
                 "score": float(framing.get("confidence") or 0.0),
                 "score_kind": "rule_score",
+                "measurement": ({"value": float(ratio), "unit": "ratio", "basis": "measured",
+                                 "analysis_window": window}
+                                if isinstance(ratio, (int, float)) else None),
                 "uncertainty_reason": framing.get("uncertainty")
                 or "未检测到主体不等于画面中不存在主体",
             })
@@ -1081,9 +1134,10 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                      if pair.get("class") not in (None, "not_run")]
             confidence = min((float(pair.get("confidence") or 0.0) for pair in pairs), default=0.0)
             first_pair = pairs[0] if pairs else {}
+            speed = summary.get("mean_speed_px_s")
             claims.append({
                 "id": S.make_id("clm", f"{job_id}:{index}:motion"),
-                "claim_type": "measured",
+                "claim_type": "measured" if isinstance(speed, (int, float)) else "observable",
                 "statement": (f"该镜头相邻抽样帧之间的画面全局运动为"
                               f"{summary['class']}（仅抽样帧对比，不代表全程运镜）。"),
                 "subject_ref": None,
@@ -1093,13 +1147,16 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                            "parameters": {"class": summary["class"],
                                           "agreement": summary.get("agreement"),
                                           "pairs": summary.get("pairs"),
-                                          "mean_speed_px_s": summary.get("mean_speed_px_s"),
+                                          "mean_speed_px_s": speed,
                                           "frame_index": keyframe.get("frame_index"),
                                           "from_frame": first_pair.get("from_frame"),
                                           "to_frame": first_pair.get("to_frame")}},
                 "model_run_id": None,
                 "score": round(confidence, 3),
                 "score_kind": "rule_score",
+                "measurement": ({"value": float(speed), "unit": "px/s", "basis": "measured",
+                                 "analysis_window": window}
+                                if isinstance(speed, (int, float)) else None),
                 "uncertainty_reason": summary.get("uncertainty")
                 or (f"仅 {len(pairs)} 对相邻抽样帧，不能证明整段镜头的运动方式" if len(pairs) < 2
                     else "相邻抽样帧分类不一致，需人工复核"),
@@ -1132,12 +1189,13 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                     metrics[str(key)] = item.item()
                 else:
                     metrics[str(key)] = str(item)
+            transition_window, transition_window_is_exact = _event_time_window(candidate, event, window)
             claims.append({
                 "id": S.make_id("clm", f"{job_id}:{index}:transition:{kind}:{event.get('anchor_frame')}"),
-                "claim_type": "measured",
+                "claim_type": "observable",
                 "statement": statement,
                 "subject_ref": None,
-                "time_window": window,
+                "time_window": transition_window,
                 "evidence_ids": [],
                 "method": {"id": "shot-boundaries-v1", "version": "1",
                            "parameters": {"kind": kind,
@@ -1156,8 +1214,10 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 "model_run_id": None,
                 "score": float(event.get("confidence") or 0.0),
                 "score_kind": "rule_score",
+                "measurement": None,
                 "uncertainty_reason": event.get("uncertainty")
-                or "仅使用边界前后抽样帧，未覆盖整段视频的全部帧",
+                or (None if transition_window_is_exact
+                    else "边界事件缺少可用的帧级区间；claim 使用镜头上下文窗口"),
             })
     return {"version": SEMANTIC_VERSION, "claims": claims}
 

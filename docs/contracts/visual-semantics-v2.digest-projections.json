@@ -1,0 +1,99 @@
+{
+  "contract": "visual-semantics-v2",
+  "digest_version": "visual-semantics-v2",
+  "claim": {
+    "fields": [
+      "claim_type",
+      "statement",
+      "subject_ref",
+      "time_window",
+      "evidence_ids",
+      "method",
+      "model_run_id",
+      "score",
+      "score_kind",
+      "uncertainty_reason",
+      "measurement"
+    ],
+    "excludes": [
+      "id"
+    ],
+    "input": {
+      "digest_version": "visual-semantics-v2",
+      "claim": "<projection>"
+    }
+  },
+  "semantic": {
+    "fields": [
+      "version",
+      "claims"
+    ],
+    "claims_sorted_by": "id",
+    "input": {
+      "digest_version": "visual-semantics-v2",
+      "version": "visual-semantics-v2",
+      "claims": [
+        "<claim digest projections>"
+      ]
+    }
+  },
+  "model_run": {
+    "fields": [
+      "provider",
+      "model_name",
+      "model_version",
+      "weights_sha256",
+      "license",
+      "preprocessing",
+      "parameters",
+      "input_sha256",
+      "code_version",
+      "status",
+      "failure_reason",
+      "score_kind"
+    ],
+    "excludes": [
+      "id",
+      "output_sha256"
+    ],
+    "input": {
+      "digest_version": "visual-semantics-v1",
+      "run": "<projection>"
+    }
+  },
+  "annotation_review": {
+    "fields": [
+      "id",
+      "type",
+      "label",
+      "text",
+      "tags",
+      "track",
+      "attributes",
+      "evidence_ids",
+      "provenance",
+      "start",
+      "end",
+      "at",
+      "legacy_id"
+    ],
+    "excludes": [
+      "review_status",
+      "review_binding"
+    ],
+    "input": {
+      "annotation": "<annotation without review fields>",
+      "media_id": "...",
+      "template_id": "...",
+      "template_version": 1
+    },
+    "note": "identical to the existing workspace/professional review binding"
+  },
+  "task": {
+    "note": "task digest is owned by workspace/schema.task_content_sha256 and professional_schema.task_content_digest; semantic fields travel inside annotations and therefore already participate",
+    "excludes": [
+      "content_sha256",
+      "review_binding"
+    ]
+  }
+}

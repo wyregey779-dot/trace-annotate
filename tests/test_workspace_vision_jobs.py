@@ -67,6 +67,25 @@ def fail_code(code, call):
     assert exc.value.code == code
 
 
+def test_transition_claim_uses_event_interval_not_whole_scene_window():
+    candidate = {"job_id": "job-time", "processor_version": "1", "keyframes": [],
+                 "boundary_frames": [{"frame_index": 99, "seconds": 9.9},
+                                     {"frame_index": 100, "seconds": 10.0}]}
+    scene = {"start": "0", "end": "20"}
+    event = {"kind": "cut", "anchor_frame": 100, "previous_frame": 99,
+             "confidence": 0.9, "metrics": {}}
+    body = V._candidate_claims(candidate, 0, scene, {"n": "0", "d": "1"},
+                               {"n": "20", "d": "1"},
+                               {"frame_index": 90, "source_pts": "9.0",
+                                "boundary_events": [event]})
+    transition = next(claim for claim in body["claims"]
+                      if claim["method"]["id"] == "shot-boundaries-v1")
+    assert transition["claim_type"] == "observable"
+    assert transition["time_window"]["start"]["seconds"] == {"n": "99", "d": "10"}
+    assert transition["time_window"]["end"]["seconds"] == {"n": "10", "d": "1"}
+    assert transition["measurement"] is None
+
+
 def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
     initial = task(store)
@@ -178,7 +197,7 @@ def test_apply_imports_candidates_as_model_candidate_and_refuses_reviewed(store)
     assert all(a["review_status"] == "unreviewed" for a in after["annotations"])
     for annotation in after["annotations"]:
         semantic = annotation["attributes"]["semantic"]
-        assert semantic["version"] == "visual-semantics-v1"
+        assert semantic["version"] == "visual-semantics-v2"
         assert semantic["claims"]
         assert all(claim["claim_type"] in {"observable", "measured"}
                    for claim in semantic["claims"])

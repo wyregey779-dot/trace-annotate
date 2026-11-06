@@ -967,7 +967,8 @@ class WorkspaceStore:
         new_task["revision"] = current_rev + 1
         template = next(value for value in self.list_templates() if value["id"] == current["template_id"] and value["version"] == current["template_version"])
         for annotation in new_task["annotations"]:
-            self._validate_annotation(annotation, self.get_media(current["media_id"]), template)
+            self._validate_annotation(annotation, self.get_media(current["media_id"]), template,
+                                      model_run_ids=self._declared_model_run_ids(new_task))
         previous = {a["id"]: a for a in current["annotations"]}
         if operation not in {"import_professional", "import_temporal", "revert_command"}:
             for annotation in new_task["annotations"]:
@@ -1109,7 +1110,24 @@ class WorkspaceStore:
             raise SchemaInvalid("UNSUPPORTED_OPERATION", f"Unknown operation {operation}")
         return annotations
 
-    def _validate_annotation(self, ann, media, template):
+    @staticmethod
+    def _declared_model_run_ids(task):
+        from . import semantic_schema as SS
+        extension = (task.get("extensions") or {}).get("professional") or {}
+        if not isinstance(extension, dict):
+            raise SchemaInvalid("SCHEMA_INVALID", "Professional extension must be an object")
+        runs = extension.get("model_runs", [])
+        if not isinstance(runs, list):
+            raise SchemaInvalid("SCHEMA_INVALID", "model_runs must be an array")
+        ids = set()
+        for run in runs:
+            checked = SS.validate_model_run(run)
+            if checked["id"] in ids:
+                raise SchemaInvalid("SCHEMA_INVALID", "Duplicate model run identifier")
+            ids.add(checked["id"])
+        return ids
+
+    def _validate_annotation(self, ann, media, template, *, model_run_ids=None):
         allowed = {"id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids", "provenance", "start", "end", "at", "legacy_id", "review_status", "review_binding"}
         if set(ann) - allowed:
             raise SchemaInvalid("SCHEMA_INVALID", "Annotation contains unknown fields")
@@ -1166,7 +1184,8 @@ class WorkspaceStore:
             if ann["attributes"]:
                 SS.validate_semantic(ann["attributes"]["semantic"],
                                      actor_type="human" if provenance["origin"] == "manual" else "tool",
-                                     model_run_ids=None, evidence_ids=declared)
+                                     model_run_ids=set(model_run_ids or ()),
+                                     evidence_ids=set(ann["evidence_ids"]))
                 if provenance["origin"] == "model_candidate" and any(
                         claim["claim_type"] == "interpretation"
                         for claim in ann["attributes"]["semantic"]["claims"]):
