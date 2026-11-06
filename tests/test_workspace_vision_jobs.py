@@ -180,11 +180,15 @@ def test_apply_imports_candidates_as_model_candidate_and_refuses_reviewed(store)
         semantic = annotation["attributes"]["semantic"]
         assert semantic["version"] == "visual-semantics-v1"
         assert semantic["claims"]
-        assert all(claim["claim_type"] == "observable" for claim in semantic["claims"])
+        assert all(claim["claim_type"] in {"observable", "measured"}
+                   for claim in semantic["claims"])
         assert annotation["evidence_ids"]
         for claim in semantic["claims"]:
             if claim["method"]["id"] == "keyframe-sampling-local":
                 assert claim["evidence_ids"]
+            elif claim["method"]["id"] == "shot-boundaries-v1":
+                assert claim["score"] is not None
+                assert len(claim["evidence_ids"]) >= 2
             elif claim["method"]["id"] == "shot-boundary-local":
                 assert claim["evidence_ids"] == []
     # Review attempt on a model candidate is refused by the store path.

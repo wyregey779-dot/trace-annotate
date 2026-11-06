@@ -28,6 +28,7 @@ from ..extractors.faces import FaceExtractor
 from ..extractors.ocr import OCRExtractor
 from ..extractors.scene import SceneDetector, SceneDetectionError
 from ..extractors.shot_attributes import classify_framing
+from ..extractors.shot_boundaries import detect_shot_boundaries, TRANSITION_KINDS
 from ..extractors.vlm import VLMExtractor
 from ..temporal.media import stream_sha256
 from . import professional_schema as PS
@@ -52,6 +53,8 @@ CANDIDATE_LABEL_PREFIX = "镜头候选"
 CANDIDATE_TRACK = "镜头"
 MOTION_LABELS = {"static", "pan_left", "pan_right", "tilt_up", "tilt_down",
                  "zoom_in", "zoom_out", "handheld_like"}
+BOUNDARY_RADIUS = 8
+TRANSITION_LABELS = {"fade_in", "fade_out", "dissolve", "flash"}
 
 
 def _finite(value: Any, name: str, *, positive: bool = False) -> float:
@@ -499,6 +502,72 @@ class VisionJobs:
                         if keyframe["scene_index"] == scene_index:
                             keyframe["motion"] = motion
                             break
+                boundary_frames: List[Dict[str, Any]] = []
+                boundary_sampling = None
+                if scene_result["status"] == "success" and len(scenes) > 1:
+                    try:
+                        targets: List[tuple[int, int]] = []
+                        for scene_index in range(1, len(scenes)):
+                            index = VS.boundary_indices(
+                                self.store, job["media_snapshot"]["id"],
+                                [scenes[scene_index]["start"]])[0]
+                            targets.append((index, scene_index))
+                        plan_b = VS.plan_samples(
+                            self.store, job["media_snapshot"]["id"], uniform=0,
+                            boundary_frames=[item[0] for item in targets],
+                            include_edges=False,
+                            budget=VS.SamplingBudget(max_frames=MAX_KEYFRAMES,
+                                                     boundary_radius=BOUNDARY_RADIUS))
+                        decoded_b = VS.decode_samples(
+                            self.store, job["media_snapshot"]["id"], plan_b,
+                            work / "boundaries", cancelled=cancelled, ffmpeg=ffmpeg)
+                        boundary_sampling = {
+                            "frame_map_sha256": plan_b["frame_map_sha256"],
+                            "truncated": plan_b["truncated"],
+                            "planned": plan_b["planned"],
+                            "returned": plan_b["returned"],
+                            "radius": BOUNDARY_RADIUS,
+                            "fingerprint": VS.samples_fingerprint(plan_b),
+                        }
+                        boundary_samples: Dict[int, List[Dict[str, Any]]] = {}
+                        for item in decoded_b["decoded"]:
+                            if cancelled():
+                                raise WorkspaceError("CANCELLED",
+                                                     "Vision cancelled while analysing boundaries")
+                            frame_index = int(item["frame_index"])
+                            scene_index = next((scene for target, scene in targets
+                                               if abs(frame_index - target) <= BOUNDARY_RADIUS), None)
+                            if scene_index is None:
+                                continue
+                            seconds = float(S.rational_value(item["seconds"]))
+                            boundary_frames.append({
+                                "scene_index": scene_index,
+                                "frame_index": item["frame_index"],
+                                "seconds": seconds,
+                                "evidence_sha256": item["sha256"],
+                            })
+                            boundary_samples.setdefault(scene_index, []).append({
+                                "frame_index": item["frame_index"],
+                                "seconds": seconds,
+                                "source_pts": item["source_pts"],
+                                "proxy_pts": item["proxy_pts"],
+                                "frame": _load_frame(Path(item["path"])),
+                            })
+                        for scene_index, samples in boundary_samples.items():
+                            if len(samples) < 2:
+                                continue
+                            result = detect_shot_boundaries(samples)
+                            if not result["events"]:
+                                continue
+                            first = next((frame for frame in keyframes
+                                          if frame["scene_index"] == scene_index), None)
+                            if first is not None:
+                                first["boundary_events"] = result["events"]
+                    except Exception as exc:
+                        boundary_sampling = {"status": "failed",
+                                             "error": type(exc).__name__,
+                                             "message": str(exc)[:240]}
+                        boundary_frames = []
                 extractor_status = {
                     "scene": scene_result["status"],
                     "face": _aggregate_status(keyframes, "face"),
@@ -527,6 +596,7 @@ class VisionJobs:
                     "file_sha256": digest, "time_domain": DOMAIN, "window": window,
                     "subject_annotation_id": parameters["subject_annotation_id"],
                     "scenes": scenes, "keyframes": keyframes, "sampling": sampling,
+                    "boundary_frames": boundary_frames, "boundary_sampling": boundary_sampling,
                     "extractor_status": extractor_status, "evidence": evidence,
                     "semantic_listening": "not_performed", "source_unchanged": True,
                     "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
@@ -627,7 +697,8 @@ class VisionJobs:
             "semantic_listening": "not_performed", "source_unchanged": True,
             "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
         expected = set(fixed) | {"window", "subject_annotation_id", "scenes", "keyframes",
-                                 "extractor_status", "evidence"}
+                                 "extractor_status", "evidence", "boundary_frames",
+                                 "boundary_sampling"}
         if (not isinstance(value, dict) or not expected <= set(value)
                 or set(value) - expected - {"sampling"}
                 or any(value[key] != item for key, item in fixed.items())
@@ -650,6 +721,22 @@ class VisionJobs:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision scene descriptor is invalid")
             if not 0 <= scene["start"] < scene["end"]:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision scene interval is invalid")
+        if (not isinstance(value["boundary_frames"], list)
+                or len(value["boundary_frames"]) > MAX_KEYFRAMES * 4):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary frame list is inconsistent")
+        for frame in value["boundary_frames"]:
+            if (not isinstance(frame, dict)
+                    or set(frame) != {"scene_index", "frame_index", "seconds", "evidence_sha256"}
+                    or type(frame["scene_index"]) is not int
+                    or not isinstance(frame["frame_index"], str)
+                    or not frame["frame_index"].isdigit()
+                    or not isinstance(frame["seconds"], (int, float))
+                    or not math.isfinite(frame["seconds"])
+                    or not isinstance(frame["evidence_sha256"], str)
+                    or S.HASH_RE.fullmatch(frame["evidence_sha256"]) is None):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary frame descriptor is invalid")
+        if value["boundary_sampling"] is not None and not isinstance(value["boundary_sampling"], dict):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary sampling descriptor is inconsistent")
         prefix = f"tmp/vision/jobs/{job['id']}/{job['attempt']}-{job['lease_generation']}/"
         paths = set()
         for evidence in value["evidence"]:
@@ -831,9 +918,13 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
     immutable artifact so the portable document stays inside its byte budget.
     """
     samples = {item["sha256"]: item for item in candidate.get("evidence") or []}
-    frames = candidate.get("keyframes") or []
+    keyframes = candidate.get("keyframes") or []
+    boundary_frames = candidate.get("boundary_frames") or []
+    frames = list(keyframes) + list(boundary_frames)
     for index, annotation in enumerate(annotations):
         scene_frames = [frame for frame in frames if frame.get("scene_index") == index]
+        transition_frames = [frame for frame in boundary_frames
+                             if frame.get("scene_index") == index]
         evidence_ids: List[str] = []
         frame_artifacts: Dict[str, str] = {}
         # One representative sampled keyframe per candidate keeps the portable
@@ -850,6 +941,18 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                 for key in ("from_frame", "to_frame"):
                     wanted = str(claim["method"]["parameters"].get(key))
                     match = next((frame for frame in scene_frames
+                                  if str(frame.get("frame_index")) == wanted), None)
+                    if match is not None and match not in selected:
+                        selected.append(match)
+        has_transition = any(claim["method"]["id"] == "shot-boundaries-v1"
+                             for claim in annotation["attributes"]["semantic"]["claims"])
+        if has_transition:
+            for claim in annotation["attributes"]["semantic"]["claims"]:
+                if claim["method"]["id"] != "shot-boundaries-v1":
+                    continue
+                for key in ("previous_frame", "interval_start_frame", "anchor_frame"):
+                    wanted = str(claim["method"]["parameters"].get(key))
+                    match = next((frame for frame in transition_frames
                                   if str(frame.get("frame_index")) == wanted), None)
                     if match is not None and match not in selected:
                         selected.append(match)
@@ -883,6 +986,17 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                 ids = [frame_artifacts.get(str(claim["method"]["parameters"].get("from_frame"))),
                        frame_artifacts.get(str(claim["method"]["parameters"].get("to_frame")))]
                 ids = [item for item in ids if item]
+                if ids:
+                    claim["evidence_ids"] = ids
+            elif claim["method"]["id"] == "shot-boundaries-v1":
+                ids = []
+                for key in ("previous_frame", "interval_start_frame", "anchor_frame"):
+                    value = claim["method"]["parameters"].get(key)
+                    if value is None:
+                        continue
+                    artifact = frame_artifacts.get(str(value))
+                    if artifact and artifact not in ids:
+                        ids.append(artifact)
                 if ids:
                     claim["evidence_ids"] = ids
             elif claim["method"]["id"] in {"keyframe-sampling-local", "shot-framing-local"}:
@@ -990,6 +1104,61 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 or (f"仅 {len(pairs)} 对相邻抽样帧，不能证明整段镜头的运动方式" if len(pairs) < 2
                     else "相邻抽样帧分类不一致，需人工复核"),
             })
+        for event in keyframe.get("boundary_events") or []:
+            kind = event.get("kind")
+            if kind not in TRANSITION_KINDS:
+                continue
+            statements = {"cut": "发生硬切",
+                          "fade_in": "为渐入（画面由黑/白过渡到正常）",
+                          "fade_out": "为渐出（画面由正常过渡到黑/白）",
+                          "dissolve": "为叠化",
+                          "flash": "出现单帧闪光，未切断镜头",
+                          "unknown_transition": "存在未建模的持续转场"}
+            interval = event.get("interval") or {}
+            if interval.get("start_frame") is not None and interval.get("end_frame") is not None:
+                statement = (f"镜头边界检测判定 #{interval.get('start_frame')}–"
+                             f"#{interval.get('end_frame')} 帧区间内{statements[kind]}"
+                             f"（代表帧 #{event.get('anchor_frame')}，仅边界前后抽样帧，需人工复核）。")
+            else:
+                statement = (f"镜头边界检测在 #{event.get('anchor_frame')} 帧判定"
+                             f"{statements[kind]}（仅边界前后抽样帧，需人工复核）。")
+            metrics = {}
+            for key, item in (event.get("metrics") or {}).items():
+                if isinstance(item, bool):
+                    metrics[str(key)] = item
+                elif isinstance(item, (int, float)):
+                    metrics[str(key)] = round(float(item), 4) if isinstance(item, float) else int(item)
+                elif hasattr(item, "item"):
+                    metrics[str(key)] = item.item()
+                else:
+                    metrics[str(key)] = str(item)
+            claims.append({
+                "id": S.make_id("clm", f"{job_id}:{index}:transition:{kind}:{event.get('anchor_frame')}"),
+                "claim_type": "measured",
+                "statement": statement,
+                "subject_ref": None,
+                "time_window": window,
+                "evidence_ids": [],
+                "method": {"id": "shot-boundaries-v1", "version": "1",
+                           "parameters": {"kind": kind,
+                                          "anchor_frame": event.get("anchor_frame"),
+                                          "previous_frame": event.get("previous_frame"),
+                                          "representative_frame": event.get("representative_frame"),
+                                          "split_point": event.get("split_point"),
+                                          "interval_start_frame": interval.get("start_frame"),
+                                          "interval_end_frame": interval.get("end_frame"),
+                                          "interval_start_seconds": interval.get("start_seconds"),
+                                          "interval_end_seconds": interval.get("end_seconds"),
+                                          "confidence": event.get("confidence"),
+                                          "needs_review": event.get("needs_review"),
+                                          "boundary_radius": BOUNDARY_RADIUS,
+                                          "metrics": metrics}},
+                "model_run_id": None,
+                "score": float(event.get("confidence") or 0.0),
+                "score_kind": "rule_score",
+                "uncertainty_reason": event.get("uncertainty")
+                or "仅使用边界前后抽样帧，未覆盖整段视频的全部帧",
+            })
     return {"version": SEMANTIC_VERSION, "claims": claims}
 
 
@@ -1038,6 +1207,9 @@ def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
             if (motion.get("status") == "success"
                     and summary.get("class") in MOTION_LABELS):
                 tags.append("vision-motion-" + summary["class"])
+            for event in keyframe.get("boundary_events") or []:
+                if event.get("kind") in TRANSITION_LABELS:
+                    tags.append("vision-transition-" + event["kind"])
         annotation = {
             "id": S.make_id("ann", candidate["job_id"] + ":" + str(index)),
             "type": "segment",
