@@ -219,18 +219,39 @@ class VisionJobs:
         return self._closing.is_set() or (self._external_closing is not None and self._external_closing.is_set())
 
     def options(self) -> Dict[str, Any]:
-        thresholds = MetricThresholds()
-        self._load_extractors(thresholds)
-        extractors = self._extractors or {"face": None, "ocr": None, "clip": None, "vlm": None}
+        """Report status without loading weights.
+
+        A capability query must not import torch/transformers or touch model
+        caches: opening the editor used to block for minutes on a cold start.
+        Extractor instances are built lazily by the first job, so before that
+        the per-adapter state is the honest string "not_loaded" rather than
+        False. After loading, "loaded" and "unavailable" distinguish a real
+        adapter from a missing dependency or weight.
+        """
+        loaded = self._extractors is not None
+
+        def adapter_state(key: str) -> str:
+            if not loaded:
+                return "not_loaded"
+            instance = self._extractors.get(key) if self._extractors else None
+            if key == "face":
+                ready = instance is not None and instance.detector is not None
+            elif key == "ocr":
+                ready = instance is not None and instance.engine is not None
+            else:
+                ready = instance is not None and instance.model is not None
+            return "loaded" if ready else "unavailable"
+
         capabilities = {
             "scene": bool(shutil.which("ffmpeg")),
-            "face": extractors["face"] is not None and extractors["face"].detector is not None,
-            "ocr": extractors["ocr"] is not None and extractors["ocr"].engine is not None,
-            "clip": extractors["clip"] is not None and extractors["clip"].model is not None,
-            "vlm": extractors["vlm"] is not None and extractors["vlm"].model is not None,
+            "face": adapter_state("face"),
+            "ocr": adapter_state("ocr"),
+            "clip": adapter_state("clip"),
+            "vlm": adapter_state("vlm"),
         }
         return {"operation": OPERATION, "version": VERSION, "domain": DOMAIN,
-                "capabilities": capabilities, "extractor_error": self._extractor_error,
+                "capabilities": capabilities, "loaded": loaded,
+                "extractor_error": self._extractor_error,
                 "closing": self.is_closing()}
 
     def submit(self, task_id: str, *, command_id: str, expected_revision: int,

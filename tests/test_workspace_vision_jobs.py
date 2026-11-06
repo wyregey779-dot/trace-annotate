@@ -327,6 +327,24 @@ def test_submit_many_freezes_each_task_and_replays_the_same_receipt(store):
         jobs.close(timeout=5)
 
 
+def test_vision_options_never_loads_models(store, monkeypatch):
+    """A status probe must stay cheap: opening the editor cannot block on torch."""
+    jobs = V.VisionJobs(store)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("options() must not build extractors")
+
+    monkeypatch.setattr(jobs, "_load_extractors", forbidden)
+    try:
+        options = jobs.options()
+    finally:
+        jobs.close(timeout=5)
+    assert options["loaded"] is False
+    assert options["capabilities"]["scene"] is True
+    assert options["capabilities"]["clip"] == "not_loaded"
+    assert options["extractor_error"] is None
+
+
 def test_submit_many_rejects_duplicate_tasks(store):
     jobs = V.VisionJobs(store, face_model_path="nonexistent-face-weights",
                         clip_model_path="nonexistent-clip-weights",
