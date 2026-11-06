@@ -626,6 +626,21 @@ class VisionJobs:
                     or self.store.task_digest(job["task_snapshot"]) != job["input_sha256"]):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision frozen input was altered")
 
+    def job_status(self, job_id: str) -> Dict[str, Any]:
+        """Read-only progress for one vision job, including a terminal error."""
+        S.require_id(job_id)
+        with self.store.transaction():
+            job = self.queue.get_job(job_id)
+            if job["operation"] != OPERATION:
+                raise Conflict("UNSUPPORTED_PROCESSOR", "Job is not a vision job")
+            attempt = (job.get("attempts") or [{}])[-1] if job.get("attempts") else {}
+            return {"job_id": job_id, "task_id": job["task_id"], "state": job["state"],
+                    "attempt": job.get("attempt"), "processor_version": job["processor_version"],
+                    "input_revision": job["input_revision"], "input_sha256": job["input_sha256"],
+                    "cancel_requested": job["state"] == "cancel_requested",
+                    "error_code": job.get("error_code") or attempt.get("error_code"),
+                    "has_candidate": job.get("commit") is not None}
+
     def result(self, job_id: str) -> Dict[str, Any]:
         S.require_id(job_id)
         try:

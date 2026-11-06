@@ -631,6 +631,10 @@ class _Handler(BaseHTTPRequestHandler):
             if parts == ["vision-options"]:
                 self._send_json(200, self.server.vision_jobs.options())
                 return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "vision-status":
+                _require_id(parts[1], "job_id")
+                self._send_json(200, self.server.vision_jobs.job_status(parts[1]))
+                return
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "vision-result":
                 _require_id(parts[1], "job_id")
                 self._send_json(200, self.server.vision_jobs.result(parts[1]))

@@ -87,6 +87,26 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert jobs.close()["stopped"]
 
 
+def test_job_status_is_read_only_and_reports_progress(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    queued = submit(jobs)["jobs"][0]
+    before = task(store)
+    status = jobs.job_status(queued["id"])
+    assert status["state"] == "queued"
+    assert status["task_id"] == before["id"]
+    assert status["attempt"] == 0
+    assert status["has_candidate"] is False
+    done = jobs.run_pending()[0]
+    status = jobs.job_status(queued["id"])
+    assert status["state"] == "succeeded"
+    assert status["attempt"] == 1
+    assert status["has_candidate"] is True
+    assert status["error_code"] is None
+    assert task(store) == before
+    fail_code("JOB_NOT_FOUND", lambda: jobs.job_status("job-does-not-exist"))
+    jobs.close()
+
+
 def test_vision_result_requires_success_and_correct_operation(store):
     jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
     other = DurableQueue(store)
