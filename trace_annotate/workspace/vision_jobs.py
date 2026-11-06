@@ -526,7 +526,10 @@ class VisionJobs:
                             keyframe["motion"] = motion
                             break
                 boundary_frames: List[Dict[str, Any]] = []
-                boundary_sampling = None
+                boundary_sampling: Dict[str, Any] = {
+                    "status": "not_run",
+                    "reason": "no_scene_boundary_in_window",
+                }
                 if scene_result["status"] == "success" and len(scenes) > 1:
                     try:
                         targets: List[tuple[int, int]] = []
@@ -545,6 +548,7 @@ class VisionJobs:
                             self.store, job["media_snapshot"]["id"], plan_b,
                             work / "boundaries", cancelled=cancelled, ffmpeg=ffmpeg)
                         boundary_sampling = {
+                            "status": "success",
                             "frame_map_sha256": plan_b["frame_map_sha256"],
                             "truncated": plan_b["truncated"],
                             "planned": plan_b["planned"],

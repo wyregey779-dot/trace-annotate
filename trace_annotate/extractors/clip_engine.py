@@ -9,6 +9,7 @@ reports success.
 """
 from __future__ import annotations
 import os
+import glob
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
@@ -69,6 +70,13 @@ def _cache_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".cache", "traceannotate", "clip")
 
 
+def _cached_weights() -> Optional[str]:
+    pattern = os.path.join(_cache_dir(), "models--timm--vit_base_patch32_clip_224.openai",
+                           "snapshots", "*", "open_clip_model.safetensors")
+    files = sorted(glob.glob(pattern))
+    return files[0] if files else None
+
+
 class CLIPExtractor(BaseExtractor):
     """Zero-shot CLIP classifier with lazy weight loading and honest status."""
 
@@ -102,6 +110,7 @@ class CLIPExtractor(BaseExtractor):
         """Weight and loader identity for the model-run record."""
         return {"model_name": self.model_path or DEFAULT_MODEL_NAME,
                 "pretrained": DEFAULT_PRETRAINED,
+                "weights_path": _cached_weights(),
                 "force_quick_gelu": True,
                 "offline": self.load_policy["offline"],
                 "downloads_allowed": self.load_policy["downloads_allowed"]}

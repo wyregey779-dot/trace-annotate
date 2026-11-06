@@ -152,6 +152,26 @@ def main():
         expect(page.locator("#segment-text")).to_have_value(marker, timeout=30000)
         check("Candidate edit survives save and page reload")
 
+        rows = page.locator("#vision-candidates tbody tr").count()
+        if rows < 2:
+            raise AssertionError("Both accept and reject need two pending candidates")
+        page.locator("#vision-candidates tbody tr").first.get_by_role("button", name="接受").click()
+        expect(page.locator("#vision-candidates tbody tr")).to_have_count(rows - 1, timeout=60000)
+        accepted = [item for item in store.get_task(target_id)["annotations"]
+                    if item.get("review_status") == "reviewed"
+                    and item.get("provenance", {}).get("origin") == "manual"]
+        if not accepted:
+            raise AssertionError("Accept did not create a manual, reviewed annotation")
+        check("Explicit accept upgrades the candidate to a manual reviewed annotation")
+        before = len(store.get_task(target_id)["annotations"])
+        page.locator("#vision-candidates tbody tr").first.get_by_role("button", name="拒绝").click()
+        expect(page.locator("#confirm-dialog")).to_be_visible(timeout=10000)
+        page.locator("#confirm-accept").click()
+        expect(page.locator("#vision-candidates tbody tr")).to_have_count(rows - 2, timeout=60000)
+        if len(store.get_task(target_id)["annotations"]) != before - 1:
+            raise AssertionError("Reject did not delete exactly one annotation")
+        check("Explicit reject removes the candidate through a new revision")
+
         with page.expect_download() as download:
             page.locator("#export-professional-btn").click()
         path = args.output / "professional-export.json"
