@@ -283,6 +283,30 @@ def test_http_vision_chain_submit_result_apply_status(store, clip):
         server.server_close()
 
 
+def test_vision_sampling_uses_pts_anchored_multi_frame_plan(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        queued = submit(jobs, command_id="vision-samples")["jobs"][0]
+        jobs.run_pending()
+        result = jobs.result(queued["id"])
+    finally:
+        jobs.close()
+    sampling = result["sampling"]
+    assert sampling["frame_map_sha256"]
+    assert sampling["fingerprint"]
+    assert sampling["returned"] >= 2
+    assert all(isinstance(frame["frame_index"], str) for frame in result["keyframes"])
+    assert all(frame["source_pts"] for frame in result["keyframes"])
+    assert all("first" in frame["roles"] or "last" in frame["roles"]
+               or "uniform" in frame["roles"] or "boundary" in frame["roles"]
+               or "boundary_before" in frame["roles"] or "boundary_after" in frame["roles"]
+               for frame in result["keyframes"])
+    covered = {frame["scene_index"] for frame in result["keyframes"]}
+    assert covered == set(range(len(result["scenes"])))
+    assert all(item["relative_path"].endswith(".png") for item in result["evidence"])
+
+
 def test_submit_many_freezes_each_task_and_replays_the_same_receipt(store):
     jobs = V.VisionJobs(store, face_model_path="nonexistent-face-weights",
                         clip_model_path="nonexistent-clip-weights",

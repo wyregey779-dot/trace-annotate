@@ -106,6 +106,19 @@ def _index_of_seconds(rows: List[Dict[str, Any]], seconds: Any) -> int:
     return lo
 
 
+def boundary_indices(store: Any, media_id: str, seconds: Sequence[Any], *,
+                     budget: Optional[SamplingBudget] = None) -> List[int]:
+    """Map scene-start seconds to admitted frame indices (left-closed)."""
+    S.require_id(media_id)
+    budget = budget or SamplingBudget()
+    rows, _digest, total = _rows(store, media_id, budget)
+    result = []
+    for value in seconds:
+        index = _index_of_seconds(rows, value)
+        result.append(min(max(0, index), total - 1))
+    return sorted(set(result))
+
+
 def plan_samples(store: Any, media_id: str, *, window: Optional[Dict[str, Any]] = None,
                  uniform: int = 8, boundary_frames: Iterable[int] = (),
                  include_edges: bool = True,
@@ -178,14 +191,15 @@ def plan_samples(store: Any, media_id: str, *, window: Optional[Dict[str, Any]] 
 
 def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path, *,
                    timeout: int = DECODE_TIMEOUT, cancelled: Optional[Callable[[], bool]] = None,
-                   max_bytes: Optional[int] = None) -> Dict[str, Any]:
+                   max_bytes: Optional[int] = None,
+                   ffmpeg: Optional[str] = None) -> Dict[str, Any]:
     """Decode the planned frames in one pass; verify count, PNG signature and hash."""
     Path(output).mkdir(parents=True, exist_ok=True)
     _safe(Path(output))
     frames = plan["samples"]
     if not frames:
         raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "No frames were planned")
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = ffmpeg or shutil.which("ffmpeg")
     if not ffmpeg:
         raise DependencyUnavailable("DEPENDENCY_UNAVAILABLE", "FFmpeg is needed to decode samples")
     from .frames import _binding

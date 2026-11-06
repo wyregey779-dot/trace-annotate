@@ -28,6 +28,7 @@ from ..extractors.vlm import VLMExtractor
 from ..temporal.media import stream_sha256
 from . import professional_schema as PS
 from . import schema as S
+from . import vision_sampling as VS
 from .errors import Conflict, SchemaInvalid, WorkspaceError
 from .http_media import resolve_media_object
 from .queue import DurableQueue, MAX_RESULT_BYTES
@@ -388,30 +389,49 @@ class VisionJobs:
                     end = S.rational_value(window["end"])
                     scenes = [scene for scene in scenes
                               if scene["end"] > start and scene["start"] < end]
-                if scene_result["status"] == "success":
-                    for index, scene in enumerate(scenes):
+                if scene_result["status"] == "success" and scenes:
+                    boundary_seconds = [scene["start"] for scene in scenes]
+                    boundaries = VS.boundary_indices(self.store, job["media_snapshot"]["id"], boundary_seconds)
+                    plan = VS.plan_samples(
+                        self.store, job["media_snapshot"]["id"], window=window,
+                        uniform=min(8, max(1, len(scenes))), boundary_frames=boundaries,
+                        budget=VS.SamplingBudget(max_frames=MAX_KEYFRAMES))
+                    decoded = VS.decode_samples(
+                        self.store, job["media_snapshot"]["id"], plan, work / "samples",
+                        cancelled=cancelled, ffmpeg=ffmpeg)
+                    sampling = {"frame_map_sha256": plan["frame_map_sha256"],
+                                "truncated": plan["truncated"],
+                                "planned": plan["planned"], "returned": plan["returned"],
+                                "coverage": plan["coverage"],
+                                "fingerprint": VS.samples_fingerprint(plan)}
+                    for item in decoded["decoded"]:
                         if cancelled():
-                            raise WorkspaceError("CANCELLED", "Vision cancelled while extracting keyframes")
-                        if len(keyframes) >= MAX_KEYFRAMES:
-                            break
-                        mid = (float(scene["start"]) + float(scene["end"])) / 2.0
-                        if window is not None:
-                            mid = max(float(start), min(float(end), mid))
-                        frame_path = work / f"keyframe-{index:04d}.jpg"
-                        _extract_keyframe(ffmpeg, Path(source), mid, frame_path)
-                        frame = _load_frame(frame_path)
+                            raise WorkspaceError("CANCELLED", "Vision cancelled while analysing samples")
+                        seconds = S.rational_value(item["seconds"])
+                        scene_index = next((index for index, scene in enumerate(scenes)
+                                            if scene["start"] <= seconds < scene["end"]), None)
+                        if scene_index is None:
+                            continue
+                        frame = _load_frame(Path(item["path"]))
                         face_result = _run_face(frame, extractors["face"])
                         ocr_result = _run_ocr(frame, extractors["ocr"])
                         clip_result = _run_clip(frame, extractors["clip"])
                         vlm_result = _run_vlm(frame, extractors["vlm"])
                         keyframes.append({
-                            "scene_index": index,
-                            "timestamp": _seconds_ratio(mid),
+                            "scene_index": scene_index,
+                            "frame_index": item["frame_index"],
+                            "source_pts": item["source_pts"],
+                            "proxy_pts": item["proxy_pts"],
+                            "roles": item["roles"],
+                            "timestamp": _seconds_ratio(seconds),
+                            "evidence_sha256": item["sha256"],
                             "face": face_result,
                             "ocr": ocr_result,
                             "clip": clip_result,
                             "vlm": vlm_result,
                         })
+                else:
+                    sampling = None
                 extractor_status = {
                     "scene": scene_result["status"],
                     "face": _aggregate_status(keyframes, "face"),
@@ -422,13 +442,16 @@ class VisionJobs:
                 if self._extractor_error is not None:
                     extractor_status["extractor_error"] = self._extractor_error
                 evidence = []
-                for path in sorted(work.iterdir()):
+                for path in sorted(work.rglob("*")):
                     if cancelled():
                         raise WorkspaceError("CANCELLED", "Vision cancelled while hashing evidence")
                     _safe(path)
+                    if path.is_dir():
+                        continue
                     if not stat.S_ISREG(path.stat().st_mode):
                         raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence is not a regular file")
-                    evidence.append({"relative_path": relative + "/" + path.name,
+                    nested = path.relative_to(work).as_posix()
+                    evidence.append({"relative_path": relative + "/" + nested,
                                      "sha256": stream_sha256(path, cancelled=cancelled),
                                      "size_bytes": str(path.stat().st_size)})
                 candidate = {"kind": RESULT_KIND, "version": 1, "processor_version": VERSION,
@@ -436,7 +459,7 @@ class VisionJobs:
                     "input_revision": job["input_revision"], "input_sha256": job["input_sha256"],
                     "file_sha256": digest, "time_domain": DOMAIN, "window": window,
                     "subject_annotation_id": parameters["subject_annotation_id"],
-                    "scenes": scenes, "keyframes": keyframes,
+                    "scenes": scenes, "keyframes": keyframes, "sampling": sampling,
                     "extractor_status": extractor_status, "evidence": evidence,
                     "semantic_listening": "not_performed", "source_unchanged": True,
                     "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
@@ -538,11 +561,19 @@ class VisionJobs:
             "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
         expected = set(fixed) | {"window", "subject_annotation_id", "scenes", "keyframes",
                                  "extractor_status", "evidence"}
-        if (not isinstance(value, dict) or set(value) != expected
+        if (not isinstance(value, dict) or not expected <= set(value)
+                or set(value) - expected - {"sampling"}
                 or any(value[key] != item for key, item in fixed.items())
                 or value["window"] != parameters["window"]
                 or value["subject_annotation_id"] != parameters["subject_annotation_id"]):
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate identity is inconsistent")
+        sampling = value.get("sampling")
+        if sampling is not None and (not isinstance(sampling, dict)
+                or set(sampling) != {"frame_map_sha256", "truncated", "planned", "returned",
+                                     "coverage", "fingerprint"}
+                or not isinstance(sampling["frame_map_sha256"], str)
+                or not isinstance(sampling["fingerprint"], str)):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision sampling descriptor is inconsistent")
         if (not isinstance(value["scenes"], list) or len(value["scenes"]) > MAX_SCENES
                 or not isinstance(value["keyframes"], list) or len(value["keyframes"]) > MAX_KEYFRAMES):
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate scene list is inconsistent")
@@ -560,7 +591,8 @@ class VisionJobs:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence descriptor is invalid")
             path = evidence["relative_path"]
             name = path[len(prefix):]
-            if (not name or PurePosixPath(name).name != name or "\\" in name or ":" in name or name in {".", ".."}
+            parts = PurePosixPath(name).parts
+            if (not name or any(part in {"", ".", ".."} or "\\" in part or ":" in part for part in parts)
                     or path in paths or not isinstance(evidence["sha256"], str) or S.HASH_RE.fullmatch(evidence["sha256"]) is None
                     or not isinstance(evidence["size_bytes"], str) or not evidence["size_bytes"].isdigit()):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence path or identity is invalid")
