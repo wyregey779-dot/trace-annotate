@@ -26,6 +26,7 @@ from ..extractors.clip_engine import CLIPExtractor
 from ..extractors.faces import FaceExtractor
 from ..extractors.ocr import OCRExtractor
 from ..extractors.scene import SceneDetector, SceneDetectionError
+from ..extractors.shot_attributes import classify_framing
 from ..extractors.vlm import VLMExtractor
 from ..temporal.media import stream_sha256
 from . import professional_schema as PS
@@ -149,6 +150,31 @@ def _run_face(frame: Any, face_extractor: Optional[FaceExtractor]) -> Dict[str, 
         result = face_extractor.detect_faces(frame)
     except Exception as exc:  # A vision helper must never crash the whole job.
         return {"status": "failed", "error": str(exc)}
+    return result
+
+
+def _shot_framing(frame: Any, face_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Framing from the face boxes this project actually measured.
+
+    A face-only ratio is explicitly downgraded and is never called a close-up
+    merely because the face is large. Without a face result the framing is
+    ``not_applicable``; it is not guessed from the frame.
+    """
+    if face_result.get("status") != "success":
+        return {"status": "not_run", "framing": None,
+                "reason": "face extractor did not report boxes"}
+    faces = face_result.get("faces_detected") or []
+    if not faces:
+        return {"status": "success", "framing": "不适用", "subjects": 0,
+                "reason": "画面内没有可用主体框", "confidence": 0.0,
+                "uncertainty": "未检测到主体不等于画面中不存在主体"}
+    height, width = frame.shape[:2]
+    boxes = []
+    for face in faces:
+        x, y, box_width, box_height = [float(value) for value in face["box"]]
+        boxes.append((x, y, x + box_width, y + box_height))
+    result = classify_framing(boxes, (width, height), subject_kind="face")
+    result["status"] = "success"
     return result
 
 
@@ -438,6 +464,7 @@ class VisionJobs:
                             continue
                         frame = _load_frame(Path(item["path"]))
                         face_result = _run_face(frame, extractors["face"])
+                        framing_result = _shot_framing(frame, face_result)
                         ocr_result = _run_ocr(frame, extractors["ocr"])
                         clip_result = _run_clip(frame, extractors["clip"])
                         vlm_result = _run_vlm(frame, extractors["vlm"])
@@ -450,6 +477,7 @@ class VisionJobs:
                             "timestamp": _seconds_ratio(seconds),
                             "evidence_sha256": item["sha256"],
                             "face": face_result,
+                            "framing": framing_result,
                             "ocr": ocr_result,
                             "clip": clip_result,
                             "vlm": vlm_result,
@@ -822,7 +850,7 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
             frame_artifacts[str(frame["frame_index"])] = artifact["id"]
         annotation["evidence_ids"] = evidence_ids
         for claim in annotation["attributes"]["semantic"]["claims"]:
-            if claim["method"]["id"] == "keyframe-sampling-local":
+            if claim["method"]["id"] in {"keyframe-sampling-local", "shot-framing-local"}:
                 frame_index = str(claim["method"]["parameters"]["frame_index"])
                 if frame_index in frame_artifacts:
                     claim["evidence_ids"] = [frame_artifacts[frame_index]]
@@ -872,6 +900,30 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
             "score_kind": "none",
             "uncertainty_reason": "抽样帧只代表该时刻，不覆盖镜头内全部画面",
         })
+        framing = keyframe.get("framing") or {}
+        if (framing.get("status") == "success"
+                and framing.get("framing") in {"远景", "全景", "中景", "近景", "特写"}):
+            measurements = framing.get("measurements") or []
+            ratio = measurements[0].get("height_ratio") if measurements else None
+            claims.append({
+                "id": S.make_id("clm", f"{job_id}:{index}:framing"),
+                "claim_type": "measured",
+                "statement": (f"按关键帧 #{keyframe['frame_index']} 的人脸框高度占比"
+                              f"测得景别为{framing['framing']}（仅人脸框，需人物框复核）。"),
+                "subject_ref": None,
+                "time_window": window,
+                "evidence_ids": [],
+                "method": {"id": "shot-framing-local", "version": "1",
+                           "parameters": {"framing": framing["framing"],
+                                          "subject_kind": "face",
+                                          "face_height_ratio": ratio,
+                                          "frame_index": keyframe["frame_index"]}},
+                "model_run_id": None,
+                "score": float(framing.get("confidence") or 0.0),
+                "score_kind": "rule_score",
+                "uncertainty_reason": framing.get("uncertainty")
+                or "未检测到主体不等于画面中不存在主体",
+            })
     return {"version": SEMANTIC_VERSION, "claims": claims}
 
 
@@ -911,6 +963,10 @@ def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
             if vlm.get("status") == "success" and vlm.get("caption"):
                 text_draft = vlm["caption"]
                 tags.append("vision-caption")
+            framing = keyframe.get("framing") or {}
+            if (framing.get("status") == "success"
+                    and framing.get("framing") in {"远景", "全景", "中景", "近景", "特写"}):
+                tags.append("vision-framing-" + framing["framing"])
         annotation = {
             "id": S.make_id("ann", candidate["job_id"] + ":" + str(index)),
             "type": "segment",

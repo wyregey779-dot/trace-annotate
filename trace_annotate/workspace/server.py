@@ -13,6 +13,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 import webbrowser
 
@@ -904,7 +905,11 @@ def make_server(store: WorkspaceStore, host: str = "127.0.0.1", port: int = 0) -
     server.analysis_jobs = AnalysisJobs(store, queue=queue, closing=server.closing)
     server.analysis_jobs.start()
     from .vision_jobs import VisionJobs
-    server.vision_jobs = VisionJobs(store, queue=queue, closing=server.closing)
+    default_face = Path(__file__).resolve().parents[1] / "models" / "face_detection_yunet_2023mar.onnx"
+    face_model = os.environ.get("TRACE_ANNOTATE_FACE_MODEL",
+                                str(default_face) if default_face.exists() else None)
+    server.vision_jobs = VisionJobs(store, queue=queue, closing=server.closing,
+                                    face_model_path=face_model)
     server.vision_jobs.start()
     from .render_jobs import RenderJobs
     server.render_preview_lock = threading.Lock()
