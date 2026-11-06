@@ -167,17 +167,18 @@ def analyse_motion(samples: Sequence[Dict[str, Any]], *,
     if not classes:
         return {"status": "not_run", "pairs": pairs, "summary": None}
     # A shot is described by the motion it actually contains: a hold frame at the
-    # end must not cancel the pan that happened before it.
+    # end must not cancel the pan that happened before it. The denominator stays
+    # the number of attempted pairs, so an unmeasurable pair still lowers agreement.
     moving = [name for name in classes if name != "static"]
     pool = moving or classes
     stable = max(set(pool), key=pool.count)
-    agreement = pool.count(stable) / len(classes)
+    agreement = pool.count(stable) / max(1, len(pairs))
     summary = {"class": stable if agreement >= min_pair_confidence else "unknown_motion",
-               "agreement": round(pool.count(stable) / len(pool), 3),
+               "agreement": round(agreement, 3),
                "pairs": len(classes),
                "mean_speed_px_s": _mean_speed(pairs),
-               "uncertainty": None if pool.count(stable) / len(pool) >= 0.8
-               else "相邻帧分类不一致，需人工复核"}
+               "uncertainty": None if agreement >= 0.8
+               else "相邻帧分类不一致或存在无法测量的帧对，需人工复核"}
     return {"status": "success", "pairs": pairs, "summary": summary}
 
 

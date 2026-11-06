@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from ..config import MetricThresholds
+from ..extractors.camera_motion import analyse_motion
 from ..extractors.clip_engine import CLIPExtractor
 from ..extractors.faces import FaceExtractor
 from ..extractors.ocr import OCRExtractor
@@ -49,6 +50,8 @@ MAX_FRAME_BYTES = 16 * 1024 * 1024
 FRAME_QUALITY = 3
 CANDIDATE_LABEL_PREFIX = "镜头候选"
 CANDIDATE_TRACK = "镜头"
+MOTION_LABELS = {"static", "pan_left", "pan_right", "tilt_up", "tilt_down",
+                 "zoom_in", "zoom_out", "handheld_like"}
 
 
 def _finite(value: Any, name: str, *, positive: bool = False) -> float:
@@ -432,6 +435,7 @@ class VisionJobs:
                 detector = SceneDetector(thresholds=thresholds)
                 scene_result = _run_scenes(detector, Path(source), thresholds)
                 keyframes: List[Dict[str, Any]] = []
+                scene_frames: Dict[int, List[Dict[str, Any]]] = {}
                 window = parameters["window"]
                 scenes = scene_result["scenes"]
                 if window is not None:
@@ -482,8 +486,19 @@ class VisionJobs:
                             "clip": clip_result,
                             "vlm": vlm_result,
                         })
+                        scene_frames.setdefault(scene_index, []).append({
+                            "frame_index": item["frame_index"], "seconds": seconds,
+                            "frame": frame})
                 else:
                     sampling = None
+                for scene_index, samples in scene_frames.items():
+                    if len(samples) < 2:
+                        continue
+                    motion = analyse_motion(samples)
+                    for keyframe in keyframes:
+                        if keyframe["scene_index"] == scene_index:
+                            keyframe["motion"] = motion
+                            break
                 extractor_status = {
                     "scene": scene_result["status"],
                     "face": _aggregate_status(keyframes, "face"),
@@ -823,8 +838,22 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
         frame_artifacts: Dict[str, str] = {}
         # One representative sampled keyframe per candidate keeps the portable
         # professional document inside its byte budget while still grounding the
-        # keyframe claim in a real immutable PNG.
-        for frame in scene_frames[:1]:
+        # keyframe claim in a real immutable PNG. A camera-motion claim needs both
+        # ends of its comparison, so both sampled frames are previewed.
+        selected = list(scene_frames[:1])
+        has_motion = any(claim["method"]["id"] == "camera-motion-local"
+                         for claim in annotation["attributes"]["semantic"]["claims"])
+        if has_motion:
+            for claim in annotation["attributes"]["semantic"]["claims"]:
+                if claim["method"]["id"] != "camera-motion-local":
+                    continue
+                for key in ("from_frame", "to_frame"):
+                    wanted = str(claim["method"]["parameters"].get(key))
+                    match = next((frame for frame in scene_frames
+                                  if str(frame.get("frame_index")) == wanted), None)
+                    if match is not None and match not in selected:
+                        selected.append(match)
+        for frame in selected:
             digest = frame.get("evidence_sha256")
             descriptor = samples.get(digest)
             if descriptor is None:
@@ -850,7 +879,13 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
             frame_artifacts[str(frame["frame_index"])] = artifact["id"]
         annotation["evidence_ids"] = evidence_ids
         for claim in annotation["attributes"]["semantic"]["claims"]:
-            if claim["method"]["id"] in {"keyframe-sampling-local", "shot-framing-local"}:
+            if claim["method"]["id"] == "camera-motion-local":
+                ids = [frame_artifacts.get(str(claim["method"]["parameters"].get("from_frame"))),
+                       frame_artifacts.get(str(claim["method"]["parameters"].get("to_frame")))]
+                ids = [item for item in ids if item]
+                if ids:
+                    claim["evidence_ids"] = ids
+            elif claim["method"]["id"] in {"keyframe-sampling-local", "shot-framing-local"}:
                 frame_index = str(claim["method"]["parameters"]["frame_index"])
                 if frame_index in frame_artifacts:
                     claim["evidence_ids"] = [frame_artifacts[frame_index]]
@@ -924,6 +959,37 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 "uncertainty_reason": framing.get("uncertainty")
                 or "未检测到主体不等于画面中不存在主体",
             })
+        motion = keyframe.get("motion") or {}
+        summary = motion.get("summary") or {}
+        if (motion.get("status") == "success"
+                and summary.get("class") in MOTION_LABELS):
+            pairs = [pair for pair in (motion.get("pairs") or [])
+                     if pair.get("class") not in (None, "not_run")]
+            confidence = min((float(pair.get("confidence") or 0.0) for pair in pairs), default=0.0)
+            first_pair = pairs[0] if pairs else {}
+            claims.append({
+                "id": S.make_id("clm", f"{job_id}:{index}:motion"),
+                "claim_type": "measured",
+                "statement": (f"该镜头相邻抽样帧之间的画面全局运动为"
+                              f"{summary['class']}（仅抽样帧对比，不代表全程运镜）。"),
+                "subject_ref": None,
+                "time_window": window,
+                "evidence_ids": [],
+                "method": {"id": "camera-motion-local", "version": "1",
+                           "parameters": {"class": summary["class"],
+                                          "agreement": summary.get("agreement"),
+                                          "pairs": summary.get("pairs"),
+                                          "mean_speed_px_s": summary.get("mean_speed_px_s"),
+                                          "frame_index": keyframe.get("frame_index"),
+                                          "from_frame": first_pair.get("from_frame"),
+                                          "to_frame": first_pair.get("to_frame")}},
+                "model_run_id": None,
+                "score": round(confidence, 3),
+                "score_kind": "rule_score",
+                "uncertainty_reason": summary.get("uncertainty")
+                or (f"仅 {len(pairs)} 对相邻抽样帧，不能证明整段镜头的运动方式" if len(pairs) < 2
+                    else "相邻抽样帧分类不一致，需人工复核"),
+            })
     return {"version": SEMANTIC_VERSION, "claims": claims}
 
 
@@ -967,6 +1033,11 @@ def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
             if (framing.get("status") == "success"
                     and framing.get("framing") in {"远景", "全景", "中景", "近景", "特写"}):
                 tags.append("vision-framing-" + framing["framing"])
+            motion = keyframe.get("motion") or {}
+            summary = motion.get("summary") or {}
+            if (motion.get("status") == "success"
+                    and summary.get("class") in MOTION_LABELS):
+                tags.append("vision-motion-" + summary["class"])
         annotation = {
             "id": S.make_id("ann", candidate["job_id"] + ":" + str(index)),
             "type": "segment",
