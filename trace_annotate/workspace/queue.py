@@ -28,14 +28,14 @@ _DDL = (
     "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, "
     "input TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, "
     "lease_generation INTEGER NOT NULL DEFAULT 0, worker_id TEXT, session_id TEXT, "
-    "lease_expires_at REAL, heartbeat_at REAL, error_code TEXT, created_at TEXT NOT NULL)",
+    "lease_expires_at REAL, heartbeat_at REAL, error_code TEXT, error_message TEXT, created_at TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS batch_jobs (batch_id TEXT NOT NULL REFERENCES batches(id), "
     "job_id TEXT NOT NULL REFERENCES jobs(id), ordinal INTEGER NOT NULL, "
     "PRIMARY KEY(batch_id,job_id))",
     "CREATE TABLE IF NOT EXISTS attempts (job_id TEXT NOT NULL REFERENCES jobs(id), "
     "attempt INTEGER NOT NULL, lease_generation INTEGER NOT NULL, worker_id TEXT NOT NULL, "
     "state TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error_code TEXT, "
-    "diagnostic_artifact_id TEXT, "
+    "error_message TEXT, diagnostic_artifact_id TEXT, "
     "PRIMARY KEY(job_id,attempt))",
     "CREATE TABLE IF NOT EXISTS job_commits (job_id TEXT PRIMARY KEY REFERENCES jobs(id), "
     "id TEXT NOT NULL UNIQUE, body TEXT NOT NULL)",
@@ -178,6 +178,10 @@ class DurableQueue:
         with store.transaction():
             for statement in _DDL:
                 store.conn.execute(statement)
+            for table in ("jobs", "attempts"):
+                columns = {row[1] for row in store.conn.execute(f"PRAGMA table_info({table})")}
+                if "error_message" not in columns:
+                    store.conn.execute(f"ALTER TABLE {table} ADD COLUMN error_message TEXT")
             store._install_revision_triggers(("batches", "jobs", "attempts", "batch_jobs"))
             config = store.conn.execute("SELECT value FROM meta WHERE key='queue_max_concurrency'").fetchone()
             if config:
@@ -359,11 +363,12 @@ class DurableQueue:
                                     (now, now + self.lease_seconds, job_id))
             return {"cancel_requested": job["state"] == "cancel_requested", "lease_expires_at": now + self.lease_seconds}
 
-    def _end(self, job: Dict[str, Any], state: str, error_code: Optional[str] = None) -> None:
-        self.store.conn.execute("UPDATE jobs SET state=?,error_code=?,lease_expires_at=NULL WHERE id=?",
-                                (state, error_code, job["id"]))
-        self.store.conn.execute("UPDATE attempts SET state=?,ended_at=?,error_code=? WHERE job_id=? AND attempt=?",
-                                (state, self._now(), error_code, job["id"], job["attempt"]))
+    def _end(self, job: Dict[str, Any], state: str, error_code: Optional[str] = None,
+             error_message: Optional[str] = None) -> None:
+        self.store.conn.execute("UPDATE jobs SET state=?,error_code=?,error_message=?,lease_expires_at=NULL WHERE id=?",
+                                (state, error_code, error_message, job["id"]))
+        self.store.conn.execute("UPDATE attempts SET state=?,ended_at=?,error_code=?,error_message=? WHERE job_id=? AND attempt=?",
+                                (state, self._now(), error_code, error_message, job["id"], job["attempt"]))
 
     def finish(self, job_id: str, lease_generation: int, worker_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
         if type(lease_generation) is not int or lease_generation < 1:
@@ -403,16 +408,20 @@ class DurableQueue:
             return commit
 
     def fail(self, job_id: str, lease_generation: int, worker_id: str,
-             error_code: str = "PROCESSOR_FAILED", *, diagnostic: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+             error_code: str = "PROCESSOR_FAILED", *, diagnostic: Optional[Dict[str, Any]] = None,
+             error_message: Optional[str] = None) -> Dict[str, Any]:
         if not isinstance(error_code, str) or re.fullmatch(r"[A-Z][A-Z0-9_]{0,95}", error_code) is None:
             raise SchemaInvalid("SCHEMA_INVALID", "Invalid error_code")
+        if error_message is not None and (not isinstance(error_message, str) or len(error_message) > 512):
+            raise SchemaInvalid("SCHEMA_INVALID", "error_message must be a string of at most 512 characters")
         with self.store.transaction():
             job = self._lease(job_id, lease_generation, worker_id)
             if diagnostic is not None and error_code != "STORAGE_FULL":
                 artifact = self.store._put_artifact(_json(diagnostic))
                 self.store.conn.execute("UPDATE attempts SET diagnostic_artifact_id=? WHERE job_id=? AND attempt=?",
                                         (artifact["id"], job_id, job["attempt"]))
-            self._end(job, "cancelled" if job["state"] == "cancel_requested" else "failed", error_code)
+            self._end(job, "cancelled" if job["state"] == "cancel_requested" else "failed", error_code,
+                      error_message)
             if error_code == "STORAGE_FULL":
                 self.store.conn.execute("UPDATE batches SET dispatch_paused=1")
             return self.get_job(job_id)
@@ -575,7 +584,9 @@ class DurableQueue:
                                                       getattr(exc, "winerror", None) == 112):
                         code = "STORAGE_FULL"
                     self.fail(job["id"], job["lease_generation"], worker_id, code,
+                              error_message=str(exc)[:512],
                               diagnostic={"stage": "processor_or_commit", "exception_type": type(exc).__name__,
+                                          "exception_message": str(exc)[:512],
                                           "error_code": code, "job_id": job["id"], "attempt": job["attempt"],
                                           "input_revision": job["input_revision"], "input_sha256": job["input_sha256"]})
         finally:
