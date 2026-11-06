@@ -55,7 +55,8 @@ CANDIDATE_TRACK = "镜头"
 MOTION_LABELS = {"static", "pan_left", "pan_right", "tilt_up", "tilt_down",
                  "zoom_in", "zoom_out", "handheld_like"}
 BOUNDARY_RADIUS = 8
-TRANSITION_LABELS = {"fade_in", "fade_out", "dissolve", "flash"}
+TRANSITION_LABELS = {"cut", "fade_in", "fade_out", "dissolve", "flash",
+                     "unknown_transition"}
 
 
 def _finite(value: Any, name: str, *, positive: bool = False) -> float:
@@ -582,19 +583,53 @@ class VisionJobs:
                                       "frame": _load_frame(Path(item["path"]))}
                             for scene_index in scene_indices:
                                 boundary_samples.setdefault(scene_index, []).append(dict(sample))
+                        scene_events: Dict[int, List[Dict[str, Any]]] = {}
                         for scene_index, samples in boundary_samples.items():
                             if len(samples) < 2:
                                 continue
                             result = detect_shot_boundaries(samples)
                             for event in result["events"]:
-                                key = (event.get("frame_index"), event.get("class"),
-                                       tuple(event.get("time_window") or ()))
+                                key = (event.get("kind"), event.get("anchor_frame"),
+                                       (event.get("interval") or {}).get("start_frame"),
+                                       (event.get("interval") or {}).get("end_frame"))
                                 detected.setdefault(key, (scene_index, event))
-                        for scene_index, event in detected.values():
+                            scene_events[scene_index] = list(result["events"])
+                        target_frames = {scene: index for index, scene in targets}
+                        final_events: Dict[int, List[Dict[str, Any]]] = {}
+                        for scene_index, events in scene_events.items():
+                            target = target_frames.get(scene_index)
+                            has_cut = any(
+                                event.get("kind") == "cut"
+                                and target is not None
+                                and abs(int(event.get("anchor_frame") or -1) - target) <= 2
+                                for event in events)
+                            if has_cut or target is None:
+                                final_events[scene_index] = events
+                                continue
+                            previous = target - 1 if target > 0 else None
+                            final_events[scene_index] = [{
+                                "kind": "cut",
+                                "anchor_frame": str(target),
+                                "previous_frame": str(previous) if previous is not None else None,
+                                "representative_frame": str(target),
+                                "split_point": str(target),
+                                "confidence": 0.5,
+                                "uncertainty": "弱视觉差异，切点由 scene-cut-ffmpeg 场景边界给出；边界检测未单独达到阈值",
+                                "metrics": {"source": "scene-cut-ffmpeg", "scene_boundary": True},
+                                "needs_review": True,
+                                "interval": None,
+                            }]
+                        for scene_index, events in final_events.items():
                             first = next((frame for frame in keyframes
                                           if frame["scene_index"] == scene_index), None)
-                            if first is not None:
+                            if first is None:
+                                continue
+                            for event in events:
                                 first.setdefault("boundary_events", []).append(event)
+                                detected[(scene_index, event.get("kind"),
+                                          event.get("anchor_frame"))] = (scene_index, event)
+                        boundary_sampling["scene_events"] = {
+                            str(scene): len(final_events[scene]) for scene in sorted(final_events)}
                         boundary_sampling["scenes_with_events"] = sorted({scene for scene, _ in detected.values()})
                         boundary_sampling["event_count"] = len(detected)
                         boundary_sampling["overlap_mapping"] = "each decoded boundary frame is reused by every scene window that covers it"
