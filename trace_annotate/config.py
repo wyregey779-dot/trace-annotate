@@ -22,9 +22,9 @@ class StagingConfig:
 class MetricThresholds:
     """Thresholds for visual metrics, near-duplicate clustering, and quality scoring."""
     dhash_hamming_threshold: int = 10     # Max hamming distance for similar cluster grouping
-    scene_threshold: float = 0.35          # ffmpeg scene detection threshold
-    scene_min_duration_s: float = 10.0     # Minimum duration in seconds to trigger scene splitting
-    scene_cap_seconds: float = 180.0       # Max video duration processed for scene detection
+    scene_threshold: float = 0.30          # ffmpeg scene detection threshold
+    scene_min_duration_s: float = 10.0     # Legacy; never merges short shots in SceneDetector
+    scene_cap_seconds: float = 1200.0      # Max video duration processed for scene detection
     dark_brightness_cutoff: float = 15.0   # Bad frame: too dark
     blown_brightness_cutoff: float = 245.0 # Bad frame: overexposed
     blur_sharpness_cutoff: float = 8.0     # Bad frame: blurry (Laplacian variance)
