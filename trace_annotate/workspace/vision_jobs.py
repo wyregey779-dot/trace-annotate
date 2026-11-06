@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import MetricThresholds
 from ..extractors.camera_motion import analyse_motion
+from ..extractors.scene_change import detect_content_changes
 from ..extractors.clip_engine import CLIPExtractor
 from ..extractors.faces import FaceExtractor
 from ..extractors.ocr import OCRExtractor
@@ -526,6 +527,60 @@ class VisionJobs:
                         if keyframe["scene_index"] == scene_index:
                             keyframe["motion"] = motion
                             break
+                content_sampling: Dict[str, Any] = {
+                    "status": "not_run", "reason": "scene_extraction_not_run"}
+                if sampling is not None:
+                    try:
+                        scene_results = []
+                        for scene_index, scene in enumerate(scenes):
+                            plan_c = VS.plan_samples(
+                                self.store, job["media_snapshot"]["id"],
+                                window={"start": _seconds_ratio(float(scene["start"])),
+                                        "end": _seconds_ratio(float(scene["end"]))},
+                                uniform=8, include_edges=True,
+                                budget=VS.SamplingBudget(max_frames=16,
+                                                         boundary_radius=0))
+                            decoded_c = VS.decode_samples(
+                                self.store, job["media_snapshot"]["id"], plan_c,
+                                work / "content" / str(scene_index),
+                                cancelled=cancelled, ffmpeg=ffmpeg)
+                            samples = []
+                            for item in decoded_c["decoded"]:
+                                if cancelled():
+                                    raise WorkspaceError(
+                                        "CANCELLED",
+                                        "Vision cancelled while analysing content changes")
+                                samples.append({"frame_index": item["frame_index"],
+                                                "seconds": float(S.rational_value(item["seconds"])),
+                                                "frame": _load_frame(Path(item["path"]))})
+                            analysis = detect_content_changes(samples)
+                            for keyframe in keyframes:
+                                if keyframe["scene_index"] == scene_index:
+                                    keyframe["content_changes"] = analysis["changes"]
+                                    keyframe["content_filtered"] = analysis["filtered"]
+                                    break
+                            scene_results.append({
+                                "scene_index": scene_index,
+                                "planned": plan_c["planned"],
+                                "returned": len(decoded_c["decoded"]),
+                                "truncated": plan_c["truncated"],
+                                "changes": len(analysis["changes"]),
+                                "filtered": len(analysis["filtered"]),
+                            })
+                        content_sampling = {
+                            "status": "success",
+                            "scenes": len(scenes),
+                            "planned": sum(item["planned"] for item in scene_results),
+                            "returned": sum(item["returned"] for item in scene_results),
+                            "truncated": any(item["truncated"] for item in scene_results),
+                            "changes": sum(item["changes"] for item in scene_results),
+                            "filtered": sum(item["filtered"] for item in scene_results),
+                            "scene_results": scene_results,
+                        }
+                    except Exception as exc:
+                        content_sampling = {"status": "failed",
+                                            "error": type(exc).__name__,
+                                            "message": str(exc)[:240]}
                 boundary_frames: List[Dict[str, Any]] = []
                 boundary_sampling: Dict[str, Any] = {
                     "status": "not_run",
@@ -685,6 +740,7 @@ class VisionJobs:
                     "subject_annotation_id": parameters["subject_annotation_id"],
                     "scenes": scenes, "keyframes": keyframes, "sampling": sampling,
                     "boundary_frames": boundary_frames, "boundary_sampling": boundary_sampling,
+                    "content_sampling": content_sampling,
                     "extractor_status": extractor_status, "module_status": module_status,
                     "model_runs": model_runs,
                     "job_identity": parameters["job_identity"], "evidence": evidence,
@@ -789,6 +845,7 @@ class VisionJobs:
         expected = set(fixed) | {"window", "subject_annotation_id", "scenes", "keyframes",
                                  "extractor_status", "module_status", "job_identity",
                                  "model_runs", "evidence", "boundary_frames", "boundary_sampling"}
+        expected = expected | {"content_sampling"}
         if (not isinstance(value, dict) or not expected <= set(value)
                 or set(value) - expected - {"sampling"}
                 or any(value[key] != item for key, item in fixed.items())
@@ -1553,6 +1610,28 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 or (f"仅 {len(pairs)} 对相邻抽样帧，不能证明整段镜头的运动方式" if len(pairs) < 2
                     else "相邻抽样帧分类不一致，需人工复核"),
             })
+        for change in keyframe.get("content_changes") or []:
+            claims.append({
+                "id": S.make_id("clm", f"{job_id}:{index}:content:{change.get('start_frame')}"),
+                "claim_type": "observable",
+                "statement": (f"镜头内部 #{change.get('start_frame')}–"
+                              f"#{change.get('end_frame')} 帧出现持续画面内容变化"
+                              "（边缘结构与色度同时改变，且新状态在后续抽样帧保持；需人工复核）。"),
+                "subject_ref": None,
+                "time_window": window,
+                "evidence_ids": [],
+                "method": {"id": "scene-change-v1", "version": "1",
+                           "parameters": {"start_frame": change.get("start_frame"),
+                                          "end_frame": change.get("end_frame"),
+                                          "metrics": change.get("metrics"),
+                                          "sustained": change.get("sustained")}},
+                "model_run_id": None,
+                "score": float(change.get("confidence") or 0.0),
+                "score_kind": "rule_score",
+                "measurement": None,
+                "uncertainty_reason": change.get("uncertainty")
+                or "仅按镜头内均匀抽样帧判断，未逐帧验证；短时遮挡或字幕可能被过滤",
+            })
         for event in keyframe.get("boundary_events") or []:
             kind = event.get("kind")
             if kind not in TRANSITION_KINDS:
@@ -1659,6 +1738,8 @@ def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
             if (motion.get("status") == "success"
                     and summary.get("class") in MOTION_LABELS):
                 tags.append("vision-motion-" + summary["class"])
+            if keyframe.get("content_changes"):
+                tags.append("vision-content-change")
             for event in keyframe.get("boundary_events") or []:
                 if event.get("kind") in TRANSITION_LABELS:
                     tags.append("vision-transition-" + event["kind"])
