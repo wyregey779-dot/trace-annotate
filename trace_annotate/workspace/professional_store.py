@@ -6,7 +6,9 @@ the command journal or interpret imported filesystem paths.
 """
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import json
 
 from . import schema as S
@@ -29,6 +31,18 @@ def prepare_task(store, current, operation, payload, *, command_id):
         if set(payload) != {'document'}:
             raise SchemaInvalid('SCHEMA_INVALID', 'Professional import requires one document')
         imported = import_payload(payload['document'], media, task['id'])
+        # Portable evidence samples travel inside the document as bounded base64.
+        # Register their bytes before the task command validates annotation
+        # evidence ids, otherwise a valid document could not be reconstructed.
+        for artifact in payload['document']['artifacts']:
+            if 'data_base64' not in artifact:
+                continue
+            data = base64.b64decode(artifact['data_base64'], validate=True)
+            descriptor = store._put_artifact(data)
+            expected = {'id': artifact['id'], 'relative_path': artifact['relative_path'],
+                        'sha256': artifact['sha256'], 'size_bytes': artifact['size_bytes']}
+            if descriptor != expected:
+                raise WorkspaceError('RECOVERY_REQUIRED', 'Portable evidence bytes differ from their descriptor')
         task['annotations'] = imported['annotations']
         task['extensions'] = imported['extensions']
         task['legacy_document_metadata'] = imported['legacy_document_metadata']
@@ -188,6 +202,27 @@ def export_professional(store, task_id):
                 raise WorkspaceError('RECOVERY_REQUIRED', 'Professional source archive is missing or inconsistent')
             if ident not in known:
                 artifacts.append(actual)
+                known.add(ident)
+        for annotation in task['annotations']:
+            for ident in annotation.get('evidence_ids', []):
+                if ident in known:
+                    continue
+                row = store.conn.execute('SELECT id,rel_path,sha256,size_bytes FROM artifacts WHERE id=?', (ident,)).fetchone()
+                if row is None:
+                    raise WorkspaceError('RECOVERY_REQUIRED', 'Annotation evidence artifact is missing')
+                path = store.root / row[1]
+                try:
+                    data = path.read_bytes()
+                except OSError as exc:
+                    raise WorkspaceError('RECOVERY_REQUIRED', 'Annotation evidence bytes are unavailable') from exc
+                if (len(data) != row[3] or hashlib.sha256(data).hexdigest() != row[2]):
+                    raise WorkspaceError('RECOVERY_REQUIRED', 'Annotation evidence bytes are corrupt')
+                if len(data) > 512 * 1024:
+                    raise SchemaInvalid('PROFESSIONAL_LIMIT_EXCEEDED',
+                                        'One evidence sample exceeds the portable export budget')
+                artifacts.append({'id': row[0], 'relative_path': row[1], 'sha256': row[2],
+                                  'size_bytes': str(row[3]),
+                                  'data_base64': base64.b64encode(data).decode('ascii')})
                 known.add(ident)
         document = build_document(task, media, template, history=history, artifacts=artifacts)
         data = S.canonical_json(document)

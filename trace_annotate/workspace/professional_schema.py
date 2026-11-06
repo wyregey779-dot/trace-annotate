@@ -6,6 +6,8 @@ Frame-map row verification belongs to the receiving store's admission path.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 from typing import Any
@@ -22,6 +24,7 @@ MAX_NODES = 400_000
 MAX_ANNOTATIONS = 20_000
 MAX_REPORTS = 256
 MAX_TEXT_CHARS = 1_000_000
+MAX_EVIDENCE_BASE64_CHARS = 768_000
 
 
 def _invalid(message, code="INVALID_PROFESSIONAL_DOCUMENT"):
@@ -306,6 +309,11 @@ def validate_annotation(annotation, media, template, *, artifact_ids=None, actor
         actor_type = (actor_types or {}).get(annotation["provenance"]["actor_id"])
         if actor_type is None:
             actor_type = "human" if origin == "manual" else "tool"
+        # A historical, unverified actor is never treated as a human author: it
+        # cannot carry interpretations. The semantic contract has no
+        # "historical_unverified" type, so map it to a non-human tool actor.
+        if actor_type == "historical_unverified":
+            actor_type = "tool"
         SS.validate_semantic(annotation["attributes"]["semantic"], actor_type=actor_type,
                              model_run_ids=set(model_run_ids or ()),
                              evidence_ids=annotation["evidence_ids"])
@@ -379,10 +387,21 @@ def _validate_document(document):
         actor_types[actor["id"]]=actor["type"]
     artifact_ids=set()
     for artifact in _list(document["artifacts"],50_000):
-        _object(artifact,{"id","relative_path","sha256","size_bytes"})
+        _object(artifact,{"id","relative_path","sha256","size_bytes"},{"data_base64"})
         S.require_id(artifact["id"]);S.require_hash(artifact["sha256"]);_decimal(artifact["size_bytes"])
         if artifact["relative_path"]!="objects/"+artifact["sha256"] or artifact["id"] in artifact_ids:
             _invalid("Invalid artifact path or duplicate identifier")
+        if "data_base64" in artifact:
+            text=artifact["data_base64"]
+            if not isinstance(text,str) or not text or len(text)>MAX_EVIDENCE_BASE64_CHARS:
+                _invalid("Embedded evidence payload is invalid or too large","UNSUPPORTED_PROFESSIONAL_EVIDENCE")
+            try:
+                data=base64.b64decode(text,validate=True)
+            except (ValueError,TypeError):
+                _invalid("Embedded evidence payload is not valid base64","UNSUPPORTED_PROFESSIONAL_EVIDENCE")
+            if (len(data)!=_decimal(artifact["size_bytes"])
+                    or hashlib.sha256(data).hexdigest()!=artifact["sha256"]):
+                _invalid("Embedded evidence payload differs from its descriptor","UNSUPPORTED_PROFESSIONAL_EVIDENCE")
         artifact_ids.add(artifact["id"])
     if media["frame_map_artifact"] not in artifact_ids:
         _invalid("Frame-map manifest is required")

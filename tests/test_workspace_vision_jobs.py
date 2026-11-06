@@ -14,6 +14,7 @@ import threading
 
 import pytest
 
+from trace_annotate.workspace import professional_store as PStore
 from trace_annotate.workspace import schema as S
 from trace_annotate.workspace import vision_jobs as V
 from trace_annotate.workspace.errors import Conflict, SchemaInvalid, WorkspaceError
@@ -175,6 +176,17 @@ def test_apply_imports_candidates_as_model_candidate_and_refuses_reviewed(store)
     after = task(store)
     assert len(after["annotations"]) == len(annotations)
     assert all(a["review_status"] == "unreviewed" for a in after["annotations"])
+    for annotation in after["annotations"]:
+        semantic = annotation["attributes"]["semantic"]
+        assert semantic["version"] == "visual-semantics-v1"
+        assert semantic["claims"]
+        assert all(claim["claim_type"] == "observable" for claim in semantic["claims"])
+        assert annotation["evidence_ids"]
+        for claim in semantic["claims"]:
+            if claim["method"]["id"] == "keyframe-sampling-local":
+                assert claim["evidence_ids"]
+            elif claim["method"]["id"] == "shot-boundary-local":
+                assert claim["evidence_ids"] == []
     # Review attempt on a model candidate is refused by the store path.
     for annotation in after["annotations"]:
         fail_code("SCHEMA_INVALID", lambda a=annotation: store.apply_task_command(
@@ -182,6 +194,40 @@ def test_apply_imports_candidates_as_model_candidate_and_refuses_reviewed(store)
             expected_sha256=store.task_digest(after), operation="review_annotation",
             payload={"annotation_id": a["id"], "reviewed": True}, request_body=b'{}'))
     jobs.close()
+
+
+def test_candidate_semantics_survive_professional_export_import(store, clip, tmp_path):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    current = task(store)
+    queued = submit(jobs, command_id="vision-roundtrip")["jobs"][0]
+    jobs.run_pending()
+    body = json.dumps({"candidates": V._candidate_annotations(jobs.result(queued["id"])),
+                       "source_job_id": queued["id"]}).encode("utf-8")
+    jobs.apply(queued["id"], command_id="apply-roundtrip", expected_revision=current["revision"],
+               expected_sha256=store.task_digest(current), request_body=body)
+    source_task = task(store)
+    document = json.loads(PStore.export_professional(store, source_task["id"])["data"])
+    destination = WorkspaceStore(tmp_path / "roundtrip-workspace")
+    destination.create()
+    try:
+        destination.import_source(clip)
+        target = destination.get_task(destination.list_tasks()[0]["task_id"])
+        imported = PStore.apply_import(
+            destination, target["id"], command_id="import-roundtrip",
+            expected_revision=target["revision"], expected_sha256=destination.task_digest(target),
+            document=document, request_body=b"{}")
+        after = destination.get_task(target["id"])
+        assert imported["imported_count"] == len(source_task["annotations"])
+        assert len(after["annotations"]) == len(source_task["annotations"])
+        for original, restored in zip(source_task["annotations"], after["annotations"]):
+            assert restored["legacy_id"] == original["id"]
+            assert restored["attributes"] == original["attributes"]
+            assert restored["tags"] == original["tags"]
+            assert restored["review_status"] == "unreviewed"
+            assert restored["provenance"]["origin"] == "imported"
+    finally:
+        destination.close()
+        jobs.close()
 
 
 def test_human_upgrade_rewrites_origin_then_reviews(store):

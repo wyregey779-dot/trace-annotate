@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
@@ -29,6 +31,7 @@ from ..temporal.media import stream_sha256
 from . import professional_schema as PS
 from . import schema as S
 from . import vision_sampling as VS
+from .semantic_schema import SEMANTIC_VERSION
 from .errors import Conflict, SchemaInvalid, WorkspaceError
 from .http_media import resolve_media_object
 from .queue import DurableQueue, MAX_RESULT_BYTES
@@ -697,13 +700,16 @@ class VisionJobs:
         Every annotation carries provenance origin=model_candidate and an
         unreviewed review status; a completed local review is refused by the
         professional schema. Upgrading to human-reviewed ground truth is a
-        separate explicit command, never an automatic side effect.
+        separate explicit command, never an automatic side effect. The sampled
+        keyframe PNGs are registered as immutable artifacts and pinned to the
+        candidate annotation as evidence so the claim trail survives export/import.
         """
         from .professional_store import apply_vision_candidates
 
         with self.store.transaction():
             result = self.result(job_id)
             annotations = _candidate_annotations(result)
+            _attach_candidate_evidence(self.store, result, annotations)
             arguments = dict(store=self.store, command_id=command_id, task_id=result["task_id"],
                 expected_revision=expected_revision, expected_sha256=expected_sha256,
                 candidates=annotations, source_job_id=result["job_id"], request_body=request_body)
@@ -742,6 +748,131 @@ def _aggregate_status(keyframes: List[Dict[str, Any]], extractor: str) -> str:
     if any(status == "failed" for status in statuses):
         return "failed"
     return "partial"
+
+
+def _evidence_preview(source: Path) -> Path:
+    """Create a small JPEG preview of one sampled keyframe.
+
+    Full keyframe samples are hundreds of kilobytes each. A compact preview keeps
+    the professional exchange document inside its bounded HTTP envelope and lets
+    dozens of candidates travel together. It is a lossy, resampled preview of the
+    exact sampled frame, never a caption or a synthesised image; the full sample
+    remains in the job workspace.
+    """
+    from PIL import Image
+
+    handle, name = tempfile.mkstemp(prefix="vision-sample-", suffix=".jpg")
+    os.close(handle)
+    try:
+        with Image.open(source) as image:
+            image = image.convert("RGB")
+            image.thumbnail((240, 240), Image.LANCZOS)
+            image.save(name, "JPEG", quality=78, optimize=True)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+    return Path(name)
+
+
+def _attach_candidate_evidence(store, candidate: Dict[str, Any],
+                               annotations: List[Dict[str, Any]]) -> None:
+    """Create and pin compact previews of sampled keyframes as evidence.
+
+    The vision job workspace is temporary. A candidate that is applied to the
+    task must own durable evidence, otherwise cleanup or export would leave a
+    claim with an empty evidence trail. Each full sample is verified byte-for-byte
+    against the job candidate, then a 240px JPEG preview is registered as an
+    immutable artifact so the portable document stays inside its byte budget.
+    """
+    samples = {item["sha256"]: item for item in candidate.get("evidence") or []}
+    frames = candidate.get("keyframes") or []
+    for index, annotation in enumerate(annotations):
+        scene_frames = [frame for frame in frames if frame.get("scene_index") == index]
+        evidence_ids: List[str] = []
+        frame_artifacts: Dict[str, str] = {}
+        # One representative sampled keyframe per candidate keeps the portable
+        # professional document inside its byte budget while still grounding the
+        # keyframe claim in a real immutable PNG.
+        for frame in scene_frames[:1]:
+            digest = frame.get("evidence_sha256")
+            descriptor = samples.get(digest)
+            if descriptor is None:
+                raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
+                                     "Candidate keyframe has no registered sample")
+            source = store.root / descriptor["relative_path"]
+            _safe(source)
+            if (not source.is_file() or source.stat().st_size != int(descriptor["size_bytes"])
+                    or stream_sha256(source) != digest):
+                raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
+                                     "Candidate sample is missing or changed")
+            preview = _evidence_preview(source)
+            try:
+                artifact = store._put_file(preview)
+            finally:
+                try:
+                    preview.unlink()
+                except OSError:
+                    pass
+            store.bind_artifact_reference(artifact, owner_kind="evidence",
+                owner_id=annotation["id"], role="vision-sample-preview", owner_revision="0")
+            evidence_ids.append(artifact["id"])
+            frame_artifacts[str(frame["frame_index"])] = artifact["id"]
+        annotation["evidence_ids"] = evidence_ids
+        for claim in annotation["attributes"]["semantic"]["claims"]:
+            if claim["method"]["id"] == "keyframe-sampling-local":
+                frame_index = str(claim["method"]["parameters"]["frame_index"])
+                if frame_index in frame_artifacts:
+                    claim["evidence_ids"] = [frame_artifacts[frame_index]]
+
+
+def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, Any],
+                      start: Dict[str, str], end: Dict[str, str],
+                      keyframe: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build versioned, observation-only claims for one candidate.
+
+    The claims describe what the local detector actually returned: a time
+    interval and (when available) the sampled frame identity. They are
+    deliberately not interpretations, and they stay inside a model_candidate
+    annotation that a human must still review.
+    """
+    job_id = candidate["job_id"]
+    window = {"start": {"seconds": start}, "end": {"seconds": end}}
+    claims = [{
+        "id": S.make_id("clm", f"{job_id}:{index}:scene-boundary"),
+        "claim_type": "observable",
+        "statement": (f"本地镜头边界算法测得区间 {float(scene['start']):.6f}–"
+                      f"{float(scene['end']):.6f} 秒；边界仍待人工复核。"),
+        "subject_ref": None,
+        "time_window": window,
+        "evidence_ids": [],
+        "method": {"id": "shot-boundary-local", "version": str(candidate.get("processor_version") or "1"),
+                   "parameters": {"detector": "local-scene-cut", "scene_index": index}},
+        "model_run_id": None,
+        "score": None,
+        "score_kind": "none",
+        "uncertainty_reason": "算法候选；未进行人工边界复核",
+    }]
+    if keyframe is not None:
+        claims.append({
+            "id": S.make_id("clm", f"{job_id}:{index}:keyframe"),
+            "claim_type": "observable",
+            "statement": (f"抽样关键帧 #{keyframe['frame_index']}（源 PTS "
+                          f"{keyframe['source_pts']}）位于该镜头内。"),
+            "subject_ref": None,
+            "time_window": window,
+            "evidence_ids": [],
+            "method": {"id": "keyframe-sampling-local", "version": "1",
+                       "parameters": {"frame_index": keyframe["frame_index"],
+                                      "roles": list(keyframe.get("roles") or [])}},
+            "model_run_id": None,
+            "score": None,
+            "score_kind": "none",
+            "uncertainty_reason": "抽样帧只代表该时刻，不覆盖镜头内全部画面",
+        })
+    return {"version": SEMANTIC_VERSION, "claims": claims}
 
 
 def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -787,7 +918,7 @@ def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
             "text": text_draft,
             "tags": tags,
             "track": CANDIDATE_TRACK,
-            "attributes": {},
+            "attributes": {"semantic": _candidate_claims(candidate, index, scene, start, end, keyframe)},
             "evidence_ids": [],
             "provenance": {"origin": "model_candidate", "actor_id": "vision-worker",
                            "job_id": candidate["job_id"]},
