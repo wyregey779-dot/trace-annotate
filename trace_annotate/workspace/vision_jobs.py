@@ -66,6 +66,27 @@ def _finite(value: Any, name: str, *, positive: bool = False) -> float:
     return result
 
 
+def _job_identity() -> Dict[str, Any]:
+    thresholds = MetricThresholds()
+    config = {
+        "scene_threshold": thresholds.scene_threshold,
+        "scene_min_duration_s": thresholds.scene_min_duration_s,
+        "scene_cap_seconds": thresholds.scene_cap_seconds,
+        "face_min_confidence": thresholds.face_min_confidence,
+        "face_min_height_ratio": thresholds.face_min_height_ratio,
+        "ocr_min_height_ratio": thresholds.ocr_min_height_ratio,
+        "ocr_min_confidence": thresholds.ocr_min_confidence,
+        "clip_binary_confidence": thresholds.clip_binary_confidence,
+        "clip_multiclass_confidence": thresholds.clip_multiclass_confidence,
+        "clip_entity_mismatch_cutoff": thresholds.clip_entity_mismatch_cutoff,
+        "sampling": {"max_frames": MAX_KEYFRAMES, "boundary_radius": BOUNDARY_RADIUS},
+    }
+    return {"pipeline": "vision-assist-v1", "processor_version": VERSION,
+            "config_sha256": S.sha256_text(config), "config": config,
+            "model_identity": "declared_at_run_not_at_config_query",
+            "capability_identity": "ffmpeg+local_extractors; weights_sha256_recorded_per_run"}
+
+
 def _parameters(window: Optional[Dict[str, Any]] = None,
                 subject_annotation_id: Optional[str] = None) -> Dict[str, Any]:
     if subject_annotation_id is not None:
@@ -78,14 +99,15 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
                 or not 0 <= S.rational_value(window["start"]) < S.rational_value(window["end"])):
             raise SchemaInvalid("SCHEMA_INVALID", "window must be a reduced rational half-open interval")
     return json.loads(S.canonical_json({"window": window, "subject_annotation_id": subject_annotation_id,
-                                        "time_domain": DOMAIN}))
+                                        "time_domain": DOMAIN, "job_identity": _job_identity()}))
 
 
 def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     if job["operation"] != OPERATION or job["processor_version"] != VERSION:
         raise WorkspaceError("UNSUPPORTED_PROCESSOR", "No installed vision processor matches this frozen job")
     parameters = job["parameters"]
-    if (not isinstance(parameters, dict) or set(parameters) != {"window", "subject_annotation_id", "time_domain"}
+    if (not isinstance(parameters, dict)
+            or set(parameters) != {"window", "subject_annotation_id", "time_domain", "job_identity"}
             or parameters["time_domain"] != DOMAIN
             or parameters != _parameters(parameters["window"], parameters["subject_annotation_id"])):
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
@@ -575,6 +597,20 @@ class VisionJobs:
                     "clip": _aggregate_status(keyframes, "clip"),
                     "vlm": _aggregate_status(keyframes, "vlm"),
                 }
+                motion_status = "success" if any(
+                    frame.get("motion", {}).get("status") == "success" for frame in keyframes) else "not_run"
+                module_status = dict(extractor_status)
+                module_status.update({
+                    "boundary": boundary_sampling.get("status", "not_run"),
+                    "framing": extractor_status["face"],
+                    "motion": motion_status,
+                    "transition": ("success" if any(frame.get("boundary_events") for frame in keyframes)
+                                   else boundary_sampling.get("status", "not_run")),
+                    "actions": "not_run", "expressive": "not_run", "acoustics": "not_run",
+                })
+                module_status["actions_reason"] = "no_local_action_provider_in_this_build"
+                module_status["expressive_reason"] = "no_landmark_provider_in_this_build"
+                module_status["acoustics_reason"] = "no_local_audio_analysis_provider_in_this_build"
                 if self._extractor_error is not None:
                     extractor_status["extractor_error"] = self._extractor_error
                 evidence = []
@@ -597,7 +633,8 @@ class VisionJobs:
                     "subject_annotation_id": parameters["subject_annotation_id"],
                     "scenes": scenes, "keyframes": keyframes, "sampling": sampling,
                     "boundary_frames": boundary_frames, "boundary_sampling": boundary_sampling,
-                    "extractor_status": extractor_status, "evidence": evidence,
+                    "extractor_status": extractor_status, "module_status": module_status,
+                    "job_identity": parameters["job_identity"], "evidence": evidence,
                     "semantic_listening": "not_performed", "source_unchanged": True,
                     "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
                 self._validate_candidate(candidate, job)
@@ -697,12 +734,13 @@ class VisionJobs:
             "semantic_listening": "not_performed", "source_unchanged": True,
             "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
         expected = set(fixed) | {"window", "subject_annotation_id", "scenes", "keyframes",
-                                 "extractor_status", "evidence", "boundary_frames",
-                                 "boundary_sampling"}
+                                 "extractor_status", "module_status", "job_identity",
+                                 "evidence", "boundary_frames", "boundary_sampling"}
         if (not isinstance(value, dict) or not expected <= set(value)
                 or set(value) - expected - {"sampling"}
                 or any(value[key] != item for key, item in fixed.items())
                 or value["window"] != parameters["window"]
+                or value["job_identity"] != parameters["job_identity"]
                 or value["subject_annotation_id"] != parameters["subject_annotation_id"]):
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate identity is inconsistent")
         sampling = value.get("sampling")
@@ -770,6 +808,7 @@ class VisionJobs:
             return {"job_id": job_id, "task_id": job["task_id"], "state": job["state"],
                     "attempt": job.get("attempt"), "processor_version": job["processor_version"],
                     "input_revision": job["input_revision"], "input_sha256": job["input_sha256"],
+                    "job_identity": job["parameters"].get("job_identity"),
                     "cancel_requested": job["state"] == "cancel_requested",
                     "error_code": job.get("error_code") or attempt.get("error_code"),
                     "has_candidate": job.get("commit") is not None}

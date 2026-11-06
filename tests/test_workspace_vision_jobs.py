@@ -91,6 +91,10 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     initial = task(store)
     queued = submit(jobs)["jobs"][0]
     assert queued["parameters"]["time_domain"] == "playback_seconds"
+    identity = queued["parameters"]["job_identity"]
+    assert identity["pipeline"] == "vision-assist-v1"
+    assert len(identity["config_sha256"]) == 64
+    assert identity["config"]["sampling"]["max_frames"] == V.MAX_KEYFRAMES
     fail_code("VISION_NOT_READY", lambda: jobs.result(queued["id"]))
     done = jobs.run_pending()[0]
     assert done["state"] == "succeeded"
@@ -99,6 +103,9 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert result["scope"] == "registered_playback_only; original_source_not_measured; candidate_not_applied"
     assert result["semantic_listening"] == "not_performed"
     assert result["extractor_status"]["scene"] in {"success", "failed"}
+    assert result["module_status"]["actions"] == "not_run"
+    assert result["module_status"]["actions_reason"] == "no_local_action_provider_in_this_build"
+    assert result["module_status"]["boundary"] in {"success", "failed", "not_run"}
     assert len(result["scenes"]) >= 1
     assert all({"start", "end", "duration"} <= set(scene) for scene in result["scenes"])
     assert result["evidence"] and all(item["relative_path"].startswith("tmp/vision/jobs/") for item in result["evidence"])
@@ -115,6 +122,7 @@ def test_job_status_is_read_only_and_reports_progress(store):
     assert status["state"] == "queued"
     assert status["task_id"] == before["id"]
     assert status["attempt"] == 0
+    assert status["job_identity"]["pipeline"] == "vision-assist-v1"
     assert status["has_candidate"] is False
     done = jobs.run_pending()[0]
     status = jobs.job_status(queued["id"])
@@ -124,6 +132,19 @@ def test_job_status_is_read_only_and_reports_progress(store):
     assert status["error_code"] is None
     assert task(store) == before
     fail_code("JOB_NOT_FOUND", lambda: jobs.job_status("job-does-not-exist"))
+    jobs.close()
+
+
+def test_configuration_change_creates_a_new_frozen_job_identity(store, monkeypatch):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
+    first = submit(jobs, command_id="identity-one")["jobs"][0]
+    old_sha = first["parameters"]["job_identity"]["config_sha256"]
+    monkeypatch.setattr(V, "BOUNDARY_RADIUS", 9)
+    second = submit(jobs, command_id="identity-two")["jobs"][0]
+    new_sha = second["parameters"]["job_identity"]["config_sha256"]
+    assert new_sha != old_sha
+    assert first["idempotency_key"] != second["idempotency_key"]
+    assert second["parameters"]["job_identity"]["config"]["sampling"]["boundary_radius"] == 9
     jobs.close()
 
 
