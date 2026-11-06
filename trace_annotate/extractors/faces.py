@@ -196,7 +196,7 @@ class FaceExtractor(BaseExtractor):
             detected_list.append({
                 "box": [float(box_x), float(box_y), float(box_w), float(box_h)],
                 "confidence": round(conf, 3),
-                "is_recognizable": is_recog
+                "is_recognizable": bool(is_recog)
             })
 
         count = len(detected_list)
