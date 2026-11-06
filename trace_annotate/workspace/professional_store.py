@@ -55,10 +55,38 @@ def prepare_task(store, current, operation, payload, *, command_id):
     elif operation == 'import_vision_candidates':
         candidates = payload.get('candidates')
         source_job_id = payload.get('source_job_id')
-        if (set(payload) != {'candidates', 'source_job_id'} or not isinstance(candidates, list)
-                or not 1 <= len(candidates) <= 4096 or not isinstance(source_job_id, str)):
+        model_runs = payload.get('model_runs')
+        if (set(payload) != {'candidates', 'source_job_id', 'model_runs'}
+                or not isinstance(candidates, list)
+                or not 1 <= len(candidates) <= 4096 or not isinstance(source_job_id, str)
+                or not isinstance(model_runs, list)):
             raise SchemaInvalid('SCHEMA_INVALID', 'Vision import requires a bounded candidate list and source job')
         S.require_id(source_job_id)
+        from . import semantic_schema as SS
+        if len(model_runs) > SS.MAX_MODEL_RUNS:
+            raise SchemaInvalid('SCHEMA_INVALID', 'Vision import declares too many model runs')
+        checked_runs = []
+        run_ids = set()
+        for run in model_runs:
+            checked = SS.validate_model_run(run)
+            if checked['id'] in run_ids:
+                raise SchemaInvalid('SCHEMA_INVALID', 'Vision import declares a duplicate model run')
+            run_ids.add(checked['id'])
+            checked_runs.append(checked)
+        professional = task.setdefault('extensions', {}).setdefault('professional', {})
+        if not isinstance(professional, dict):
+            raise WorkspaceError('RECOVERY_REQUIRED', 'Stored professional extension is invalid')
+        declared = professional.setdefault('model_runs', [])
+        if not isinstance(declared, list):
+            raise WorkspaceError('RECOVERY_REQUIRED', 'Stored model runs are invalid')
+        for run in checked_runs:
+            existing = next((item for item in declared if item.get('id') == run['id']), None)
+            if existing is not None and S.canonical_json(existing) != S.canonical_json(run):
+                raise SchemaInvalid('SCHEMA_INVALID', 'Model run identities are immutable')
+            if existing is None:
+                declared.append(run)
+        declared_ids = {item.get('id') for item in declared
+                        if isinstance(item, dict) and isinstance(item.get('id'), str)}
         seen = set()
         for candidate in candidates:
             if not isinstance(candidate, dict):
@@ -72,7 +100,8 @@ def prepare_task(store, current, operation, payload, *, command_id):
                 raise SchemaInvalid('SCHEMA_INVALID',
                                     'Vision candidate must carry model_candidate provenance from its source job')
             declared = {row[0] for row in store.conn.execute("SELECT id FROM artifacts")}
-            PS.validate_annotation(candidate, media, template, artifact_ids=declared)
+            PS.validate_annotation(candidate, media, template, artifact_ids=declared,
+                                   model_run_ids=declared_ids)
             task['annotations'].append(candidate)
     elif operation == 'set_analysis_reports':
         reports = payload.get('reports')
@@ -137,11 +166,12 @@ def apply_analysis(store, task_id, *, command_id, expected_revision, expected_sh
 
 
 def apply_vision_candidates(store, task_id, *, command_id, expected_revision, expected_sha256,
-                            candidates, source_job_id, request_body):
+                            candidates, source_job_id, model_runs=None, request_body=None):
     return store.apply_task_command(
         command_id=command_id, task_id=task_id, expected_revision=expected_revision,
         expected_sha256=expected_sha256, operation='import_vision_candidates',
-        payload={'candidates': candidates, 'source_job_id': source_job_id},
+        payload={'candidates': candidates, 'source_job_id': source_job_id,
+                 'model_runs': list(model_runs or [])},
         request_body=request_body)['response']
 
 

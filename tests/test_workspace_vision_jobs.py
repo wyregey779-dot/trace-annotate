@@ -16,6 +16,7 @@ import pytest
 
 from trace_annotate.workspace import professional_store as PStore
 from trace_annotate.workspace import schema as S
+from trace_annotate.workspace import semantic_schema as SS
 from trace_annotate.workspace import vision_jobs as V
 from trace_annotate.workspace.errors import Conflict, SchemaInvalid, WorkspaceError
 from trace_annotate.workspace.queue import DurableQueue
@@ -106,6 +107,14 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert result["module_status"]["actions"] == "not_run"
     assert result["module_status"]["actions_reason"] == "no_local_action_provider_in_this_build"
     assert result["module_status"]["boundary"] in {"success", "failed", "not_run"}
+    runs = result["model_runs"]
+    assert len(runs) == 7
+    assert {run["id"] for run in runs} == {V._module_run_id(queued["id"], name) for name in
+                                           ("face", "ocr", "clip", "vlm", "scene", "motion", "boundary")}
+    for run in runs:
+        assert SS.validate_model_run(run) == run
+    assert any(run["status"] == "not_run" and run["failure_reason"] for run in runs)
+    assert all(run["status"] == "success" or run["failure_reason"] for run in runs)
     assert len(result["scenes"]) >= 1
     assert all({"start", "end", "duration"} <= set(scene) for scene in result["scenes"])
     assert result["evidence"] and all(item["relative_path"].startswith("tmp/vision/jobs/") for item in result["evidence"])

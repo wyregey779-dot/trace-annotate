@@ -25,6 +25,20 @@ class OCRExtractor(BaseExtractor):
     def name(self) -> str:
         return "ocr"
 
+    @property
+    def code_identity(self) -> Dict[str, Any]:
+        """OCR runtime identity; bundled weights have no local file path."""
+        from importlib.metadata import version
+        try:
+            runtime_version = version("rapidocr_onnxruntime")
+        except Exception:  # noqa: BLE001 - metadata absence is reported honestly
+            runtime_version = "unavailable"
+        return {"provider": "RapidOCR",
+                "model_name": "RapidOCR default det+cls+rec",
+                "model_version": runtime_version,
+                "weights_path": None,
+                "license": "Apache-2.0"}
+
     def _init_engine(self) -> None:
         try:
             from rapidocr_onnxruntime import RapidOCR

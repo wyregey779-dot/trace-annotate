@@ -33,6 +33,7 @@ from ..extractors.vlm import VLMExtractor
 from ..temporal.media import stream_sha256
 from . import professional_schema as PS
 from . import schema as S
+from . import semantic_schema as SS
 from . import vision_sampling as VS
 from .semantic_schema import SEMANTIC_VERSION
 from .errors import Conflict, SchemaInvalid, WorkspaceError
@@ -552,39 +553,47 @@ class VisionJobs:
                             "fingerprint": VS.samples_fingerprint(plan_b),
                         }
                         boundary_samples: Dict[int, List[Dict[str, Any]]] = {}
+                        detected: Dict[tuple, tuple[int, Dict[str, Any]]] = {}
                         for item in decoded_b["decoded"]:
                             if cancelled():
                                 raise WorkspaceError("CANCELLED",
                                                      "Vision cancelled while analysing boundaries")
                             frame_index = int(item["frame_index"])
-                            scene_index = next((scene for target, scene in targets
-                                               if abs(frame_index - target) <= BOUNDARY_RADIUS), None)
-                            if scene_index is None:
+                            scene_indices = [scene for target, scene in targets
+                                             if abs(frame_index - target) <= BOUNDARY_RADIUS]
+                            if not scene_indices:
                                 continue
                             seconds = float(S.rational_value(item["seconds"]))
                             boundary_frames.append({
-                                "scene_index": scene_index,
+                                "scene_index": scene_indices[0],
+                                "scene_indices": scene_indices,
                                 "frame_index": item["frame_index"],
                                 "seconds": seconds,
                                 "evidence_sha256": item["sha256"],
                             })
-                            boundary_samples.setdefault(scene_index, []).append({
-                                "frame_index": item["frame_index"],
-                                "seconds": seconds,
-                                "source_pts": item["source_pts"],
-                                "proxy_pts": item["proxy_pts"],
-                                "frame": _load_frame(Path(item["path"])),
-                            })
+                            sample = {"frame_index": item["frame_index"],
+                                      "seconds": seconds,
+                                      "source_pts": item["source_pts"],
+                                      "proxy_pts": item["proxy_pts"],
+                                      "frame": _load_frame(Path(item["path"]))}
+                            for scene_index in scene_indices:
+                                boundary_samples.setdefault(scene_index, []).append(dict(sample))
                         for scene_index, samples in boundary_samples.items():
                             if len(samples) < 2:
                                 continue
                             result = detect_shot_boundaries(samples)
-                            if not result["events"]:
-                                continue
+                            for event in result["events"]:
+                                key = (event.get("frame_index"), event.get("class"),
+                                       tuple(event.get("time_window") or ()))
+                                detected.setdefault(key, (scene_index, event))
+                        for scene_index, event in detected.values():
                             first = next((frame for frame in keyframes
                                           if frame["scene_index"] == scene_index), None)
                             if first is not None:
-                                first["boundary_events"] = result["events"]
+                                first.setdefault("boundary_events", []).append(event)
+                        boundary_sampling["scenes_with_events"] = sorted({scene for scene, _ in detected.values()})
+                        boundary_sampling["event_count"] = len(detected)
+                        boundary_sampling["overlap_mapping"] = "each decoded boundary frame is reused by every scene window that covers it"
                     except Exception as exc:
                         boundary_sampling = {"status": "failed",
                                              "error": type(exc).__name__,
@@ -613,6 +622,10 @@ class VisionJobs:
                 module_status["acoustics_reason"] = "no_local_audio_analysis_provider_in_this_build"
                 if self._extractor_error is not None:
                     extractor_status["extractor_error"] = self._extractor_error
+                model_runs = _build_model_runs(
+                    job, extractors, keyframes, scene_result,
+                    boundary_sampling, boundary_frames, module_status,
+                    digest, window)
                 evidence = []
                 for path in sorted(work.rglob("*")):
                     if cancelled():
@@ -634,6 +647,7 @@ class VisionJobs:
                     "scenes": scenes, "keyframes": keyframes, "sampling": sampling,
                     "boundary_frames": boundary_frames, "boundary_sampling": boundary_sampling,
                     "extractor_status": extractor_status, "module_status": module_status,
+                    "model_runs": model_runs,
                     "job_identity": parameters["job_identity"], "evidence": evidence,
                     "semantic_listening": "not_performed", "source_unchanged": True,
                     "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
@@ -735,7 +749,7 @@ class VisionJobs:
             "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
         expected = set(fixed) | {"window", "subject_annotation_id", "scenes", "keyframes",
                                  "extractor_status", "module_status", "job_identity",
-                                 "evidence", "boundary_frames", "boundary_sampling"}
+                                 "model_runs", "evidence", "boundary_frames", "boundary_sampling"}
         if (not isinstance(value, dict) or not expected <= set(value)
                 or set(value) - expected - {"sampling"}
                 or any(value[key] != item for key, item in fixed.items())
@@ -763,18 +777,33 @@ class VisionJobs:
                 or len(value["boundary_frames"]) > MAX_KEYFRAMES * 4):
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary frame list is inconsistent")
         for frame in value["boundary_frames"]:
+            base = {"scene_index", "frame_index", "seconds", "evidence_sha256"}
             if (not isinstance(frame, dict)
-                    or set(frame) != {"scene_index", "frame_index", "seconds", "evidence_sha256"}
+                    or set(frame) not in (base, base | {"scene_indices"})
                     or type(frame["scene_index"]) is not int
                     or not isinstance(frame["frame_index"], str)
                     or not frame["frame_index"].isdigit()
                     or not isinstance(frame["seconds"], (int, float))
                     or not math.isfinite(frame["seconds"])
                     or not isinstance(frame["evidence_sha256"], str)
-                    or S.HASH_RE.fullmatch(frame["evidence_sha256"]) is None):
+                    or S.HASH_RE.fullmatch(frame["evidence_sha256"]) is None
+                    or ("scene_indices" in frame and
+                        (not isinstance(frame["scene_indices"], list)
+                         or any(type(item) is not int or item < 0 or item >= len(value["scenes"])
+                                for item in frame["scene_indices"])
+                         or not frame["scene_indices"]))):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary frame descriptor is invalid")
         if value["boundary_sampling"] is not None and not isinstance(value["boundary_sampling"], dict):
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary sampling descriptor is inconsistent")
+        model_runs = value["model_runs"]
+        if not isinstance(model_runs, list) or len(model_runs) > SS.MAX_MODEL_RUNS:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision model-run list is inconsistent")
+        run_ids = set()
+        for run in model_runs:
+            checked = SS.validate_model_run(run)
+            if checked["id"] in run_ids:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision model-run identities are duplicated")
+            run_ids.add(checked["id"])
         prefix = f"tmp/vision/jobs/{job['id']}/{job['attempt']}-{job['lease_generation']}/"
         paths = set()
         for evidence in value["evidence"]:
@@ -881,12 +910,14 @@ class VisionJobs:
             _attach_candidate_evidence(self.store, result, annotations)
             arguments = dict(store=self.store, command_id=command_id, task_id=result["task_id"],
                 expected_revision=expected_revision, expected_sha256=expected_sha256,
-                candidates=annotations, source_job_id=result["job_id"], request_body=request_body)
+                candidates=annotations, source_job_id=result["job_id"],
+                model_runs=result.get("model_runs") or [], request_body=request_body)
             if self.store.conn.execute("SELECT 1 FROM command_receipts WHERE command_id=?", (command_id,)).fetchone():
                 return self.store.apply_task_command(command_id=command_id, task_id=result["task_id"],
                     expected_revision=expected_revision, expected_sha256=expected_sha256,
                     operation="import_vision_candidates", payload={"candidates": annotations,
-                    "source_job_id": result["job_id"]}, request_body=request_body)["response"]
+                    "source_job_id": result["job_id"],
+                    "model_runs": result.get("model_runs") or []}, request_body=request_body)["response"]
             return apply_vision_candidates(**arguments)
 
 
@@ -917,6 +948,289 @@ def _aggregate_status(keyframes: List[Dict[str, Any]], extractor: str) -> str:
     if any(status == "failed" for status in statuses):
         return "failed"
     return "partial"
+
+
+def _jsonable(value: Any) -> Any:
+    """Convert extractor output to strict JSON without silently stringifying.
+
+    Some detectors expose numpy scalars or arrays. They are converted with
+    ``item``/``tolist``; an unknown object is a schema error rather than a
+    model-run digest over a Python repr.
+    """
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        if abs(value) > S.MAX_SAFE_INTEGER:
+            return str(value)
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise SchemaInvalid("SCHEMA_INVALID", "Model output contains a non-finite number")
+        return value
+    if hasattr(value, "tolist"):
+        return _jsonable(value.tolist())
+    if hasattr(value, "item"):
+        return _jsonable(value.item())
+    raise SchemaInvalid("SCHEMA_INVALID", "Model output is not JSON-serializable")
+
+
+def _module_run_id(job_id: str, module: str) -> str:
+    return S.make_id("run", f"{job_id}:{module}")
+
+
+def _package_version(distribution: str) -> str:
+    try:
+        from importlib.metadata import version
+        return version(distribution)
+    except Exception:  # noqa: BLE001 - missing metadata is reported, never guessed
+        return "unavailable"
+
+
+def _weights_digest(path: Optional[str]) -> Optional[str]:
+    if not path or not os.path.isfile(path):
+        return None
+    return stream_sha256(Path(path))
+
+
+def _first_module_reason(keyframes: List[Dict[str, Any]], module: str) -> Optional[str]:
+    for frame in keyframes:
+        result = frame.get(module) or {}
+        if result.get("status") != "success":
+            reason = result.get("reason") or result.get("error")
+            if reason:
+                return str(reason)[:500]
+            if result.get("status") == "not_run":
+                return f"{module}_runtime_unavailable"
+    return None
+
+
+def _run_status(value: str) -> str:
+    if value == "success":
+        return "success"
+    if value == "not_run" or value == "skipped":
+        return "not_run"
+    return "failed"
+
+
+def _model_run_record(job_id: str, module: str, *, provider: str, model_name: str,
+                      model_version: str, weights_sha256: Optional[str], license: str,
+                      preprocessing: Dict[str, Any], parameters: Dict[str, Any],
+                      input_value: Any, output_value: Any, status: str,
+                      failure_reason: Optional[str], code_version: str,
+                      score_kind: str = "none") -> Dict[str, Any]:
+    normalized = _run_status(status)
+    reason = None if normalized == "success" else (str(failure_reason)[:500]
+                                                  if failure_reason else "module did not report success")
+    output_sha = None
+    if output_value is not None and normalized != "not_run":
+        output_sha = S.sha256_text(_jsonable(output_value))
+    if normalized == "success" and output_sha is None:
+        raise SchemaInvalid("SCHEMA_INVALID", "A successful model run requires an output digest")
+    return {
+        "id": _module_run_id(job_id, module),
+        "provider": str(provider)[:120],
+        "model_name": str(model_name)[:200],
+        "model_version": str(model_version)[:120],
+        "weights_sha256": weights_sha256,
+        "license": str(license)[:200],
+        "preprocessing": _jsonable(preprocessing),
+        "parameters": _jsonable(parameters),
+        "input_sha256": S.sha256_text(_jsonable(input_value)),
+        "output_sha256": output_sha,
+        "code_version": str(code_version)[:120],
+        "status": normalized,
+        "failure_reason": reason,
+        "score_kind": score_kind,
+    }
+
+
+def _keyframe_input(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"basis": "decoded_keyframe_samples",
+            "frames": [{"frame_index": frame["frame_index"],
+                        "evidence_sha256": frame["evidence_sha256"]}
+                       for frame in keyframes]}
+
+
+def _frame_output(keyframes: List[Dict[str, Any]], module: str) -> Dict[str, Any]:
+    return {"module": module,
+            "frames": [{"frame_index": frame["frame_index"],
+                        "scene_index": frame["scene_index"],
+                        "result": _jsonable(frame.get(module))}
+                       for frame in keyframes]} 
+
+
+def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
+                      keyframes: List[Dict[str, Any]], scene_result: Dict[str, Any],
+                      boundary_sampling: Optional[Dict[str, Any]],
+                      boundary_frames: List[Dict[str, Any]],
+                      module_status: Dict[str, Any], digest: str,
+                      window: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Record one real run per executed module, including honest non-success.
+
+    Weights are hashed only when a local file exists. A failed or not-run
+    adapter still gets a record so the export can distinguish "did not run"
+    from "ran and produced this". Rule-based detectors are recorded too: their
+    identity is the frozen threshold set, not a fabricated model weight.
+    """
+    job_id = job["id"]
+    thresholds = MetricThresholds()
+    frame_input = _keyframe_input(keyframes)
+    runs: List[Dict[str, Any]] = []
+
+    def extractor_identity(module: str, fallback: str) -> Dict[str, Any]:
+        instance = extractors.get(module)
+        if instance is None:
+            return {"provider": "unavailable", "model_name": fallback,
+                    "model_version": "unavailable", "weights_path": None,
+                    "license": "not declared"}
+        return instance.code_identity
+
+    face_identity = extractor_identity("face", "YuNet")
+    runs.append(_model_run_record(
+        job_id, "face", provider=face_identity.get("provider", "opencv"),
+        model_name=face_identity.get("model_name", "YuNet"),
+        model_version=face_identity.get("model_version", "unknown"),
+        weights_sha256=_weights_digest(face_identity.get("weights_path")),
+        license=face_identity.get("license", "not declared"),
+        preprocessing={"input": "BGR frame as decoded",
+                       "detector_kind": face_identity.get("detector_kind"),
+                       "detector_input": "320x320" if face_identity.get("detector_kind") == "yunet" else "native"},
+        parameters={"face_min_confidence": thresholds.face_min_confidence},
+        input_value=frame_input, output_value=_frame_output(keyframes, "face"),
+        status=module_status.get("face", "not_run"),
+        failure_reason=_first_module_reason(keyframes, "face")
+        or ("no sampled keyframes" if not keyframes else None),
+        code_version=f"vision_jobs={VERSION}; opencv={_package_version('opencv-python')}",
+        score_kind="confidence"))
+
+    ocr_identity = extractor_identity("ocr", "RapidOCR")
+    runs.append(_model_run_record(
+        job_id, "ocr", provider=ocr_identity.get("provider", "RapidOCR"),
+        model_name=ocr_identity.get("model_name", "RapidOCR default det+cls+rec"),
+        model_version=ocr_identity.get("model_version", "unavailable"),
+        weights_sha256=_weights_digest(ocr_identity.get("weights_path")),
+        license=ocr_identity.get("license", "Apache-2.0"),
+        preprocessing={"input": "BGR frame as decoded", "orientation": "as-shot"},
+        parameters={"ocr_min_confidence": thresholds.ocr_min_confidence,
+                    "ocr_min_height_ratio": thresholds.ocr_min_height_ratio},
+        input_value=frame_input, output_value=_frame_output(keyframes, "ocr"),
+        status=module_status.get("ocr", "not_run"),
+        failure_reason=_first_module_reason(keyframes, "ocr")
+        or ("no sampled keyframes" if not keyframes else None),
+        code_version=f"vision_jobs={VERSION}; rapidocr={ocr_identity.get('model_version', 'unavailable')}",
+        score_kind="confidence"))
+
+    clip_identity = extractor_identity("clip", "ViT-B-32")
+    runs.append(_model_run_record(
+        job_id, "clip", provider=clip_identity.get("provider", "open_clip"),
+        model_name=clip_identity.get("model_name", "ViT-B-32"),
+        model_version=clip_identity.get("pretrained", "openai"),
+        weights_sha256=_weights_digest(clip_identity.get("weights_path")),
+        license=clip_identity.get("license", "MIT (open_clip); pretrained weights terms not declared locally"),
+        preprocessing={"input": "BGR frame converted to RGB",
+                       "transform": "open_clip pretrained eval transform",
+                       "offline": clip_identity.get("offline"),
+                       "downloads_allowed": clip_identity.get("downloads_allowed")},
+        parameters={"clip_binary_confidence": thresholds.clip_binary_confidence,
+                    "clip_multiclass_confidence": thresholds.clip_multiclass_confidence,
+                    "clip_entity_mismatch_cutoff": thresholds.clip_entity_mismatch_cutoff,
+                    "force_quick_gelu": clip_identity.get("force_quick_gelu")},
+        input_value=frame_input, output_value=_frame_output(keyframes, "clip"),
+        status=module_status.get("clip", "not_run"),
+        failure_reason=_first_module_reason(keyframes, "clip")
+        or ("no sampled keyframes" if not keyframes else None),
+        code_version=f"vision_jobs={VERSION}; open_clip_torch={_package_version('open_clip_torch')}",
+        score_kind="softmax"))
+
+    vlm_identity = extractor_identity("vlm", "microsoft/Florence-2-base")
+    runs.append(_model_run_record(
+        job_id, "vlm", provider=vlm_identity.get("provider", "transformers"),
+        model_name=vlm_identity.get("model_path", "microsoft/Florence-2-base"),
+        model_version=vlm_identity.get("revision", "unpinned"),
+        weights_sha256=_weights_digest(vlm_identity.get("weights_path")),
+        license=vlm_identity.get("license", "MIT (Florence-2); local weight terms not declared"),
+        preprocessing={"input": "BGR frame converted to RGB PIL image",
+                       "trust_remote_code": vlm_identity.get("trust_remote_code"),
+                       "offline": vlm_identity.get("offline"),
+                       "downloads_allowed": vlm_identity.get("downloads_allowed")},
+        parameters={"task_prompt": "CAPTION", "max_new_tokens": 192,
+                    "num_beams": 3, "do_sample": False},
+        input_value=frame_input, output_value=_frame_output(keyframes, "vlm"),
+        status=module_status.get("vlm", "not_run"),
+        failure_reason=_first_module_reason(keyframes, "vlm")
+        or ("no sampled keyframes" if not keyframes else None),
+        code_version=f"vision_jobs={VERSION}; transformers={_package_version('transformers')}",
+        score_kind="none"))
+
+    runs.append(_model_run_record(
+        job_id, "scene", provider="trace-annotate", model_name="scene-cut-ffmpeg",
+        model_version=VERSION, weights_sha256=None,
+        license="Project source; FFmpeg build license applies to the bundled binary",
+        preprocessing={"sampler": "ffmpeg lavfi.scene_score", "time_domain": DOMAIN},
+        parameters={"scene_threshold": thresholds.scene_threshold,
+                    "scene_min_duration_s": thresholds.scene_min_duration_s},
+        input_value={"file_sha256": digest, "window": window,
+                     "time_domain": DOMAIN},
+        output_value={"scenes": _jsonable(scene_result.get("scenes") or []),
+                      "status": scene_result.get("status")},
+        status=scene_result.get("status", "failed"),
+        failure_reason=scene_result.get("error") or ("no scenes detected" if not scene_result.get("scenes") else None),
+        code_version=f"vision_jobs={VERSION}; ffmpeg=system",
+        score_kind="rule_score"))
+
+    runs.append(_model_run_record(
+        job_id, "motion", provider="trace-annotate", model_name="camera-motion-v1",
+        model_version="1", weights_sha256=None, license="Project source",
+        preprocessing={"input": "adjacent sampled frames",
+                       "grayscale": True, "analysis_width": 96},
+        parameters={"min_points": 15, "min_inliers": 12,
+                    "static_pixels": 2.0,
+                    "scale_threshold": 0.02,
+                    "rotation_threshold": 1.5},
+        input_value=frame_input,
+        output_value={"module": "motion",
+                      "frames": [{"frame_index": frame["frame_index"],
+                                  "summary": _jsonable((frame.get("motion") or {}).get("summary")),
+                                  "status": (frame.get("motion") or {}).get("status")}
+                                 for frame in keyframes]},
+        status=module_status.get("motion", "not_run"),
+        failure_reason=("fewer than two sampled frames per scene" if module_status.get("motion") == "not_run"
+                        else None),
+        code_version=f"vision_jobs={VERSION}; camera_motion=1",
+        score_kind="rule_score"))
+
+    runs.append(_model_run_record(
+        job_id, "boundary", provider="trace-annotate", model_name="shot-boundaries-v1",
+        model_version="1", weights_sha256=None, license="Project source",
+        preprocessing={"input": "boundary-radius sampled frames",
+                       "analysis_width": 96, "hist_bins": 32},
+        parameters={"boundary_radius": BOUNDARY_RADIUS,
+                    "cut_threshold": 0.30, "gradual_low": 0.05,
+                    "strong_cut": 0.60, "flash_ratio": 0.5,
+                    "min_gradual_frames": 3, "dissolve_residual": 0.20,
+                    "dissolve_far": 0.15, "black_level": 10,
+                    "white_level": 248, "neighbour_radius": 6},
+        input_value={"boundary_frames": [
+            {"frame_index": frame["frame_index"],
+             "seconds": frame["seconds"],
+             "evidence_sha256": frame["evidence_sha256"]}
+            for frame in boundary_frames]},
+        output_value={"module": "boundary",
+                      "events": [_jsonable(event)
+                                 for frame in keyframes
+                                 for event in (frame.get("boundary_events") or [])]},
+        status=module_status.get("boundary", "not_run"),
+        failure_reason=((boundary_sampling or {}).get("message")
+                        or (boundary_sampling or {}).get("error")
+                        or ("fewer than two scenes; no boundary sample"
+                            if module_status.get("boundary") == "not_run" else None)),
+        code_version=f"vision_jobs={VERSION}; shot_boundaries=1",
+        score_kind="rule_score"))
+    return runs
 
 
 def _evidence_preview(source: Path) -> Path:
@@ -1114,7 +1428,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
         "evidence_ids": [],
         "method": {"id": "shot-boundary-local", "version": str(candidate.get("processor_version") or "1"),
                    "parameters": {"detector": "local-scene-cut", "scene_index": index}},
-        "model_run_id": None,
+        "model_run_id": _module_run_id(job_id, "scene"),
         "score": None,
         "score_kind": "none",
         "measurement": None,
@@ -1156,7 +1470,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                                           "subject_kind": "face",
                                           "face_height_ratio": ratio,
                                           "frame_index": keyframe["frame_index"]}},
-                "model_run_id": None,
+                "model_run_id": _module_run_id(job_id, "face"),
                 "score": float(framing.get("confidence") or 0.0),
                 "score_kind": "rule_score",
                 "measurement": ({"value": float(ratio), "unit": "ratio", "basis": "measured",
@@ -1190,7 +1504,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                                           "frame_index": keyframe.get("frame_index"),
                                           "from_frame": first_pair.get("from_frame"),
                                           "to_frame": first_pair.get("to_frame")}},
-                "model_run_id": None,
+                "model_run_id": _module_run_id(job_id, "motion"),
                 "score": round(confidence, 3),
                 "score_kind": "rule_score",
                 "measurement": ({"value": float(speed), "unit": "px/s", "basis": "measured",
@@ -1250,7 +1564,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                                           "needs_review": event.get("needs_review"),
                                           "boundary_radius": BOUNDARY_RADIUS,
                                           "metrics": metrics}},
-                "model_run_id": None,
+                "model_run_id": _module_run_id(job_id, "boundary"),
                 "score": float(event.get("confidence") or 0.0),
                 "score_kind": "rule_score",
                 "measurement": None,

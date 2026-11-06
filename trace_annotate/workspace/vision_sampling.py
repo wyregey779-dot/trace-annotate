@@ -220,8 +220,10 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
     produced = sorted(Path(output).glob("sample-*.png"))
     expected = len(frames)
     if result.returncode or len(produced) != expected:
+        diagnostic = (result.stderr or b"").decode("utf-8", "replace").strip()[-600:]
         raise WorkspaceError("FRAME_DECODE_FAILED",
-                            f"Decoder produced {len(produced)} of {expected} planned frames")
+                            f"Decoder produced {len(produced)} of {expected} planned frames"
+                            + (f"; ffmpeg={diagnostic}" if diagnostic else ""))
     evidence: List[Dict[str, Any]] = []
     total_bytes = 0
     for item, file in zip(frames, produced):
