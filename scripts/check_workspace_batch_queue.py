@@ -139,6 +139,25 @@ def main():
             raise AssertionError("Accepted uploads left temp bytes: " + str(leftovers))
         check("Accepted uploads leave no staged or prepare bytes under tmp")
 
+        corrupt = args.output / "queue-corrupt.mp4"
+        corrupt.write_bytes(b"not a video at all")
+        page.locator("#file-input").set_input_files([str(corrupt)])
+        expect(page.locator("#import-status")).to_contain_text("失败或未知 1", timeout=180000)
+        failed_item = page.locator('#import-log li[data-phase="failed"]').filter(has_text="queue-corrupt.mp4")
+        expect(failed_item).to_have_count(1, timeout=30000)
+        retry_button = failed_item.locator('button[data-action="retry-batch-item"]')
+        expect(retry_button).to_have_count(1, timeout=30000)
+        check("A failed batch item exposes a retry control")
+
+        failed_intake = store.list_intakes()
+        corrupt_row = next(row for row in failed_intake if row["display_name"] == "queue-corrupt.mp4")
+        before_attempt = corrupt_row["attempt"]
+        retry_button.click()
+        attempts = page.locator(f'#intake-list li[data-intake-id="{corrupt_row["id"]}"]')
+        expect(attempts).to_have_attribute("data-attempt", str(before_attempt + 1), timeout=60000)
+        summary["retry_attempt"] = {"before": before_attempt, "after": before_attempt + 1}
+        check("Retrying a failed item starts a new intake attempt")
+
         browser.close()
         playwright.stop()
     finally:
@@ -152,7 +171,7 @@ def main():
         raise AssertionError("Intake worker did not stop before the store closed: " + str(shutdown_report))
     check("Workspace shutdown stops the intake drain before SQLite closes")
 
-    summary["ok"] = len(summary["checks"]) == 7
+    summary["ok"] = len(summary["checks"]) == 9
     write_json(args.output / "summary.json", summary)
     if not summary["ok"]:
         raise SystemExit("Batch queue acceptance did not complete")
