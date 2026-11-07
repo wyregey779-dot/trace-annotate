@@ -373,6 +373,7 @@ def test_retry_uses_an_attempt_scoped_work_directory(store, upload):
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "attempt-one.evidence").write_text("first attempt", encoding="utf-8")
             raise WorkspaceError("ADMISSION_FAILED", "synthetic first-attempt failure")
+        calls["retry_dir"] = output_dir.name
         return original(source, output_dir, **kwargs)
 
     import trace_annotate.workspace.store as store_module
@@ -380,23 +381,25 @@ def test_retry_uses_an_attempt_scoped_work_directory(store, upload):
     try:
         media_module.prepare_workspace_media = flaky
         first = q.run_pending(worker_id="w1")
+        assert first[0]["state"] == "failed", first[0]
+        assert first[0]["attempt"] == 1
+        work_dirs = sorted(p.name for p in store.tmp_dir.iterdir() if p.is_dir() and p.name.startswith(rec["id"]))
+        assert any(name.endswith("-a1-g1") for name in work_dirs), work_dirs
+        # The first attempt's evidence survives; a retry gets its own directory.
+        assert (store.tmp_dir / f"{rec['id']}-a1-g1" / "attempt-one.evidence").is_file()
+        q.retry_failed(rec["id"])
+        second = q.run_pending(worker_id="w1")
     finally:
         media_module.prepare_workspace_media = store_module_prepare
-    assert first[0]["state"] == "failed", first[0]
-    assert first[0]["attempt"] == 1
-    work_dirs = sorted(p.name for p in store.tmp_dir.iterdir() if p.is_dir() and p.name.startswith(rec["id"]))
-    assert any(name.endswith("-a1-g1") for name in work_dirs), work_dirs
-    # The first attempt's evidence survives; a retry gets its own directory.
-    assert (store.tmp_dir / f"{rec['id']}-a1-g1" / "attempt-one.evidence").is_file()
-    q.retry_failed(rec["id"])
-    second = q.run_pending(worker_id="w1")
     assert second[0]["state"] == "succeeded", second[0]
     # ``attempt`` counts real prepares: the retry is attempt 2, not attempt 3.
     assert second[0]["attempt"] == 2, second[0]
     assert (store.tmp_dir / f"{rec['id']}-a1-g1" / "attempt-one.evidence").is_file()
-    retry_dirs = [p.name for p in store.tmp_dir.iterdir()
-                  if p.is_dir() and p.name.startswith(rec["id"]) and p.name != f"{rec['id']}-a1-g1"]
-    assert retry_dirs, "the retry must prepare in its own attempt-scoped directory"
+    # The successful retry's own prepare work directory is removed only after
+    # its objects are committed, so observe the name while preparation runs.
+    assert calls.get("retry_dir") == f"{rec['id']}-a2-g2", calls
+    assert not (store.tmp_dir / f"{rec['id']}-a2-g2").exists()
+    assert (store.tmp_dir / f"{rec['id']}-a1-g1" / "attempt-one.evidence").is_file()
 
 
 # -- P06: ordered shutdown -------------------------------------------------
