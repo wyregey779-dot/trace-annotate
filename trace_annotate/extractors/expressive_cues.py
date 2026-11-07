@@ -42,7 +42,10 @@ def measure_acoustic_window(samples: Sequence[float], sample_rate: int, *,
     frames = [audio[index:index + hop] for index in range(0, audio.size - hop + 1, hop)]
     energies = np.array([_rms_dbfs(frame) for frame in frames]) if frames else np.array([rms])
     floor = float(np.percentile(energies, 10))
-    threshold = max(floor + 6.0, -60.0)
+    # A window that is loud from end to end has no quieter reference: its
+    # percentile floor equals the signal, so a pure relative threshold would
+    # report zero activity. Cap the relative threshold below the window RMS.
+    threshold = max(min(floor + 6.0, rms - 6.0), -60.0)
     active = []
     start: Optional[int] = None
     for index, energy in enumerate(energies):

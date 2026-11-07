@@ -41,6 +41,12 @@ def test_speech_interval_is_detected_between_silences():
     assert interval["end"] <= 1.0
 
 
+def test_continuous_loud_window_is_active_despite_flat_floor():
+    measurement = EC.measure_acoustic_window(_sine(440, 1.0), 22050)
+    assert measurement["active_ratio"] > 0.9
+    assert len(measurement["active_intervals"]) == 1
+
+
 def test_window_reports_origin_and_units():
     measurement = EC.measure_acoustic_window(_sine(300, 0.5), 22050, origin_seconds=12.5)
     assert measurement["window_seconds"]["start"] == 12.5
