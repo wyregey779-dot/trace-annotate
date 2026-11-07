@@ -261,7 +261,7 @@ def _milliseconds(value):
     return whole + int(remainder * 2 >= denominator)
 
 
-def _srt(task, track, track_id=None):
+def _subtitles(task, track, track_id=None, *, fmt):
     segments = [item for item in task["annotations"] if item["type"] == "segment"]
     tracks = {item["track"] for item in segments}
     if track_id is not None:
@@ -272,7 +272,7 @@ def _srt(task, track, track_id=None):
             raise SchemaInvalid("TRACK_ID_AMBIGUOUS", "Track ID does not uniquely identify a segment track")
         track = matches[0]
     if track is None and len(tracks) > 1:
-        raise SchemaInvalid("TRACK_REQUIRED", "Select one track for SRT export")
+        raise SchemaInvalid("TRACK_REQUIRED", "Select one track for subtitle export")
     if track is not None and (not isinstance(track, str) or track not in tracks):
         raise SchemaInvalid("TRACK_NOT_FOUND", "Selected segment track does not exist")
     segments = [item for item in segments if track is None or item["track"] == track]
@@ -284,20 +284,33 @@ def _srt(task, track, track_id=None):
         if end <= start:
             raise SchemaInvalid("SUBTITLE_PRECISION_LOSS", "A segment collapses at millisecond precision")
         try:
-            text = _plain_text(item["text"] if item["text"] else item["label"], "srt", "annotation")
+            text = _plain_text(item["text"] if item["text"] else item["label"], fmt, "annotation")
         except ValueError as exc:
-            raise SchemaInvalid("SUBTITLE_TEXT_UNSUPPORTED", "SRT cannot represent this annotation text safely") from exc
-        cues.append(f"{number}\n{_timestamp(start, 'srt')} --> {_timestamp(end, 'srt')}\n{text}")
+            raise SchemaInvalid("SUBTITLE_TEXT_UNSUPPORTED",
+                                f"{fmt.upper()} cannot represent this annotation text safely") from exc
+        timing = f"{_timestamp(start, fmt)} --> {_timestamp(end, fmt)}"
+        cues.append(f"{number}\n{timing}\n{text}" if fmt == "srt" else f"{timing}\n{text}")
+    if fmt == "vtt":
+        return "WEBVTT\n\n" + "\n\n".join(cues) + ("\n" if cues else "")
     return "\n\n".join(cues) + ("\n" if cues else "")
 
 
+def _srt(task, track, track_id=None):
+    return _subtitles(task, track, track_id, fmt="srt")
+
+
+def _vtt(task, track, track_id=None):
+    return _subtitles(task, track, track_id, fmt="vtt")
+
+
 def export_task(store, task_id, format, *, track=None, track_id=None):
-    if format not in {"json", "csv", "srt", "temporal", "professional"}:
-        raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT", "Supported task exports are json, csv, srt, temporal and professional")
+    if format not in {"json", "csv", "srt", "vtt", "temporal", "professional"}:
+        raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT",
+                            "Supported task exports are json, csv, srt, vtt, temporal and professional")
     if track is not None and track_id is not None:
         raise SchemaInvalid("TRACK_SELECTION_CONFLICT", "Select a track by either name or ID, not both")
-    if (track is not None or track_id is not None) and format != "srt":
-        raise SchemaInvalid("UNSUPPORTED_EXPORT_OPTION", "Track selection applies only to SRT")
+    if (track is not None or track_id is not None) and format not in {"srt", "vtt"}:
+        raise SchemaInvalid("UNSUPPORTED_EXPORT_OPTION", "Track selection applies only to SRT and WebVTT")
     if track_id is not None and (not isinstance(track_id, str) or re.fullmatch(r"[0-9a-f]{64}", track_id) is None):
         raise SchemaInvalid("INVALID_TRACK_ID", "Track ID must be a lowercase SHA256 hex digest")
     if format == "professional":
@@ -329,11 +342,17 @@ def export_task(store, task_id, format, *, track=None, track_id=None):
             if report["review_qualification"]["historical_or_unbound_reviewed"]:
                 disclosures.append("Unbound historical review flags are legacy states, not current content-bound approval.")
             losses = " ".join(disclosures)
-        else:
+        elif format == "srt":
             data = _srt(task, track, track_id).encode("utf-8")
             content_type = "application/x-subrip; charset=utf-8"
             losses = ("One segment track; round-half-up milliseconds; text else label; excludes events, whole-clip labels, "
                       "IDs, tags, anchors, metadata and review history; overlapping cues retained.")
+        else:
+            data = _vtt(task, track, track_id).encode("utf-8")
+            content_type = "text/vtt; charset=utf-8"
+            losses = ("One segment track; round-half-up milliseconds; text else label; excludes events, whole-clip labels, "
+                      "IDs, tags, anchors, metadata and review history; overlapping cues retained; "
+                      "cue identifiers and styling are omitted.")
     ext = "temporal.json" if format == "temporal" else format
     return {"data": data, "content_type": content_type, "filename": f"TraceAnnotate-{task_id}-r{binding['revision']}.{ext}",
             "binding": binding, "losses": losses}

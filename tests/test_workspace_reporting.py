@@ -113,6 +113,13 @@ def test_export_csv_and_srt_roundtrip_one_segment(api):
     srt = srt_body.decode("utf-8")
     restored = import_subtitles(srt, "srt", "playback.mp4", 2)
     assert [(item["start"], item["end"], item["text"]) for item in restored["segments"]] == [(0.0, 1.0, "reviewed")]
+    status, headers, vtt_body = request(server, "GET", _task_path(store, "export?format=vtt"))
+    assert status == 200 and headers["Content-Type"].startswith("text/vtt")
+    vtt = vtt_body.decode("utf-8")
+    assert vtt.startswith("WEBVTT\n\n")
+    assert "00:00:00.000 --> 00:00:01.000" in vtt
+    vtt_restored = import_subtitles(vtt, "vtt", "playback.mp4", 2)
+    assert [(item["start"], item["end"], item["text"]) for item in vtt_restored["segments"]] == [(0.0, 1.0, "reviewed")]
 
 
 def test_export_rejects_missing_or_unknown_format_and_unauthorized(api):
