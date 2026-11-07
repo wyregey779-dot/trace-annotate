@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from trace_annotate.config import MetricThresholds
-from trace_annotate.extractors.scene import SceneDetectionError, SceneDetector
+from trace_annotate.extractors.scene import SceneDetectionError, SceneDetector, merge_adjacent_cuts
 
 
 @pytest.fixture
@@ -57,6 +57,18 @@ def test_nonexistent_video_cannot_become_a_valid_whole_clip(tmp_path, declared_d
     assert result["status"] == "failed"
     assert result["scene_sub_segments"] == []
     assert "existing regular file" in result["error"]
+
+
+def test_merge_adjacent_cuts_drops_a_weak_duplicate() -> None:
+    cuts = [(0.0, float("inf")), (1.0, 0.8), (1.02, 0.2), (2.0, 0.9), (2.2, float("inf"))]
+
+    assert merge_adjacent_cuts(cuts, window=0.07, weak_ratio=0.5) == [(0.0, float("inf")), (1.0, 0.8), (2.0, 0.9), (2.2, float("inf"))]
+
+
+def test_merge_adjacent_cuts_keeps_two_strong_cuts_within_one_frame() -> None:
+    cuts = [(1.0, 0.8), (1.033, 0.9)]
+
+    assert merge_adjacent_cuts(cuts, window=0.07, weak_ratio=0.5) == cuts
 
 
 def test_nonvideo_bytes_fail_real_probe(tmp_path):

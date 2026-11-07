@@ -69,6 +69,37 @@ def _video_duration(path: Path) -> float:
     return duration
 
 
+def merge_adjacent_cuts(
+    cuts: List[tuple[float, float]],
+    *,
+    window: float = 0.07,
+    weak_ratio: float = 0.5,
+) -> List[tuple[float, float]]:
+    """Collapse duplicate detections while retaining genuinely strong short shots."""
+    ordered = sorted((float(timestamp), float(score)) for timestamp, score in cuts)
+    clusters: List[List[tuple[float, float]]] = []
+    current: List[tuple[float, float]] = []
+    for item in ordered:
+        if current and item[0] - current[-1][0] > window:
+            clusters.append(current)
+            current = []
+        current.append(item)
+    if current:
+        clusters.append(current)
+
+    merged: List[tuple[float, float]] = []
+    for cluster in clusters:
+        if len(cluster) == 1:
+            merged.append(cluster[0])
+            continue
+        strongest = max(cluster, key=lambda item: item[1])
+        threshold = strongest[1] * weak_ratio
+        for item in cluster:
+            if item == strongest or item[1] >= threshold:
+                merged.append(item)
+    return merged
+
+
 class SceneDetector(BaseExtractor):
     """Suggest cuts after validating and decoding the whole local video."""
 
@@ -114,7 +145,7 @@ class SceneDetector(BaseExtractor):
             "-vf", f"setpts=PTS-STARTPTS,select='gt(scene,{th})',metadata=print:file=-",
             "-f", "null", "-",
         ])
-        cuts = {0.0, duration}
+        interior: List[tuple[float, float]] = []
         for line in result.stdout.splitlines():
             if "pts_time:" not in line:
                 continue
@@ -122,9 +153,14 @@ class SceneDetector(BaseExtractor):
                 timestamp = float(line.split("pts_time:", 1)[1].split()[0])
                 if not math.isfinite(timestamp) or not 0 <= timestamp <= duration:
                     raise ValueError("cut falls outside the video timeline")
+                score = 0.0
+                if "lavfi.scene_score=" in line:
+                    score = float(line.split("lavfi.scene_score=", 1)[1].split()[0])
             except (ValueError, IndexError) as exc:
                 raise SceneDetectionError(f"Invalid FFmpeg scene timestamp: {line!r}") from exc
-            cuts.add(timestamp)
+            interior.append((timestamp, score))
+        merged = merge_adjacent_cuts(interior)
+        cuts = {0.0, duration, *(timestamp for timestamp, _score in merged)}
         ordered = sorted(cuts)
         return [{"start": start, "end": end, "duration": end - start}
                 for start, end in zip(ordered, ordered[1:])]
