@@ -104,13 +104,14 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert result["scope"] == "registered_playback_only; original_source_not_measured; candidate_not_applied"
     assert result["semantic_listening"] == "not_performed"
     assert result["extractor_status"]["scene"] in {"success", "failed"}
-    assert result["module_status"]["actions"] == "not_run"
-    assert result["module_status"]["actions_reason"] == "no_local_action_provider_in_this_build"
+    assert result["module_status"]["actions"] in {"success", "not_run", "failed"}
+    assert result["module_status"]["acoustics"] in {"success", "not_run", "failed"}
     assert result["module_status"]["boundary"] in {"success", "failed", "not_run"}
     runs = result["model_runs"]
-    assert len(runs) == 7
+    assert len(runs) == 9
     assert {run["id"] for run in runs} == {V._module_run_id(queued["id"], name) for name in
-                                           ("face", "ocr", "clip", "vlm", "scene", "motion", "boundary")}
+                                           ("face", "ocr", "clip", "vlm", "scene", "motion",
+                                            "actions", "acoustics", "boundary")}
     for run in runs:
         assert SS.validate_model_run(run) == run
     assert any(run["status"] == "not_run" and run["failure_reason"] for run in runs)
@@ -423,7 +424,9 @@ def test_vision_sampling_uses_pts_anchored_multi_frame_plan(store):
                for frame in result["keyframes"])
     covered = {frame["scene_index"] for frame in result["keyframes"]}
     assert covered == set(range(len(result["scenes"])))
-    assert all(item["relative_path"].endswith(".png") for item in result["evidence"])
+    assert all(item["relative_path"].endswith((".png", "audio/acoustic.m4a"))
+               for item in result["evidence"])
+    assert any(item["relative_path"].endswith("audio/acoustic.m4a") for item in result["evidence"])
 
 
 def test_submit_many_freezes_each_task_and_replays_the_same_receipt(store):

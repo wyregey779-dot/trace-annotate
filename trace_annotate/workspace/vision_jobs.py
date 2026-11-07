@@ -19,10 +19,13 @@ import tempfile
 import threading
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..config import MetricThresholds
+from ..extractors.actions import (ACTION_VOCAB, detect_translation_candidates,
+                                  merge_candidates, provider_coverage)
 from ..extractors.camera_motion import analyse_motion
+from ..extractors.expressive_cues import acoustic_claim, measure_acoustic_window
 from ..extractors.scene_change import detect_content_changes
 from ..extractors.clip_engine import CLIPExtractor
 from ..extractors.faces import FaceExtractor
@@ -182,6 +185,158 @@ def _run_face(frame: Any, face_extractor: Optional[FaceExtractor]) -> Dict[str, 
     except Exception as exc:  # A vision helper must never crash the whole job.
         return {"status": "failed", "error": str(exc)}
     return result
+
+
+def _subject_tracks(keyframes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Associate sampled face boxes into short per-scene subject tracks.
+
+    Only boxes actually measured by the face extractor are used. A track is a
+    measurement of the sampled window, not an identity, and no track is invented
+    for a frame with no box. IoU association is per scene so a cut never links
+    two different subjects.
+    """
+    tracks: List[Dict[str, Any]] = []
+    per_scene: Dict[int, List[Dict[str, Any]]] = {}
+    for keyframe in sorted(keyframes, key=lambda item: (item["scene_index"], float(item["timestamp"]["n"]) / float(item["timestamp"]["d"]))):
+        face = keyframe.get("face") or {}
+        if face.get("status") != "success":
+            continue
+        faces = face.get("faces_detected") or []
+        if not faces:
+            continue
+        largest = max(faces, key=lambda item: float(item["box"][2]) * float(item["box"][3]))
+        x, y, box_width, box_height = [float(value) for value in largest["box"]]
+        box = (x, y, x + box_width, y + box_height)
+        seconds = float(keyframe["timestamp"]["n"]) / float(keyframe["timestamp"]["d"])
+        scene_index = int(keyframe["scene_index"])
+        candidates = per_scene.setdefault(scene_index, [])
+        best = None
+        best_iou = 0.0
+        for track in candidates:
+            previous = track["points"][-1]["box"]
+            iou = _box_iou(previous, box)
+            if iou > best_iou:
+                best, best_iou = track, iou
+        if best is None or best_iou < 0.2:
+            best = {"subject_id": f"scene{scene_index}-subject{len(candidates) + 1}",
+                    "scene_index": scene_index, "kind": "face", "points": []}
+            candidates.append(best)
+            tracks.append(best)
+        best["points"].append({"box": [round(value, 2) for value in box],
+                               "frame_index": keyframe["frame_index"], "seconds": seconds})
+    return tracks
+
+
+def _box_iou(first: Sequence[float], second: Sequence[float]) -> float:
+    left = max(float(first[0]), float(second[0]))
+    top = max(float(first[1]), float(second[1]))
+    right = min(float(first[2]), float(second[2]))
+    bottom = min(float(first[3]), float(second[3]))
+    if right <= left or bottom <= top:
+        return 0.0
+    intersection = (right - left) * (bottom - top)
+    area_first = max(0.0, float(first[2]) - float(first[0])) * max(0.0, float(first[3]) - float(first[1]))
+    area_second = max(0.0, float(second[2]) - float(second[0])) * max(0.0, float(second[3]) - float(second[1]))
+    union = area_first + area_second - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Measure walk/run from measured subject-box tracks; leave other classes not_run."""
+    coverage = provider_coverage("subject-translation-v1")
+    tracks = _subject_tracks(keyframes)
+    candidates: List[Dict[str, Any]] = []
+    track_results = []
+    for track in tracks:
+        points = track["points"]
+        result = detect_translation_candidates(points, subject_id=track["subject_id"], min_samples=3)
+        track_results.append({"subject_id": track["subject_id"],
+                              "scene_index": track["scene_index"],
+                              "kind": track["kind"], "samples": len(points),
+                              "status": result.get("status"),
+                              "reason": result.get("reason"),
+                              "metrics": result.get("metrics"),
+                              "candidate_count": len(result.get("candidates") or [])})
+        for item in result.get("candidates") or []:
+            item["provider"] = "subject-translation-v1"
+            item["scene_index"] = track["scene_index"]
+            candidates.append(item)
+    for track in tracks:
+        for point in track["points"]:
+            point.pop("box", None)
+    merged = merge_candidates(candidates)
+    if not tracks:
+        status, reason = "not_run", "no_subject_box_track_in_sampled_frames"
+    elif not any(item["samples"] >= 3 for item in track_results):
+        status, reason = "not_run", "fewer_than_three_box_samples_per_subject"
+    else:
+        status, reason = "success", None
+    return {
+        "status": status, "provider": "subject-translation-v1",
+        "supported": list(coverage.get("supported") or []),
+        "unsupported": list(coverage.get("unsupported") or []),
+        "reason": reason,
+        "tracks": track_results,
+        "candidates": merged,
+        "measurement_basis": "主体框中心位移/主体高度/时间；仅走、跑两类；拿起/放下/打开/关闭/递交无本地 provider",
+        "uncertainty": "仅由抽样帧主体框位移推出，动作类别与主体身份需人工确认",
+    }
+
+
+def _measure_audio(source: Path, ffmpeg: str, work: Path) -> Dict[str, Any]:
+    """Decode the first real audio stream and measure RMS/f0/active intervals."""
+    command = [ffmpeg, "-v", "error", "-nostdin", "-i", str(source),
+               "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+               "-f", "f32le", "pipe:1"]
+    try:
+        completed = subprocess.run(command, capture_output=True, timeout=600, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "not_run", "reason": f"audio_decode_failed:{type(exc).__name__}",
+                "measurement": None}
+    if completed.returncode != 0 or not completed.stdout:
+        return {"status": "not_run", "reason": "no_decodable_audio_track",
+                "detail": (completed.stderr or b"").decode("utf-8", "replace")[-300:],
+                "measurement": None}
+    import array
+    import wave
+
+    samples = array.array("f")
+    samples.frombytes(completed.stdout[: len(completed.stdout) - (len(completed.stdout) % 4)])
+    if not samples:
+        return {"status": "not_run", "reason": "audio_stream_empty", "measurement": None}
+    sample_rate = 16000
+    measurement = measure_acoustic_window(samples, sample_rate, origin_seconds=0.0)
+    if measurement.get("status") != "success":
+        return {"status": "not_run", "reason": measurement.get("reason"),
+                "measurement": measurement}
+    audio_dir = work / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = audio_dir / "acoustic.wav"
+    pcm = array.array("h")
+    for value in samples:
+        scaled = int(round(float(value) * 32767.0))
+        pcm.append(max(-32768, min(32767, scaled)))
+    with wave.open(str(wav_path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(pcm.tobytes())
+    audio_path = audio_dir / "acoustic.m4a"
+    completed = subprocess.run(
+        [ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(wav_path),
+         "-c:a", "aac", "-b:a", "32k", "-ac", "1", str(audio_path)],
+        capture_output=True, text=True, timeout=120)
+    if completed.returncode != 0 or not audio_path.is_file() or audio_path.stat().st_size == 0:
+        return {"status": "not_run",
+                "reason": "acoustic_evidence_encode_failed:" +
+                          (completed.stderr or "empty output").strip()[:200],
+                "measurement": measurement}
+    wav_path.unlink()
+    return {"status": "success", "reason": None, "audio_relative_path": "audio/acoustic.m4a",
+            "audio_sha256": stream_sha256(audio_path),
+            "stream_selection": "0:a:0 (first audio stream; video stream ignored)",
+            "sample_rate": sample_rate, "samples": len(samples),
+            "measurement": measurement}
 
 
 def _shot_framing(frame: Any, face_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -581,6 +736,12 @@ class VisionJobs:
                         content_sampling = {"status": "failed",
                                             "error": type(exc).__name__,
                                             "message": str(exc)[:240]}
+                actions_sampling = _action_candidates(keyframes)
+                try:
+                    acoustics_sampling = _measure_audio(Path(source), ffmpeg, work)
+                except Exception as exc:
+                    acoustics_sampling = {"status": "failed", "reason": type(exc).__name__,
+                                          "message": str(exc)[:240], "measurement": None}
                 boundary_frames: List[Dict[str, Any]] = []
                 boundary_sampling: Dict[str, Any] = {
                     "status": "not_run",
@@ -709,17 +870,21 @@ class VisionJobs:
                     "motion": motion_status,
                     "transition": ("success" if any(frame.get("boundary_events") for frame in keyframes)
                                    else boundary_sampling.get("status", "not_run")),
-                    "actions": "not_run", "expressive": "not_run", "acoustics": "not_run",
+                    "actions": actions_sampling.get("status", "not_run"),
+                    "expressive": "not_run",
+                    "acoustics": acoustics_sampling.get("status", "not_run"),
                 })
-                module_status["actions_reason"] = "no_local_action_provider_in_this_build"
+                module_status["actions_reason"] = actions_sampling.get("reason")
+                module_status["actions_supported"] = actions_sampling.get("supported")
+                module_status["actions_unsupported"] = actions_sampling.get("unsupported")
                 module_status["expressive_reason"] = "no_landmark_provider_in_this_build"
-                module_status["acoustics_reason"] = "no_local_audio_analysis_provider_in_this_build"
+                module_status["acoustics_reason"] = acoustics_sampling.get("reason")
                 if self._extractor_error is not None:
                     extractor_status["extractor_error"] = self._extractor_error
                 model_runs = _build_model_runs(
                     job, extractors, keyframes, scene_result,
                     boundary_sampling, boundary_frames, module_status,
-                    digest, window)
+                    digest, window, actions_sampling, acoustics_sampling)
                 evidence = []
                 for path in sorted(work.rglob("*")):
                     if cancelled():
@@ -741,6 +906,8 @@ class VisionJobs:
                     "scenes": scenes, "keyframes": keyframes, "sampling": sampling,
                     "boundary_frames": boundary_frames, "boundary_sampling": boundary_sampling,
                     "content_sampling": content_sampling,
+                    "actions_sampling": _jsonable(actions_sampling),
+                    "acoustics_sampling": _jsonable(acoustics_sampling),
                     "extractor_status": extractor_status, "module_status": module_status,
                     "model_runs": model_runs,
                     "job_identity": parameters["job_identity"], "evidence": evidence,
@@ -845,7 +1012,7 @@ class VisionJobs:
         expected = set(fixed) | {"window", "subject_annotation_id", "scenes", "keyframes",
                                  "extractor_status", "module_status", "job_identity",
                                  "model_runs", "evidence", "boundary_frames", "boundary_sampling"}
-        expected = expected | {"content_sampling"}
+        expected = expected | {"content_sampling", "actions_sampling", "acoustics_sampling"}
         if (not isinstance(value, dict) or not expected <= set(value)
                 or set(value) - expected - {"sampling"}
                 or any(value[key] != item for key, item in fixed.items())
@@ -1066,7 +1233,7 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, float):
         if not math.isfinite(value):
             raise SchemaInvalid("SCHEMA_INVALID", "Model output contains a non-finite number")
-        return value
+        return float(value)
     if hasattr(value, "tolist"):
         return _jsonable(value.tolist())
     if hasattr(value, "item"):
@@ -1164,7 +1331,9 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
                       boundary_sampling: Optional[Dict[str, Any]],
                       boundary_frames: List[Dict[str, Any]],
                       module_status: Dict[str, Any], digest: str,
-                      window: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                      window: Optional[Dict[str, Any]],
+                      actions_sampling: Optional[Dict[str, Any]] = None,
+                      acoustics_sampling: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Record one real run per executed module, including honest non-success.
 
     Weights are hashed only when a local file exists. A failed or not-run
@@ -1300,6 +1469,44 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         score_kind="rule_score"))
 
     runs.append(_model_run_record(
+        job_id, "actions", provider="trace-annotate", model_name="subject-translation-v1",
+        model_version="1", weights_sha256=None, license="Project source",
+        preprocessing={"input": "face-box tracks built from sampled keyframes per scene",
+                       "time_domain": DOMAIN},
+        parameters={"walk_band_heights_per_s": [0.15, 1.2],
+                    "run_band_heights_per_s": [1.2, 6.0],
+                    "supported": list(module_status.get("actions_supported") or []),
+                    "unsupported": list(module_status.get("actions_unsupported") or [])},
+        input_value=frame_input,
+        output_value={"module": "actions",
+                      "tracks": _jsonable((actions_sampling or {}).get("tracks") or []),
+                      "candidates": _jsonable((actions_sampling or {}).get("candidates") or []),
+                      "coverage": {"supported": module_status.get("actions_supported"),
+                                   "unsupported": module_status.get("actions_unsupported")}},
+        status=module_status.get("actions", "not_run"),
+        failure_reason=module_status.get("actions_reason"),
+        code_version=f"vision_jobs={VERSION}; actions=1",
+        score_kind="rule_score"))
+
+    acoustics = acoustics_sampling or {}
+    runs.append(_model_run_record(
+        job_id, "acoustics", provider="trace-annotate", model_name="acoustic-window-v1",
+        model_version="1", weights_sha256=None, license="Project source",
+        preprocessing={"stream": acoustics.get("stream_selection"),
+                       "sample_rate": acoustics.get("sample_rate"),
+                       "channels": 1, "sample_format": "float32 decoded to PCM16 evidence"},
+        parameters={"f0_min_hz": 60.0, "f0_max_hz": 500.0,
+                    "frame_hop_seconds": 0.02, "silence_dbfs": -45.0},
+        input_value={"file_sha256": digest, "module": "acoustics"},
+        output_value={"module": "acoustics",
+                      "measurement": _jsonable(acoustics.get("measurement")),
+                      "audio_sha256": acoustics.get("audio_sha256")},
+        status=module_status.get("acoustics", "not_run"),
+        failure_reason=acoustics.get("reason"),
+        code_version=f"vision_jobs={VERSION}; expressive_cues=1; ffmpeg={_package_version('static-ffmpeg')}",
+        score_kind="rule_score"))
+
+    runs.append(_model_run_record(
         job_id, "boundary", provider="trace-annotate", model_name="shot-boundaries-v1",
         model_version="1", weights_sha256=None, license="Project source",
         preprocessing={"input": "boundary-radius sampled frames",
@@ -1429,6 +1636,26 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                 owner_id=annotation["id"], role="vision-sample-preview", owner_revision="0")
             evidence_ids.append(artifact["id"])
             frame_artifacts[str(frame["frame_index"])] = artifact["id"]
+        acoustic_claims = [claim for claim in annotation["attributes"]["semantic"]["claims"]
+                           if claim["method"]["id"] == "acoustic-window-v1"]
+        if acoustic_claims:
+            descriptor = next((item for item in candidate.get("evidence") or []
+                               if item["relative_path"].endswith("/audio/acoustic.m4a")), None)
+            if descriptor is None:
+                raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
+                                     "Acoustic claim has no decoded audio evidence")
+            source = store.root / descriptor["relative_path"]
+            _safe(source)
+            if (not source.is_file() or source.stat().st_size != int(descriptor["size_bytes"])
+                    or stream_sha256(source) != descriptor["sha256"]):
+                raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
+                                     "Acoustic evidence is missing or changed")
+            artifact = store._put_file(source)
+            store.bind_artifact_reference(artifact, owner_kind="evidence",
+                owner_id=annotation["id"], role="vision-acoustic-audio", owner_revision="0")
+            evidence_ids.append(artifact["id"])
+            for claim in acoustic_claims:
+                claim["evidence_ids"] = [artifact["id"]]
         annotation["evidence_ids"] = evidence_ids
         for claim in annotation["attributes"]["semantic"]["claims"]:
             if claim["method"]["id"] == "camera-motion-local":
@@ -1632,6 +1859,72 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 "uncertainty_reason": change.get("uncertainty")
                 or "仅按镜头内均匀抽样帧判断，未逐帧验证；短时遮挡或字幕可能被过滤",
             })
+        actions = candidate.get("actions_sampling") or {}
+        for number, action in enumerate(actions.get("candidates") or []):
+            window_seconds = action.get("window_seconds") or {}
+            try:
+                left = float(window_seconds.get("start"))
+                right = float(window_seconds.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if right < float(scene["start"]) or left > float(scene["end"]):
+                continue
+            claims.append({
+                "id": S.make_id("clm", f"{job_id}:{index}:action:{number}"),
+                "claim_type": "measured",
+                "statement": (f"主体框位移测得候选动作“{action.get('action')}”"
+                              f"（{left:.3f}–{right:.3f} 秒）；动作类别与主体身份需人工确认。"),
+                "subject_ref": action.get("subject_id"),
+                "time_window": {"start": {"seconds": _seconds_ratio(left)},
+                                "end": {"seconds": _seconds_ratio(right)}},
+                "evidence_ids": [],
+                "method": {"id": "subject-translation-v1", "version": "1",
+                           "parameters": {"action": action.get("action"),
+                                          "subject_id": action.get("subject_id"),
+                                          "metrics": action.get("metrics"),
+                                          "walk_band": [0.15, 1.2],
+                                          "run_band": [1.2, 6.0]}},
+                "model_run_id": _module_run_id(job_id, "actions"),
+                "score": float(action.get("score") or 0.0),
+                "score_kind": "rule_score",
+                "measurement": {"value": float((action.get("metrics") or {}).get("speed_heights_per_s") or 0.0),
+                                "unit": "subject_heights/s", "basis": "measured",
+                                "analysis_window": {"start": {"seconds": _seconds_ratio(left)},
+                                                    "end": {"seconds": _seconds_ratio(right)}}},
+                "uncertainty_reason": action.get("uncertainty")
+                or "仅由主体框位移推出，动作类别需人工确认",
+            })
+        acoustics = candidate.get("acoustics_sampling") or {}
+        measurement = acoustics.get("measurement") or {}
+        if index == 0 and acoustics.get("status") == "success" and measurement.get("status") == "success":
+            claims.append({
+                "id": S.make_id("clm", f"{job_id}:0:acoustics"),
+                "claim_type": "measured",
+                "statement": (f"首条音轨测量：RMS {measurement.get('rms_dbfs')} dBFS，"
+                              f"语音活动占比 {measurement.get('active_ratio')}，"
+                              "仅声学测量，不代表音色、身份或情绪。"),
+                "subject_ref": None,
+                "time_window": {"start": {"seconds": _seconds_ratio(float((measurement.get("window_seconds") or {}).get("start", 0.0)))},
+                                "end": {"seconds": _seconds_ratio(float((measurement.get("window_seconds") or {}).get("end", 0.0)))}},
+                "evidence_ids": [],
+                "method": {"id": "acoustic-window-v1", "version": "1",
+                           "parameters": {"stream_selection": acoustics.get("stream_selection"),
+                                          "sample_rate": acoustics.get("sample_rate"),
+                                          "f0_min_hz": 60.0, "f0_max_hz": 500.0,
+                                          "frame_hop_seconds": 0.02,
+                                          "f0_hz": measurement.get("f0_hz"),
+                                          "f0_variation_hz": measurement.get("f0_variation_hz"),
+                                          "active_ratio": measurement.get("active_ratio"),
+                                          "active_intervals": measurement.get("active_intervals")}},
+                "model_run_id": _module_run_id(job_id, "acoustics"),
+                "score": 1.0,
+                "score_kind": "confidence",
+                "measurement": {"value": measurement.get("rms_dbfs"),
+                                "unit": "dBFS", "basis": "measured",
+                                "analysis_window": {"start": {"seconds": _seconds_ratio(float((measurement.get("window_seconds") or {}).get("start", 0.0)))},
+                                                    "end": {"seconds": _seconds_ratio(float((measurement.get("window_seconds") or {}).get("end", 0.0)))}}},
+                "uncertainty_reason": "仅声学测量，不代表音色、身份或情绪；语音区间由能量阈值推出",
+            })
         for event in keyframe.get("boundary_events") or []:
             kind = event.get("kind")
             if kind not in TRANSITION_KINDS:
@@ -1740,6 +2033,18 @@ def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
                 tags.append("vision-motion-" + summary["class"])
             if keyframe.get("content_changes"):
                 tags.append("vision-content-change")
+            actions = candidate.get("actions_sampling") or {}
+            for action in actions.get("candidates") or []:
+                window_seconds = action.get("window_seconds") or {}
+                try:
+                    left = float(window_seconds.get("start"))
+                    right = float(window_seconds.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                if right >= float(scene["start"]) and left <= float(scene["end"]):
+                    tags.append("vision-action-" + str(action.get("action")))
+            if index == 0 and (candidate.get("acoustics_sampling") or {}).get("status") == "success":
+                tags.append("vision-acoustics")
             for event in keyframe.get("boundary_events") or []:
                 if event.get("kind") in TRANSITION_LABELS:
                     tags.append("vision-transition-" + event["kind"])
