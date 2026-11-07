@@ -55,6 +55,11 @@ def test_enqueue_then_run_creates_task(store, source_video):
     done = results[0]
     assert done["state"] == "succeeded"
     assert done["task_id"] and done["media_id"]
+    # The accepted upload is copied into the immutable object store; its staged
+    # duplicate must be removed once the binding commits.
+    assert done["staged_present"] is False
+    assert not (q.staged_root / receipt["id"] / "source").exists()
+    assert [p for p in store.tmp_dir.rglob("*") if p.is_file()] == []
     task = store.get_task(done["task_id"])
     assert task["revision"] == 0
     # a second drain has nothing to do -> exactly one task per intake

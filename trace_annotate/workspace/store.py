@@ -581,6 +581,7 @@ class WorkspaceStore:
         # The generation names this attempt's completion identity; it is needed
         # on both the prepared and the reused path.
         gen = generation if generation is not None else intake.get("generation", 0)
+        work = None
         if media is None:
             attempt = intake.get("attempt", 0) or 0
             work = self.tmp_dir / f"{intake_id}-a{attempt}-g{gen}"
@@ -660,6 +661,19 @@ class WorkspaceStore:
                 "UPDATE intakes SET state='succeeded', media_id=?, task_id=?, error_code=NULL, "
                 "worker_id=NULL, session_id=NULL, lease_expires_at=NULL WHERE id=?",
                 (media["id"], task_id, intake_id))
+        if work is not None:
+            # All derived files now live in the immutable object store. Leaving
+            # the prepare directory behind duplicates every admitted source and
+            # would make later evidence runs look like leaked temp bytes.
+            try:
+                _safe(work)
+                shutil.rmtree(work)
+            except OSError as exc:
+                try:
+                    with (self.logs_dir / "prepare-cleanup.log").open("a", encoding="utf-8") as handle:
+                        handle.write(f"{_now()} intake={intake_id} path={work} error={exc}\n")
+                except OSError:
+                    pass
         return {"intake_id": intake_id, "media_id": media["id"], "task_id": task_id,
                 "duration_seconds": float(S.rational_value(media["duration"])),
                 "frames": media["frame_count"], "reused_existing": was_reused}

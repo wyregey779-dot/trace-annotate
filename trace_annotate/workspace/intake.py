@@ -448,22 +448,42 @@ class AsyncIntakes:
             row = _row(self.store.conn.execute("SELECT * FROM intakes WHERE id=?", (intake_id,)))
             if row is None:
                 raise NotFound("INTAKE_NOT_FOUND", "Intake not found")
-            if row["state"] == "succeeded" and row["task_id"]:
+            if not (row["state"] == "succeeded" and row["task_id"]):
+                self._assert_lease(row, generation, worker_id)
+                if row["state"] == "cancel_requested":
+                    raise Conflict("CANCELLED", "Cancellation was requested before admission committed")
+                self._validate_finish_binding(row, result)
+                self.store.conn.execute(
+                    "UPDATE intakes SET state='succeeded', media_id=?, task_id=?, error_code=NULL, "
+                    "worker_id=NULL, session_id=NULL, lease_expires_at=NULL WHERE id=?",
+                    (result["media_id"], result["task_id"], intake_id))
+            elif (result.get("task_id"), result.get("media_id")) != (row["task_id"], row["media_id"]):
                 # An idempotent double commit may only confirm the binding that
                 # already exists; a different result would be a fake success.
-                if (result.get("task_id"), result.get("media_id")) != (row["task_id"], row["media_id"]):
-                    raise Conflict("FINISH_BINDING_MISMATCH",
-                                   "A succeeded intake cannot be rebound to another task")
-                return self.get(intake_id)  # idempotent double-commit
-            self._assert_lease(row, generation, worker_id)
-            if row["state"] == "cancel_requested":
-                raise Conflict("CANCELLED", "Cancellation was requested before admission committed")
-            self._validate_finish_binding(row, result)
-            self.store.conn.execute(
-                "UPDATE intakes SET state='succeeded', media_id=?, task_id=?, error_code=NULL, "
-                "worker_id=NULL, session_id=NULL, lease_expires_at=NULL WHERE id=?",
-                (result["media_id"], result["task_id"], intake_id))
-            return self.get(intake_id)
+                raise Conflict("FINISH_BINDING_MISMATCH",
+                               "A succeeded intake cannot be rebound to another task")
+        # The media object is committed at this point, so the staged upload is
+        # redundant.  Keeping it would duplicate every accepted source forever.
+        # A removal failure is logged, never allowed to turn a committed task
+        # back into a failure.
+        self._discard_staged(intake_id)
+        return self.get(intake_id)
+
+    def _discard_staged(self, intake_id: str) -> None:
+        target = self.staged_root / intake_id
+        if not target.exists():
+            return
+        try:
+            _safe(target)
+            shutil.rmtree(target)
+        except OSError as exc:
+            cleanup_log = self.store.logs_dir / "intake-cleanup.log"
+            try:
+                with cleanup_log.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{dt.datetime.now(dt.timezone.utc).isoformat()} "
+                                 f"intake={intake_id} path={target} error={exc}\n")
+            except OSError:
+                pass
 
     def _validate_finish_binding(self, row: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Refuse a success that does not name a real task for this intake.

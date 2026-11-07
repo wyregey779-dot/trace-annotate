@@ -132,14 +132,27 @@ def main():
             raise AssertionError("Page errors were observed: " + str(summary["page_errors"]))
         check("Intake rows are all succeeded and the page has no errors")
 
+        leftovers = [str(path.relative_to(store.tmp_dir)) for path in store.tmp_dir.rglob("*")
+                     if path.is_file()] if store.tmp_dir.exists() else []
+        summary["temp_leftovers"] = leftovers
+        if leftovers:
+            raise AssertionError("Accepted uploads left temp bytes: " + str(leftovers))
+        check("Accepted uploads leave no staged or prepare bytes under tmp")
+
         browser.close()
         playwright.stop()
     finally:
         server.shutdown()
         server.server_close()
+        summary["shutdown_report"] = getattr(server, "shutdown_report", None)
         store.close()
 
-    summary["ok"] = len(summary["checks"]) == 5
+    shutdown_report = summary.get("shutdown_report") or {}
+    if shutdown_report.get("worker_stopped") is not True or shutdown_report.get("drain_alive") is not False:
+        raise AssertionError("Intake worker did not stop before the store closed: " + str(shutdown_report))
+    check("Workspace shutdown stops the intake drain before SQLite closes")
+
+    summary["ok"] = len(summary["checks"]) == 7
     write_json(args.output / "summary.json", summary)
     if not summary["ok"]:
         raise SystemExit("Batch queue acceptance did not complete")
