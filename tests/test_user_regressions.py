@@ -228,8 +228,12 @@ def _directory_link(link, target):
         # Windows junctions require no Developer Mode or elevated token.
         quoted_link = str(link).replace("'", "''")
         quoted_target = str(target).replace("'", "''")
+        powershell = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            [powershell, "-NoProfile", "-NonInteractive", "-Command",
              f"New-Item -ItemType Junction -Path '{quoted_link}' -Target '{quoted_target}' | Out-Null"],
             capture_output=True, text=True,
         )

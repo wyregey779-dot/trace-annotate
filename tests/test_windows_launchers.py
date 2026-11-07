@@ -13,9 +13,16 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Real Windows CM
 
 
 def _run(script, *args, report_root=None):
+    system_paths = [
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"),
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0"),
+        os.path.dirname(sys.executable),
+    ]
+    child_path = os.pathsep.join(system_paths + [os.environ.get("PATH", "")])
     return subprocess.run(["cmd.exe", "/d", "/c", str(script), *map(str, args)],
                           cwd=str(ROOT), capture_output=True, timeout=30,
-                          env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                          env={**os.environ, "PATH": child_path,
+                               "PYTHONDONTWRITEBYTECODE": "1",
                                **({"TRACE_QC_REPORT_ROOT": str(report_root)} if report_root else {})})
 
 

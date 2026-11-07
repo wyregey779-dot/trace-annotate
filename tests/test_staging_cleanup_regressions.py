@@ -40,8 +40,12 @@ def directory_link(link, target):
             raise
         # Test-only junctions work on Windows without symlink privileges.
         link_text, target_text = str(link).replace("'", "''"), str(target).replace("'", "''")
+        powershell = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            [powershell, "-NoProfile", "-NonInteractive", "-Command",
              f"New-Item -ItemType Junction -Path '{link_text}' -Target '{target_text}' | Out-Null"],
             capture_output=True, text=True,
         )
