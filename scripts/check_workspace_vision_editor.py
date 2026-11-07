@@ -162,6 +162,13 @@ def main():
                     and item.get("provenance", {}).get("origin") == "manual"]
         if not accepted:
             raise AssertionError("Accept did not create a manual, reviewed annotation")
+        binding = accepted[0].get("review_binding") or {}
+        if (binding.get("actor_id") != "local-user"
+                or not str(binding.get("command_id", "")).startswith("cmd-")
+                or not isinstance(binding.get("task_revision"), int)
+                or not binding.get("content_sha256")
+                or not binding.get("reviewed_at")):
+            raise AssertionError("Accepted review is not bound to the acting user, content and command")
         check("Explicit accept upgrades the candidate to a manual reviewed annotation")
         before = len(store.get_task(target_id)["annotations"])
         page.locator("#vision-candidates tbody tr").first.get_by_role("button", name="拒绝").click()
