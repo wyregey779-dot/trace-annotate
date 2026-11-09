@@ -26,7 +26,7 @@ from ..extractors.actions import (ACTION_VOCAB, detect_translation_candidates,
                                   merge_candidates, provider_coverage)
 from ..extractors.camera_motion import analyse_motion
 from ..extractors.expressive_cues import acoustic_claim, measure_acoustic_window
-from ..extractors.scene_change import detect_content_changes
+from ..extractors.scene_change import detect_content_changes, minimum_samples
 from ..extractors.clip_engine import CLIPExtractor
 from ..extractors.faces import FaceExtractor
 from ..extractors.ocr import OCRExtractor
@@ -52,6 +52,9 @@ RESULT_KIND = "traceannotate.vision-candidate"
 DOMAIN = "playback_seconds"
 MAX_SCENES = 512
 MAX_KEYFRAMES = 512
+CONTENT_MIN_SAMPLES = minimum_samples()
+CONTENT_UNIFORM = 24
+CONTENT_MAX_FRAMES = 26
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 FRAME_QUALITY = 3
 CANDIDATE_LABEL_PREFIX = "镜头候选"
@@ -86,6 +89,9 @@ def _job_identity() -> Dict[str, Any]:
         "clip_multiclass_confidence": thresholds.clip_multiclass_confidence,
         "clip_entity_mismatch_cutoff": thresholds.clip_entity_mismatch_cutoff,
         "sampling": {"max_frames": MAX_KEYFRAMES, "boundary_radius": BOUNDARY_RADIUS},
+        "content_sampling": {"uniform": CONTENT_UNIFORM,
+                             "max_frames": CONTENT_MAX_FRAMES,
+                             "min_samples": CONTENT_MIN_SAMPLES},
     }
     return {"pipeline": "vision-assist-v1", "processor_version": VERSION,
             "config_sha256": S.sha256_text(config), "config": config,
@@ -692,8 +698,8 @@ class VisionJobs:
                                 self.store, job["media_snapshot"]["id"],
                                 window={"start": _seconds_ratio(float(scene["start"])),
                                         "end": _seconds_ratio(float(scene["end"]))},
-                                uniform=8, include_edges=True,
-                                budget=VS.SamplingBudget(max_frames=16,
+                                uniform=CONTENT_UNIFORM, include_edges=True,
+                                budget=VS.SamplingBudget(max_frames=CONTENT_MAX_FRAMES,
                                                          boundary_radius=0))
                             decoded_c = VS.decode_samples(
                                 self.store, job["media_snapshot"]["id"], plan_c,
@@ -709,25 +715,48 @@ class VisionJobs:
                                                 "seconds": float(S.rational_value(item["seconds"])),
                                                 "frame": _load_frame(Path(item["path"]))})
                             analysis = detect_content_changes(samples)
+                            indices = [int(item["frame_index"]) for item in decoded_c["decoded"]]
+                            max_gap = max((right - left for left, right
+                                           in zip(indices, indices[1:])), default=0)
+                            detail = {
+                                "status": analysis.get("status", "success"),
+                                "provided_samples": analysis.get("provided_samples", len(samples)),
+                                "required_samples": analysis.get("required_samples",
+                                                                  CONTENT_MIN_SAMPLES),
+                                "message": analysis.get("message"),
+                                "max_gap_frames": max_gap,
+                            }
                             for keyframe in keyframes:
                                 if keyframe["scene_index"] == scene_index:
-                                    keyframe["content_changes"] = analysis["changes"]
-                                    keyframe["content_filtered"] = analysis["filtered"]
-                                    break
+                                    keyframe["content_sampling"] = detail
+                                    if "content_changes" not in keyframe:
+                                        keyframe["content_changes"] = analysis["changes"]
+                                        keyframe["content_filtered"] = analysis["filtered"]
                             scene_results.append({
                                 "scene_index": scene_index,
                                 "planned": plan_c["planned"],
                                 "returned": len(decoded_c["decoded"]),
                                 "truncated": plan_c["truncated"],
+                                "status": detail["status"],
+                                "provided_samples": detail["provided_samples"],
+                                "required_samples": detail["required_samples"],
+                                "message": detail["message"],
+                                "max_gap_frames": max_gap,
                                 "changes": len(analysis["changes"]),
                                 "filtered": len(analysis["filtered"]),
                             })
+                        insufficient = [item for item in scene_results
+                                        if item["status"] == "insufficient_samples"]
                         content_sampling = {
-                            "status": "success",
+                            "status": "insufficient_samples" if insufficient else "success",
                             "scenes": len(scenes),
                             "planned": sum(item["planned"] for item in scene_results),
                             "returned": sum(item["returned"] for item in scene_results),
                             "truncated": any(item["truncated"] for item in scene_results),
+                            "required_samples": CONTENT_MIN_SAMPLES,
+                            "insufficient_scenes": len(insufficient),
+                            "max_gap_frames": max((item["max_gap_frames"]
+                                                     for item in scene_results), default=0),
                             "changes": sum(item["changes"] for item in scene_results),
                             "filtered": sum(item["filtered"] for item in scene_results),
                             "scene_results": scene_results,

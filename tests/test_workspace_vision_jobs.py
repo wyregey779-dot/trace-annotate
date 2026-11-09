@@ -52,6 +52,43 @@ def store(tmp_path, clip):
         project.close()
 
 
+@pytest.fixture(scope="module")
+def content_clip(tmp_path_factory):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for vision fixtures")
+    source = tmp_path_factory.mktemp("vision-content-source") / "content.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin",
+        "-f", "lavfi", "-i", "color=green:s=64x64:r=10:d=1.0",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True, timeout=60)
+    return source
+
+
+@pytest.fixture(scope="module")
+def eight_frame_clip(tmp_path_factory):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for vision fixtures")
+    source = tmp_path_factory.mktemp("vision-eight-source") / "eight.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin",
+        "-f", "lavfi", "-i", "color=blue:s=64x64:r=10:d=0.8",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True, timeout=60)
+    return source
+
+
+@pytest.fixture
+def content_store(tmp_path, content_clip):
+    project = WorkspaceStore(tmp_path / "content-workspace")
+    project.create()
+    try:
+        project.import_source(content_clip)
+        yield project
+    finally:
+        project.close()
+
+
 def task(store):
     return store.get_task(store.list_tasks()[0]["task_id"])
 
@@ -107,6 +144,13 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert result["module_status"]["actions"] in {"success", "not_run", "failed"}
     assert result["module_status"]["acoustics"] in {"success", "not_run", "failed"}
     assert result["module_status"]["boundary"] in {"success", "failed", "not_run"}
+    content = result["content_sampling"]
+    assert content["status"] == "insufficient_samples"
+    assert content["required_samples"] == 9
+    assert content["insufficient_scenes"] == len(content["scene_results"])
+    assert all(item["provided_samples"] < 9 for item in content["scene_results"])
+    assert all(item["message"] and "9" in item["message"]
+               for item in content["scene_results"])
     runs = result["model_runs"]
     assert len(runs) == 9
     assert {run["id"] for run in runs} == {V._module_run_id(queued["id"], name) for name in
@@ -122,6 +166,27 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert str(store.root) not in json.dumps(result)
     assert task(store) == initial
     assert jobs.close()["stopped"]
+
+
+def test_content_sampling_returns_at_least_nine_contiguous_frames_for_a_ten_frame_scene(
+        content_store):
+    jobs = V.VisionJobs(content_store,
+                        clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    queued = submit(jobs, command_id="vision-content")["jobs"][0]
+    assert jobs.run_pending()[0]["state"] == "succeeded"
+    result = jobs.result(queued["id"])
+    content = result["content_sampling"]
+    assert content["status"] == "success"
+    assert content["required_samples"] == 9
+    assert content["insufficient_scenes"] == 0
+    assert content["scene_results"]
+    assert all(item["provided_samples"] >= 9 for item in content["scene_results"])
+    assert all(item["max_gap_frames"] <= 1 for item in content["scene_results"])
+    assert result["keyframes"]
+    assert all(keyframe["content_sampling"]["provided_samples"] >= 9
+               for keyframe in result["keyframes"])
+    jobs.close()
 
 
 def test_job_status_is_read_only_and_reports_progress(store):
@@ -333,6 +398,74 @@ def test_close_stops_runner_and_cancels_active(store):
     assert report["stopped"] is True
 
 
+def test_http_vision_job_reports_eight_frames_need_nine(tmp_path, eight_frame_clip):
+    """The workbench vision route must state 8<9 instead of silently reporting none."""
+    import threading
+    import time
+    import urllib.request
+    from trace_annotate.workspace.server import TOKEN_HEADER, make_server
+
+    project = WorkspaceStore(tmp_path / "eight-workspace")
+    project.create()
+    server = None
+    thread = None
+    try:
+        project.import_source(eight_frame_clip)
+        current = task(project)
+        server = make_server(project)
+        server.vision_jobs.close(timeout=5)
+        server.vision_jobs = V.VisionJobs(project, queue=server.queue,
+                                          closing=server.closing,
+                                          clip_model_path="nonexistent-clip-weights",
+                                          vlm_model_path="nonexistent-vlm-weights")
+        server.vision_jobs.start()
+        thread = threading.Thread(target=server.serve_forever,
+                                  kwargs={"poll_interval": .01}, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        base = f"http://127.0.0.1:{port}/api/v1/projects/current/"
+        headers = {"Host": f"127.0.0.1:{port}", "Origin": f"http://127.0.0.1:{port}",
+                   TOKEN_HEADER: server.token}
+
+        def get(path):
+            request = urllib.request.Request(base + path, headers=headers)
+            with urllib.request.urlopen(request) as response:
+                return json.loads(response.read())
+
+        def post(path, body):
+            request = urllib.request.Request(
+                base + path, data=json.dumps(body).encode("utf-8"),
+                headers={**headers, "Content-Type": "application/json"})
+            with urllib.request.urlopen(request) as response:
+                return json.loads(response.read())
+
+        submission = {"command_id": "http-vision-eight", "expected_revision": current["revision"],
+                      "expected_sha256": current["content_sha256"], "window": None,
+                      "subject_annotation_id": None}
+        job_id = post(f"tasks/{current['id']}/vision-jobs", submission)["jobs"][0]["id"]
+        result = None
+        for _ in range(100):
+            try:
+                result = get(f"jobs/{job_id}/vision-result")
+                break
+            except Exception:
+                time.sleep(0.1)
+        assert result is not None
+        content = result["content_sampling"]
+        assert content["status"] == "insufficient_samples"
+        assert content["required_samples"] == 9
+        assert content["insufficient_scenes"] == len(content["scene_results"])
+        assert any(item["provided_samples"] == 8 for item in content["scene_results"])
+        first = next(item for item in content["scene_results"]
+                     if item["status"] == "insufficient_samples")
+        assert "9" in first["message"] and "8" in first["message"]
+    finally:
+        if server is not None:
+            server.shutdown()
+            if thread is not None:
+                thread.join(timeout=10)
+            server.server_close()
+        project.close()
 def test_http_vision_chain_submit_result_apply_status(store, clip):
     """Exercise the loopback HTTP vision routes end to end on a real import."""
     import threading

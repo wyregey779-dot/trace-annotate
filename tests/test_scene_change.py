@@ -74,6 +74,23 @@ def test_too_short_sequence_is_reported_as_empty():
     assert result["params"]["persistence"] == SC.PERSISTENCE
 
 
+def test_eight_samples_reports_the_required_nine_explicitly():
+    result = SC.detect_content_changes(_samples([_checker()] * 8))
+    assert result["changes"] == []
+    assert result["status"] == "insufficient_samples"
+    assert result["provided_samples"] == 8
+    assert result["required_samples"] == 9
+    assert "9" in result["message"]
+
+
+def test_nine_samples_still_detects_a_persistent_structural_change():
+    frames = [_checker()] * 4 + [_stripes()] * 5
+    result = SC.detect_content_changes(_samples(frames))
+    assert result["status"] == "success"
+    assert result["changes"]
+    assert result["changes"][0]["kind"] == "content_change"
+
+
 def test_changes_map_to_observable_claims():
     frames = [_checker()] * 6 + [_stripes()] * 12
     result = SC.detect_content_changes(_samples(frames))

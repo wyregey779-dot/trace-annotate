@@ -23,6 +23,7 @@ EDGE_BINS = 16
 CONTENT_THRESHOLD = 0.18
 LIGHTING_LUMA = 18.0
 PERSISTENCE = 4
+MINIMUM_SAMPLES = PERSISTENCE * 2 + 1
 
 CHANGE_KINDS = ("content_change", "lighting_change", "transient_change",
                 "camera_motion", "no_change")
@@ -73,12 +74,25 @@ def compare(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
             "luma_delta": abs(a["luma"] - b["luma"])}
 
 
+def minimum_samples(persistence: int = PERSISTENCE) -> int:
+    """Samples needed for one anchor plus two persistence windows."""
+    return persistence * 2 + 1
+
+
 def detect_content_changes(samples: Sequence[Dict[str, Any]], *,
                            threshold: float = CONTENT_THRESHOLD,
                            persistence: int = PERSISTENCE) -> Dict[str, Any]:
     """Return candidate content changes plus the negatives that were filtered."""
-    if len(samples) < persistence * 2 + 1:
-        return {"changes": [], "filtered": [], "params": _params(threshold, persistence)}
+    required = minimum_samples(persistence)
+    provided = len(samples)
+    if provided < required:
+        return {"changes": [], "filtered": [],
+                "params": _params(threshold, persistence),
+                "status": "insufficient_samples",
+                "provided_samples": provided,
+                "required_samples": required,
+                "message": (f"内容变化检测至少需要 {required} 个覆盖同一镜头的采样帧，"
+                            f"当前只有 {provided} 帧；未判定为无变化。")}
     track = [dict(features(sample), frame_index=str(sample["frame_index"]),
                   seconds=sample.get("seconds")) for sample in samples]
     changes: List[Dict[str, Any]] = []
@@ -142,7 +156,10 @@ def detect_content_changes(samples: Sequence[Dict[str, Any]], *,
                              "metrics": {key: round(value, 4) for key, value in immediate.items()}})
         index += 1
     return {"changes": changes, "filtered": filtered,
-            "params": _params(threshold, persistence)}
+            "params": _params(threshold, persistence),
+            "status": "success",
+            "provided_samples": provided,
+            "required_samples": required}
 
 
 def _locate_change(track: List[Dict[str, Any]], start: int, end: int,
