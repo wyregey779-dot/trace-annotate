@@ -8,11 +8,14 @@ review discipline with a real ffmpeg fixture so scene detection runs for real.
 from __future__ import annotations
 
 import json
+import copy
+import base64
 import shutil
 import subprocess
 import threading
 
 import pytest
+import numpy as np
 
 from trace_annotate.workspace import professional_store as PStore
 from trace_annotate.workspace import schema as S
@@ -89,6 +92,35 @@ def content_store(tmp_path, content_clip):
         project.close()
 
 
+@pytest.fixture(scope="module")
+def continuous_content_clip(tmp_path_factory):
+    """Controlled fixture: a textured panel enters one continuous shot, no cut.
+
+    This exercises real video decoding/detection, not natural-material T06
+    acceptance. The underlying scene is retained outside the moving panel.
+    """
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for vision fixtures")
+    source = tmp_path_factory.mktemp("vision-continuous-source") / "continuous.mp4"
+    y, x = np.indices((64, 64))
+    checker = np.where((x // 16 + y // 16) % 2 == 0, 200, 60).astype(np.uint8)
+    base = np.repeat(checker[..., None], 3, axis=2)
+    stripes = np.where((x // 2 % 2)[..., None] == 0,
+                       np.array([230, 180, 20]), np.array([40, 30, 10])).astype(np.uint8)
+    frames = []
+    for index in range(40):
+        frame = base.copy()
+        width = min(64, max(0, (index - 7) * 4))
+        frame[:, :width] = stripes[:, :width]
+        frames.append(frame.tobytes())
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", "64x64", "-r", "10", "-i", "pipe:0", "-an",
+        "-vf", "setsar=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], input=b"".join(frames), check=True, capture_output=True, timeout=60)
+    return source
+
+
 def task(store):
     return store.get_task(store.list_tasks()[0]["task_id"])
 
@@ -152,10 +184,18 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert all(item["message"] and "9" in item["message"]
                for item in content["scene_results"])
     runs = result["model_runs"]
-    assert len(runs) == 9
-    assert {run["id"] for run in runs} == {V._module_run_id(queued["id"], name) for name in
-                                           ("face", "ocr", "clip", "vlm", "scene", "motion",
-                                            "actions", "acoustics", "boundary")}
+    modules = {"face", "ocr", "clip", "vlm", "scene", "motion", "content",
+               "actions", "acoustics", "boundary"}
+    run_ids = {run["id"] for run in runs}
+    assert len(run_ids) == len(runs) == len(modules)
+    assert run_ids == {V._module_run_id(queued["id"], name) for name in modules}
+    assert all(claim["model_run_id"] is None or claim["model_run_id"] in run_ids
+               for annotation in V._candidate_annotations(result)
+               for claim in annotation["attributes"]["semantic"]["claims"])
+    content_run = next(run for run in runs if run["id"] == V._module_run_id(queued["id"], "content"))
+    assert (content_run["provider"], content_run["model_name"]) == ("trace-annotate", "scene-change-v1")
+    assert content_run["status"] == "failed"
+    assert "insufficient_samples" in content_run["failure_reason"]
     for run in runs:
         assert SS.validate_model_run(run) == run
     assert any(run["status"] == "not_run" and run["failure_reason"] for run in runs)
@@ -164,6 +204,8 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert all({"start", "end", "duration"} <= set(scene) for scene in result["scenes"])
     assert result["evidence"] and all(item["relative_path"].startswith("tmp/vision/jobs/") for item in result["evidence"])
     assert str(store.root) not in json.dumps(result)
+    assert len(S.canonical_json(result)) < V.MAX_RESULT_BYTES
+    assert len(result["content_frames"]) <= V.MAX_CONTENT_FRAMES
     assert task(store) == initial
     assert jobs.close()["stopped"]
 
@@ -346,6 +388,288 @@ def test_candidate_semantics_survive_professional_export_import(store, clip, tmp
             assert restored["provenance"]["origin"] == "imported"
     finally:
         destination.close()
+        jobs.close()
+
+
+def test_detected_content_candidate_evidence_review_and_roundtrip(tmp_path, continuous_content_clip):
+    """Real normal-entry pipeline on a controlled continuous-shot fixture."""
+    project = WorkspaceStore(tmp_path / "content-chain")
+    project.create()
+    jobs = None
+    destination = None
+    try:
+        admitted = project.import_source(continuous_content_clip)
+        task_id = admitted["task_id"]
+        jobs = V.VisionJobs(project, clip_model_path="nonexistent-clip-weights",
+                            vlm_model_path="nonexistent-vlm-weights")
+        queued = submit(jobs, command_id="continuous-content")["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        result = jobs.result(queued["id"])
+        assert len(result["scenes"]) == 1, "Controlled panel entry must not create a hard cut"
+        assert result["content_sampling"]["changes"] > 0
+        run = next(item for item in result["model_runs"]
+                   if item["id"] == V._module_run_id(queued["id"], "content"))
+        assert run["status"] == "success"
+        inputs = V._content_input(result["file_sha256"], result["window"],
+                                  result["content_sampling"], result["content_frames"])
+        assert run["input_sha256"] == S.sha256_text(inputs)
+        changed_inputs = copy.deepcopy(inputs)
+        changed_inputs["frames"][-1]["evidence_sha256"] = "0" * 64
+        assert S.sha256_text(changed_inputs) != run["input_sha256"]
+        assert len(S.canonical_json(result)) < V.MAX_RESULT_BYTES
+
+        # A new-contract artifact cannot shed its required provenance fields.
+        # Mapping a historical shape still discloses its missing provenance;
+        # the separate legacy-job test verifies its read/apply compatibility.
+        legacy = copy.deepcopy(result)
+        legacy.pop("content_frames")
+        legacy["model_runs"] = [item for item in legacy["model_runs"] if item["id"] != run["id"]]
+        fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(legacy, jobs.queue.get_job(queued["id"])))
+        missing_run = dict(result, model_runs=legacy["model_runs"])
+        fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(missing_run, jobs.queue.get_job(queued["id"])))
+        old_claim = next(claim for annotation in V._candidate_annotations(legacy)
+                         for claim in annotation["attributes"]["semantic"]["claims"]
+                         if claim["method"]["id"] == "scene-change-v1")
+        assert old_claim["model_run_id"] is None
+        assert old_claim["method"]["parameters"]["sample_frames"] == []
+        assert "旧候选" in old_claim["uncertainty_reason"]
+        invalid = copy.deepcopy(result)
+        invalid["content_frames"][0]["evidence_sha256"] = "0" * 64
+        fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(invalid, jobs.queue.get_job(queued["id"])))
+        invalid_time = copy.deepcopy(result)
+        invalid_time["content_frames"][0]["seconds"] = S.rational(1)
+        fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(invalid_time, jobs.queue.get_job(queued["id"])))
+        excessive = dict(result, content_frames=[result["content_frames"][0]] * (V.MAX_CONTENT_FRAMES + 1))
+        fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(excessive, jobs.queue.get_job(queued["id"])))
+
+        current = project.get_task(task_id)
+        jobs.apply(queued["id"], command_id="apply-content", expected_revision=current["revision"],
+                   expected_sha256=current["content_sha256"], request_body=b"{}")
+        after = project.get_task(task_id)
+        annotation = next(item for item in after["annotations"] if "vision-content-change" in item["tags"])
+        claims = [claim for claim in annotation["attributes"]["semantic"]["claims"]
+                  if claim["method"]["id"] == "scene-change-v1"]
+        frame_map = {item["frame_index"]: item for item in result["content_frames"]}
+        for claim in claims:
+            params = claim["method"]["parameters"]
+            assert claim["model_run_id"] == run["id"]
+            assert claim["time_window"] == {
+                "start": {"seconds": frame_map[params["start_frame"]]["seconds"]},
+                "end": {"seconds": frame_map[params["end_frame"]]["seconds"]}}
+            assert claim["time_window"] != {"start": annotation["start"], "end": annotation["end"]}
+            assert len(params["sample_frames"]) == 3
+            assert int(params["sample_frames"][0]["frame_index"]) < int(params["start_frame"])
+            assert len(claim["evidence_ids"]) >= 2
+            assert set(claim["evidence_ids"]) <= set(annotation["evidence_ids"])
+            assert all(sample["evidence_sha256"] == frame_map[sample["frame_index"]]["evidence_sha256"]
+                       for sample in params["sample_frames"])
+        assert annotation["review_status"] == "unreviewed"
+        fail_code("SCHEMA_INVALID", lambda: project.apply_task_command(
+            command_id="refuse-model-review", task_id=task_id, expected_revision=after["revision"],
+            expected_sha256=after["content_sha256"], operation="review_annotation",
+            payload={"annotation_id": annotation["id"], "reviewed": True}, request_body=b"{}"))
+        jobs.close()
+        jobs = None
+        project.close()
+        project.open()
+        reopened = project.get_task(task_id)
+        assert reopened == after
+
+        project.apply_task_command(
+            command_id="content-human-edit", task_id=task_id, expected_revision=reopened["revision"],
+            expected_sha256=reopened["content_sha256"], operation="update_annotation",
+            payload={"annotation_id": annotation["id"], "changes": {
+                "label": "受控测试人工复核流程",
+                "provenance": {"origin": "manual", "actor_id": "local-user", "job_id": None}}},
+            request_body=b"{}")
+        edited = project.get_task(task_id)
+        project.apply_task_command(
+            command_id="content-human-review", task_id=task_id, expected_revision=edited["revision"],
+            expected_sha256=edited["content_sha256"], operation="review_annotation",
+            payload={"annotation_id": annotation["id"], "reviewed": True}, request_body=b"{}")
+        reviewed = project.get_task(task_id)
+        source_annotation = next(item for item in reviewed["annotations"] if item["id"] == annotation["id"])
+        assert source_annotation["review_status"] == "reviewed"
+        assert source_annotation["attributes"] == annotation["attributes"]
+        document = json.loads(PStore.export_professional(project, task_id)["data"])
+        evidence_ids = {ref for claim in claims for ref in claim["evidence_ids"]}
+        exported = {item["id"]: item for item in document["artifacts"]}
+        assert evidence_ids <= exported.keys()
+        for reference in evidence_ids:
+            artifact = exported[reference]
+            assert S.sha256_bytes(base64.b64decode(artifact["data_base64"])) == artifact["sha256"]
+
+        destination = WorkspaceStore(tmp_path / "content-import")
+        destination.create()
+        target_id = destination.import_source(continuous_content_clip)["task_id"]
+        target = destination.get_task(target_id)
+        PStore.apply_import(destination, target_id, command_id="import-content",
+                            expected_revision=target["revision"], expected_sha256=target["content_sha256"],
+                            document=document, request_body=b"{}")
+        destination.close()
+        destination.open()
+        imported = destination.get_task(target_id)
+        restored = next(item for item in imported["annotations"] if item["legacy_id"] == annotation["id"])
+        assert restored["review_status"] == "unreviewed"
+        assert restored["attributes"] == source_annotation["attributes"]
+        assert restored["evidence_ids"] == source_annotation["evidence_ids"]
+        assert run in imported["extensions"]["professional"]["model_runs"]
+        reexported = json.loads(PStore.export_professional(destination, target_id)["data"])
+        assert evidence_ids <= {item["id"] for item in reexported["artifacts"]}
+    finally:
+        if jobs is not None:
+            jobs.close()
+        if destination is not None:
+            destination.close()
+        project.close()
+
+
+def test_content_evidence_does_not_borrow_another_decode_of_the_same_frame(tmp_path):
+    from PIL import Image
+
+    project = WorkspaceStore(tmp_path / "same-frame-evidence")
+    project.create()
+    try:
+        sources = []
+        for name, color in (("keyframe", "red"), ("content", "blue")):
+            path = project.tmp_dir / (name + ".png")
+            Image.new("RGB", (16, 16), color).save(path)
+            sources.append({"relative_path": path.relative_to(project.root).as_posix(),
+                            "sha256": V.stream_sha256(path), "size_bytes": str(path.stat().st_size)})
+        keyframe = {"scene_index": 0, "frame_index": "4", "evidence_sha256": sources[0]["sha256"]}
+        content = {"scene_index": 0, "frame_index": "4", "evidence_sha256": sources[1]["sha256"]}
+        candidate = {"keyframes": [keyframe], "content_frames": [content],
+                     "boundary_frames": [], "evidence": sources}
+        annotation = {"id": "ann-same-frame", "evidence_ids": [], "attributes": {"semantic": {"claims": [
+            {"method": {"id": "keyframe-sampling-local", "parameters": {"frame_index": "4"}},
+             "evidence_ids": []},
+            {"method": {"id": "scene-change-v1", "parameters": {"sample_frames": [content]}},
+             "evidence_ids": []},
+        ]}}}
+        attached = copy.deepcopy(annotation)
+        V._attach_candidate_evidence(project, candidate, [attached])
+        ordinary, change = attached["attributes"]["semantic"]["claims"]
+        assert ordinary["evidence_ids"] and change["evidence_ids"]
+        assert ordinary["evidence_ids"] != change["evidence_ids"]
+        assert set(attached["evidence_ids"]) == set(ordinary["evidence_ids"] + change["evidence_ids"])
+        missing_content = dict(candidate, evidence=sources[:1])
+        fail_code("VISION_EVIDENCE_UNAVAILABLE", lambda: V._attach_candidate_evidence(
+            project, missing_content, [copy.deepcopy(annotation)]))
+        # A descriptor for the content bytes pointing at the other file must
+        # also fail its real byte/hash check, even though a keyframe is present.
+        wrong_file = {**sources[1], "relative_path": sources[0]["relative_path"]}
+        changed_content = dict(candidate, evidence=[sources[0], wrong_file])
+        fail_code("VISION_EVIDENCE_UNAVAILABLE", lambda: V._attach_candidate_evidence(
+            project, changed_content, [copy.deepcopy(annotation)]))
+    finally:
+        project.close()
+
+
+def test_content_sampling_and_claims_stay_inside_requested_middle_window(tmp_path, continuous_content_clip):
+    padded = tmp_path / "long-continuous.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin", "-i", str(continuous_content_clip),
+        "-vf", "tpad=start_duration=4:stop_duration=4:start_mode=clone:stop_mode=clone",
+        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(padded),
+    ], check=True, capture_output=True, timeout=60)
+    project = WorkspaceStore(tmp_path / "middle-window")
+    project.create()
+    jobs = None
+    try:
+        project.import_source(padded)
+        jobs = V.VisionJobs(project, clip_model_path="nonexistent-clip-weights",
+                            vlm_model_path="nonexistent-vlm-weights")
+        window = {"start": S.rational(4.25), "end": S.rational(7.75)}
+        queued = submit(jobs, command_id="content-middle", window=window)["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        result = jobs.result(queued["id"])
+        assert len(result["scenes"]) == 1 and result["scenes"][0]["duration"] == 12
+        assert result["content_sampling"]["scene_results"][0]["window"] == window
+        left, right = S.rational_value(window["start"]), S.rational_value(window["end"])
+        assert result["content_frames"]
+        assert all(left <= S.rational_value(frame["seconds"]) < right for frame in result["content_frames"])
+        claims = [claim for annotation in V._candidate_annotations(result)
+                  for claim in annotation["attributes"]["semantic"]["claims"]
+                  if claim["method"]["id"] == "scene-change-v1"]
+        assert claims, "Middle-window fixture must produce a real content candidate"
+        for claim in claims:
+            assert left <= S.rational_value(claim["time_window"]["start"]["seconds"])
+            assert S.rational_value(claim["time_window"]["end"]["seconds"]) < right
+            assert all(left <= S.rational_value(frame["seconds"]) < right
+                       for frame in claim["method"]["parameters"]["sample_frames"])
+        # Even an internally rehashed descriptor cannot claim a right-edge
+        # (excluded) sample belongs to this half-open request.
+        invalid = copy.deepcopy(result)
+        invalid["content_frames"][-1]["seconds"] = window["end"]
+        run = next(item for item in invalid["model_runs"] if item["id"] == V._module_run_id(queued["id"], "content"))
+        run["input_sha256"] = S.sha256_text(V._content_input(
+            invalid["file_sha256"], window, invalid["content_sampling"], invalid["content_frames"]))
+        fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(invalid, jobs.queue.get_job(queued["id"])))
+    finally:
+        if jobs is not None:
+            jobs.close()
+        project.close()
+
+
+def test_content_contract_invalidates_reuse_but_reads_and_applies_legacy_candidate(store, monkeypatch):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        current = task(store)
+        legacy_parameters = dict(V._parameters(),
+                                 job_identity=V._job_identity(content_evidence_contract=None))
+        old = jobs.queue.create_batch(
+            [{"task_id": current["id"], "expected_revision": current["revision"],
+              "expected_sha256": current["content_sha256"]}],
+            operation=V.OPERATION, processor_version=V.VERSION,
+            parameters=legacy_parameters, command_id="legacy-content-contract")["jobs"][0]
+        processor = jobs._processor
+
+        def old_shape(job, context):
+            # Execute real detection, then serialize the pre-evidence artifact
+            # shape. No detection outputs or successful job state are invented.
+            result = processor(job, context)
+            result.pop("content_frames")
+            result["model_runs"] = [run for run in result["model_runs"]
+                                    if run["id"] != V._module_run_id(job["id"], "content")]
+            return result
+
+        with monkeypatch.context() as patch:
+            # Simulate the old installed identity while producing the old
+            # artifact fixture. The current worker below must reject old jobs.
+            identity = V._job_identity
+            patch.setattr(V, "_job_identity", lambda **kwargs: identity(content_evidence_contract=None))
+            patch.setattr(jobs, "_processor", old_shape)
+            assert jobs.run_pending()[0]["state"] == "succeeded"
+        legacy_result = jobs.result(old["id"])
+        assert "content_frames" not in legacy_result
+        pending_parameters = dict(legacy_parameters, window={"start": S.rational(.1), "end": S.rational(.9)})
+        pending = jobs.queue.create_batch(
+            [{"task_id": current["id"], "expected_revision": current["revision"],
+              "expected_sha256": current["content_sha256"]}],
+            operation=V.OPERATION, processor_version=V.VERSION,
+            parameters=pending_parameters, command_id="legacy-queued-content")
+        rejected = jobs.run_pending(batch_id=pending["id"])[0]
+        assert rejected["state"] == "failed"
+        assert rejected["error_code"] == "VISION_RESUBMIT_REQUIRED"
+        assert "resubmit" in rejected["error_message"]
+        fresh = submit(jobs, command_id="new-content-contract")["jobs"][0]
+        assert fresh["id"] != old["id"]
+        assert fresh["input_revision"] == old["input_revision"]
+        assert fresh["state"] == "queued"
+        assert fresh["parameters"]["job_identity"]["config"]["content_sampling"]["evidence_contract"] == V.CONTENT_EVIDENCE_CONTRACT
+        fail_code("VISION_NOT_READY", lambda: jobs.result(fresh["id"]))
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        assert jobs.result(fresh["id"])["content_frames"]
+        assert jobs.result(old["id"]) == legacy_result
+        # Preserve the legacy immutable artifact's normal apply path as well.
+        jobs.apply(old["id"], command_id="apply-legacy-content", expected_revision=current["revision"],
+                   expected_sha256=current["content_sha256"], request_body=b"{}")
+        assert all(item["review_status"] == "unreviewed" for item in task(store)["annotations"])
+        altered = copy.deepcopy(fresh)
+        altered["parameters"]["job_identity"]["config"]["content_sampling"]["evidence_contract"] = "unknown"
+        fail_code("SCHEMA_INVALID", lambda: V._validate_job(altered))
+    finally:
         jobs.close()
 
 

@@ -55,6 +55,8 @@ MAX_KEYFRAMES = 512
 CONTENT_MIN_SAMPLES = minimum_samples()
 CONTENT_UNIFORM = 24
 CONTENT_MAX_FRAMES = 26
+MAX_CONTENT_FRAMES = MAX_SCENES * CONTENT_MAX_FRAMES
+CONTENT_EVIDENCE_CONTRACT = "decoded-content-v1"
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 FRAME_QUALITY = 3
 CANDIDATE_LABEL_PREFIX = "镜头候选"
@@ -75,7 +77,7 @@ def _finite(value: Any, name: str, *, positive: bool = False) -> float:
     return result
 
 
-def _job_identity() -> Dict[str, Any]:
+def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE_CONTRACT) -> Dict[str, Any]:
     thresholds = MetricThresholds()
     config = {
         "scene_threshold": thresholds.scene_threshold,
@@ -93,6 +95,8 @@ def _job_identity() -> Dict[str, Any]:
                              "max_frames": CONTENT_MAX_FRAMES,
                              "min_samples": CONTENT_MIN_SAMPLES},
     }
+    if content_evidence_contract is not None:
+        config["content_sampling"]["evidence_contract"] = content_evidence_contract
     return {"pipeline": "vision-assist-v1", "processor_version": VERSION,
             "config_sha256": S.sha256_text(config), "config": config,
             "model_identity": "declared_at_run_not_at_config_query",
@@ -120,8 +124,13 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     parameters = job["parameters"]
     if (not isinstance(parameters, dict)
             or set(parameters) != {"window", "subject_annotation_id", "time_domain", "job_identity"}
-            or parameters["time_domain"] != DOMAIN
-            or parameters != _parameters(parameters["window"], parameters["subject_annotation_id"])):
+            or parameters["time_domain"] != DOMAIN):
+        raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
+    current = _parameters(parameters["window"], parameters["subject_annotation_id"])
+    # Read/apply the exact pre-evidence (6e52961) contract without accepting
+    # arbitrary frozen configurations. New submissions always use current.
+    legacy = dict(current, job_identity=_job_identity(content_evidence_contract=None))
+    if parameters != current and parameters != legacy:
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
     media, task = job["media_snapshot"], job["task_snapshot"]
     spec = {key: job[key] for key in ("task_id", "operation", "input_revision", "input_sha256", "processor_version", "parameters")}
@@ -569,6 +578,9 @@ class VisionJobs:
 
     def _processor(self, job: Dict[str, Any], context: Any) -> Dict[str, Any]:
         parameters = _validate_job(job)
+        if parameters["job_identity"] != _job_identity():
+            raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
+                                 "Legacy vision configuration is read/apply-only; resubmit a new vision job")
         self._validate_snapshot(job)
         stop = threading.Event()
         lost = threading.Event()
@@ -690,14 +702,20 @@ class VisionJobs:
                             break
                 content_sampling: Dict[str, Any] = {
                     "status": "not_run", "reason": "scene_extraction_not_run"}
+                content_frames: List[Dict[str, Any]] = []
                 if sampling is not None:
                     try:
                         scene_results = []
                         for scene_index, scene in enumerate(scenes):
+                            content_start = S.rational_value(_seconds_ratio(float(scene["start"])))
+                            content_end = S.rational_value(_seconds_ratio(float(scene["end"])))
+                            if window is not None:
+                                content_start = max(content_start, S.rational_value(window["start"]))
+                                content_end = min(content_end, S.rational_value(window["end"]))
+                            content_window = {"start": S.rational(content_start), "end": S.rational(content_end)}
                             plan_c = VS.plan_samples(
                                 self.store, job["media_snapshot"]["id"],
-                                window={"start": _seconds_ratio(float(scene["start"])),
-                                        "end": _seconds_ratio(float(scene["end"]))},
+                                window=content_window,
                                 uniform=CONTENT_UNIFORM, include_edges=True,
                                 budget=VS.SamplingBudget(max_frames=CONTENT_MAX_FRAMES,
                                                          boundary_radius=0))
@@ -714,6 +732,14 @@ class VisionJobs:
                                 samples.append({"frame_index": item["frame_index"],
                                                 "seconds": float(S.rational_value(item["seconds"])),
                                                 "frame": _load_frame(Path(item["path"]))})
+                                content_frames.append({
+                                    "scene_index": scene_index,
+                                    "frame_index": item["frame_index"],
+                                    "seconds": item["seconds"],
+                                    "source_pts": item["source_pts"],
+                                    "proxy_pts": item["proxy_pts"],
+                                    "evidence_sha256": item["sha256"],
+                                })
                             analysis = detect_content_changes(samples)
                             indices = [int(item["frame_index"]) for item in decoded_c["decoded"]]
                             max_gap = max((right - left for left, right
@@ -734,6 +760,10 @@ class VisionJobs:
                                         keyframe["content_filtered"] = analysis["filtered"]
                             scene_results.append({
                                 "scene_index": scene_index,
+                                "window": content_window,
+                                "frame_map_sha256": plan_c["frame_map_sha256"],
+                                "fingerprint": VS.samples_fingerprint(plan_c),
+                                "params": analysis["params"],
                                 "planned": plan_c["planned"],
                                 "returned": len(decoded_c["decoded"]),
                                 "truncated": plan_c["truncated"],
@@ -900,6 +930,7 @@ class VisionJobs:
                     "transition": ("success" if any(frame.get("boundary_events") for frame in keyframes)
                                    else boundary_sampling.get("status", "not_run")),
                     "actions": actions_sampling.get("status", "not_run"),
+                    "content": content_sampling.get("status", "not_run"),
                     "expressive": "not_run",
                     "acoustics": acoustics_sampling.get("status", "not_run"),
                 })
@@ -913,7 +944,8 @@ class VisionJobs:
                 model_runs = _build_model_runs(
                     job, extractors, keyframes, scene_result,
                     boundary_sampling, boundary_frames, module_status,
-                    digest, window, actions_sampling, acoustics_sampling)
+                    digest, window, actions_sampling, acoustics_sampling,
+                    content_sampling, content_frames)
                 evidence = []
                 for path in sorted(work.rglob("*")):
                     if cancelled():
@@ -935,6 +967,7 @@ class VisionJobs:
                     "scenes": scenes, "keyframes": keyframes, "sampling": sampling,
                     "boundary_frames": boundary_frames, "boundary_sampling": boundary_sampling,
                     "content_sampling": content_sampling,
+                    "content_frames": content_frames,
                     "actions_sampling": _jsonable(actions_sampling),
                     "acoustics_sampling": _jsonable(acoustics_sampling),
                     "extractor_status": extractor_status, "module_status": module_status,
@@ -1043,7 +1076,7 @@ class VisionJobs:
                                  "model_runs", "evidence", "boundary_frames", "boundary_sampling"}
         expected = expected | {"content_sampling", "actions_sampling", "acoustics_sampling"}
         if (not isinstance(value, dict) or not expected <= set(value)
-                or set(value) - expected - {"sampling"}
+                or set(value) - expected - {"sampling", "content_frames"}
                 or any(value[key] != item for key, item in fixed.items())
                 or value["window"] != parameters["window"]
                 or value["job_identity"] != parameters["job_identity"]
@@ -1087,6 +1120,43 @@ class VisionJobs:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary frame descriptor is invalid")
         if value["boundary_sampling"] is not None and not isinstance(value["boundary_sampling"], dict):
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary sampling descriptor is inconsistent")
+        # Optional for immutable candidates produced before content provenance
+        # was recorded. New candidates always carry the decoded frame identity.
+        content_frames = value.get("content_frames", [])
+        requires_content = (parameters["job_identity"]["config"]["content_sampling"].get("evidence_contract")
+                            == CONTENT_EVIDENCE_CONTRACT)
+        if requires_content and "content_frames" not in value:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Current vision contract requires decoded content frames")
+        if not isinstance(content_frames, list) or len(content_frames) > MAX_CONTENT_FRAMES:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision content frame list is inconsistent")
+        content_keys = set()
+        for frame in content_frames:
+            if (not isinstance(frame, dict)
+                    or set(frame) != {"scene_index", "frame_index", "seconds", "source_pts",
+                                      "proxy_pts", "evidence_sha256"}
+                    or type(frame["scene_index"]) is not int
+                    or not 0 <= frame["scene_index"] < len(value["scenes"])
+                    or not isinstance(frame["frame_index"], str) or not frame["frame_index"].isdigit()
+                    or not isinstance(frame["evidence_sha256"], str)
+                    or S.HASH_RE.fullmatch(frame["evidence_sha256"]) is None):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision content frame descriptor is invalid")
+            try:
+                if S.rational(frame["seconds"]) != frame["seconds"] or S.rational_value(frame["seconds"]) < 0:
+                    raise ValueError("invalid frame time")
+                seconds = S.rational_value(frame["seconds"])
+                scene = value["scenes"][frame["scene_index"]]
+                if not (S.rational_value(_seconds_ratio(scene["start"])) <= seconds
+                        < S.rational_value(_seconds_ratio(scene["end"]))):
+                    raise ValueError("content sample outside its scene")
+                if value["window"] is not None and not (S.rational_value(value["window"]["start"]) <= seconds
+                                                        < S.rational_value(value["window"]["end"])):
+                    raise ValueError("content sample outside requested window")
+            except (TypeError, ValueError, WorkspaceError) as exc:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision content frame time is invalid") from exc
+            identity = (frame["scene_index"], frame["frame_index"])
+            if identity in content_keys:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision content frame identities are duplicated")
+            content_keys.add(identity)
         model_runs = value["model_runs"]
         if not isinstance(model_runs, list) or len(model_runs) > SS.MAX_MODEL_RUNS:
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision model-run list is inconsistent")
@@ -1096,6 +1166,15 @@ class VisionJobs:
             if checked["id"] in run_ids:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision model-run identities are duplicated")
             run_ids.add(checked["id"])
+        content_run = next((run for run in model_runs
+                            if run["id"] == _module_run_id(job["id"], "content")), None)
+        if requires_content and content_run is None:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Current vision contract requires a content model run")
+        if content_run is not None:
+            if ("content_frames" not in value or not isinstance(value["content_sampling"], dict)
+                    or content_run["input_sha256"] != S.sha256_text(_content_input(
+                        value["file_sha256"], value["window"], value["content_sampling"], content_frames))):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision content input fingerprint is inconsistent")
         prefix = f"tmp/vision/jobs/{job['id']}/{job['attempt']}-{job['lease_generation']}/"
         paths = set()
         for evidence in value["evidence"]:
@@ -1110,6 +1189,9 @@ class VisionJobs:
                     or not isinstance(evidence["size_bytes"], str) or not evidence["size_bytes"].isdigit()):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence path or identity is invalid")
             paths.add(path)
+        evidence_hashes = {item["sha256"] for item in value["evidence"]}
+        if any(frame["evidence_sha256"] not in evidence_hashes for frame in content_frames):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision content frame has no registered sample")
         return value
 
     def _validate_snapshot(self, job: Dict[str, Any]) -> None:
@@ -1355,6 +1437,17 @@ def _frame_output(keyframes: List[Dict[str, Any]], module: str) -> Dict[str, Any
                        for frame in keyframes]} 
 
 
+def _content_input(digest: str, window: Optional[Dict[str, Any]],
+                   sampling: Dict[str, Any], frames: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Fingerprint actual decoded inputs, independently of general keyframes."""
+    return {"basis": "decoded_content_samples", "file_sha256": digest,
+            "window": window, "time_domain": DOMAIN,
+            "scenes": [{key: scene.get(key) for key in
+                        ("scene_index", "window", "frame_map_sha256", "fingerprint", "params")}
+                       for scene in sampling.get("scene_results", [])],
+            "frames": frames}
+
+
 def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
                       keyframes: List[Dict[str, Any]], scene_result: Dict[str, Any],
                       boundary_sampling: Optional[Dict[str, Any]],
@@ -1362,7 +1455,9 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
                       module_status: Dict[str, Any], digest: str,
                       window: Optional[Dict[str, Any]],
                       actions_sampling: Optional[Dict[str, Any]] = None,
-                      acoustics_sampling: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                      acoustics_sampling: Optional[Dict[str, Any]] = None,
+                      content_sampling: Optional[Dict[str, Any]] = None,
+                      content_frames: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """Record one real run per executed module, including honest non-success.
 
     Weights are hashed only when a local file exists. A failed or not-run
@@ -1497,6 +1592,26 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         code_version=f"vision_jobs={VERSION}; camera_motion=1",
         score_kind="rule_score"))
 
+    content = content_sampling or {"status": "not_run", "reason": "content_sampling_not_recorded"}
+    runs.append(_model_run_record(
+        job_id, "content", provider="trace-annotate", model_name="scene-change-v1",
+        model_version="1", weights_sha256=None, license="Project source",
+        preprocessing={"input": "per-scene decoded content samples", "time_domain": DOMAIN,
+                       "sampling": {"uniform": CONTENT_UNIFORM, "max_frames": CONTENT_MAX_FRAMES}},
+        parameters=detect_content_changes([])["params"],
+        input_value=_content_input(digest, window, content, content_frames or []),
+        output_value={"sampling": content,
+                      "changes": [{"scene_index": frame["scene_index"],
+                                   "changes": frame.get("content_changes", []),
+                                   "filtered": frame.get("content_filtered", [])}
+                                  for frame in keyframes if "content_changes" in frame]},
+        status=content.get("status", "not_run"),
+        failure_reason=content.get("reason") or content.get("message") or content.get("error")
+        or (f"insufficient_samples: {content.get('insufficient_scenes', 0)} scenes need "
+            f"{content.get('required_samples', CONTENT_MIN_SAMPLES)} samples"
+            if content.get("status") == "insufficient_samples" else None),
+        code_version=f"vision_jobs={VERSION}; scene_change=1", score_kind="rule_score"))
+
     runs.append(_model_run_record(
         job_id, "actions", provider="trace-annotate", model_name="subject-translation-v1",
         model_version="1", weights_sha256=None, license="Project source",
@@ -1576,7 +1691,7 @@ def _evidence_preview(source: Path) -> Path:
     """
     from PIL import Image
 
-    handle, name = tempfile.mkstemp(prefix="vision-sample-", suffix=".jpg")
+    handle, name = tempfile.mkstemp(prefix="vision-sample-", suffix=".jpg", dir=source.parent)
     os.close(handle)
     try:
         with Image.open(source) as image:
@@ -1605,13 +1720,15 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
     samples = {item["sha256"]: item for item in candidate.get("evidence") or []}
     keyframes = candidate.get("keyframes") or []
     boundary_frames = candidate.get("boundary_frames") or []
-    frames = list(keyframes) + list(boundary_frames)
+    content_frames = candidate.get("content_frames") or []
+    frames = list(keyframes) + list(boundary_frames) + list(content_frames)
     for index, annotation in enumerate(annotations):
         scene_frames = [frame for frame in frames if frame.get("scene_index") == index]
         transition_frames = [frame for frame in boundary_frames
                              if frame.get("scene_index") == index]
         evidence_ids: List[str] = []
         frame_artifacts: Dict[str, str] = {}
+        sample_artifacts: Dict[Tuple[str, str], str] = {}
         # One representative sampled keyframe per candidate keeps the portable
         # professional document inside its byte budget while still grounding the
         # keyframe claim in a real immutable PNG. A camera-motion claim needs both
@@ -1641,6 +1758,21 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                                   if str(frame.get("frame_index")) == wanted), None)
                     if match is not None and match not in selected:
                         selected.append(match)
+        for claim in annotation["attributes"]["semantic"]["claims"]:
+            if claim["method"]["id"] != "scene-change-v1":
+                continue
+            for sample in claim["method"]["parameters"].get("sample_frames", []):
+                match = next((frame for frame in content_frames
+                              if frame["scene_index"] == index
+                              and frame["frame_index"] == sample["frame_index"]
+                              and frame["evidence_sha256"] == sample["evidence_sha256"]), None)
+                if match is None:
+                    raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
+                                         "Content change has no matching decoded content sample")
+                if not any(str(frame["frame_index"]) == str(match["frame_index"])
+                           and frame["evidence_sha256"] == match["evidence_sha256"]
+                           for frame in selected):
+                    selected.append(match)
         for frame in selected:
             digest = frame.get("evidence_sha256")
             descriptor = samples.get(digest)
@@ -1663,8 +1795,13 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                     pass
             store.bind_artifact_reference(artifact, owner_kind="evidence",
                 owner_id=annotation["id"], role="vision-sample-preview", owner_revision="0")
-            evidence_ids.append(artifact["id"])
-            frame_artifacts[str(frame["frame_index"])] = artifact["id"]
+            if artifact["id"] not in evidence_ids:
+                evidence_ids.append(artifact["id"])
+            # General keyframe claims retain their own first-selected sample.
+            # A content/boundary decode of the same index can have different
+            # bytes and must be verified and referenced independently.
+            frame_artifacts.setdefault(str(frame["frame_index"]), artifact["id"])
+            sample_artifacts[(str(frame["frame_index"]), digest)] = artifact["id"]
         acoustic_claims = [claim for claim in annotation["attributes"]["semantic"]["claims"]
                            if claim["method"]["id"] == "acoustic-window-v1"]
         if acoustic_claims:
@@ -1699,7 +1836,10 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                     value = claim["method"]["parameters"].get(key)
                     if value is None:
                         continue
-                    artifact = frame_artifacts.get(str(value))
+                    frame = next((item for item in transition_frames
+                                  if str(item["frame_index"]) == str(value)), None)
+                    artifact = (sample_artifacts.get((str(value), frame["evidence_sha256"]))
+                                if frame is not None else None)
                     if artifact and artifact not in ids:
                         ids.append(artifact)
                 if ids:
@@ -1708,20 +1848,41 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                 frame_index = str(claim["method"]["parameters"]["frame_index"])
                 if frame_index in frame_artifacts:
                     claim["evidence_ids"] = [frame_artifacts[frame_index]]
+            elif claim["method"]["id"] == "scene-change-v1":
+                claim["evidence_ids"] = list(dict.fromkeys(
+                    sample_artifacts[(sample["frame_index"], sample["evidence_sha256"])]
+                    for sample in claim["method"]["parameters"].get("sample_frames", [])))
 
 
 def _frame_seconds(candidate: Dict[str, Any], frame_index: Any) -> Optional[float]:
     if frame_index is None:
         return None
-    frames = list(candidate.get("boundary_frames") or []) + list(candidate.get("keyframes") or [])
+    frames = (list(candidate.get("content_frames") or [])
+              + list(candidate.get("boundary_frames") or []) + list(candidate.get("keyframes") or []))
     for frame in frames:
         if str(frame.get("frame_index")) == str(frame_index):
             value = frame.get("seconds", frame.get("timestamp"))
             try:
-                return float(value)
+                return float(S.rational_value(value)) if isinstance(value, dict) else float(value)
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _content_change_context(candidate: Dict[str, Any], scene_index: int,
+                            change: Dict[str, Any], fallback: Dict[str, Any]):
+    """Use the decoded content timeline, never a nominal-FPS reconstruction."""
+    frames = sorted((frame for frame in candidate.get("content_frames", [])
+                     if frame["scene_index"] == scene_index), key=lambda frame: int(frame["frame_index"]))
+    start = next((frame for frame in frames if frame["frame_index"] == str(change.get("start_frame"))), None)
+    end = next((frame for frame in frames if frame["frame_index"] == str(change.get("end_frame"))), None)
+    if start is None or end is None or S.rational_value(start["seconds"]) >= S.rational_value(end["seconds"]):
+        return fallback, [], False
+    before = [frame for frame in frames if int(frame["frame_index"]) < int(start["frame_index"])]
+    selected = ([before[-1]] if before else []) + [start, end]
+    samples = [{key: frame[key] for key in ("frame_index", "seconds", "evidence_sha256")}
+               for frame in selected]
+    return ({"start": {"seconds": start["seconds"]}, "end": {"seconds": end["seconds"]}}, samples, True)
 
 
 def _event_time_window(candidate: Dict[str, Any], event: Dict[str, Any],
@@ -1867,6 +2028,10 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                     else "相邻抽样帧分类不一致，需人工复核"),
             })
         for change in keyframe.get("content_changes") or []:
+            content_window, sample_frames, exact = _content_change_context(candidate, index, change, window)
+            content_run = _module_run_id(job_id, "content")
+            if not any(run.get("id") == content_run for run in candidate.get("model_runs", [])):
+                content_run = None
             claims.append({
                 "id": S.make_id("clm", f"{job_id}:{index}:content:{change.get('start_frame')}"),
                 "claim_type": "observable",
@@ -1874,19 +2039,21 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                               f"#{change.get('end_frame')} 帧出现持续画面内容变化"
                               "（边缘结构与色度同时改变，且新状态在后续抽样帧保持；需人工复核）。"),
                 "subject_ref": None,
-                "time_window": window,
+                "time_window": content_window,
                 "evidence_ids": [],
                 "method": {"id": "scene-change-v1", "version": "1",
                            "parameters": {"start_frame": change.get("start_frame"),
                                           "end_frame": change.get("end_frame"),
+                                           "sample_frames": sample_frames,
                                           "metrics": change.get("metrics"),
                                           "sustained": change.get("sustained")}},
-                "model_run_id": None,
+                "model_run_id": content_run,
                 "score": float(change.get("confidence") or 0.0),
                 "score_kind": "rule_score",
                 "measurement": None,
-                "uncertainty_reason": change.get("uncertainty")
-                or "仅按镜头内均匀抽样帧判断，未逐帧验证；短时遮挡或字幕可能被过滤",
+                "uncertainty_reason": (change.get("uncertainty")
+                    or "仅按镜头内均匀抽样帧判断，未逐帧验证；短时遮挡或字幕可能被过滤")
+                    + ("；旧候选未记录内容采样时间与证据，时间窗仅为镜头上下文" if not exact else ""),
             })
         actions = candidate.get("actions_sampling") or {}
         for number, action in enumerate(actions.get("candidates") or []):
