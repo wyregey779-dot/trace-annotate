@@ -2,6 +2,7 @@
 from fractions import Fraction
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import pytest
@@ -194,9 +195,14 @@ def test_replace_annotations_in_store(api):
 
 
 def test_real_102_items_roundtrip():
-    source_path = Path(r"D:\099\trace-real-assignment-20261027\full-delivery\修复版浏览器最终导出.json")
+    configured = os.environ.get("TRACEANNOTATE_REAL_102_JSON")
+    source_path = Path(configured) if configured else (
+        Path(__file__).resolve().parents[3] / "03_CURRENT_DELIVERY" / "03_ANNOTATION_DATA"
+        / "CN_长沙旅行_102条" / "final-delivery" / "长沙旅行视频_全片镜头标注.json")
     if not source_path.is_file():
-        pytest.skip("Real 102 delivery file not found on disk")
+        if configured:
+            pytest.fail("Configured TRACEANNOTATE_REAL_102_JSON file does not exist: " + str(source_path))
+        pytest.skip("External 102-item delivery unavailable; set TRACEANNOTATE_REAL_102_JSON to run this integration case")
     doc = json.loads(source_path.read_text(encoding="utf-8"))
     media = {
         "duration": rational(doc["duration"]),
