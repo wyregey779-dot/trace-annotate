@@ -111,11 +111,20 @@ const state = {
   visionResult: {
     scenes: [{}, {}],
     keyframes: [{}, {}],
-    module_status: {scene: 'success'},
+    module_status: {
+      scene: 'success', transition: 'success', face: 'success',
+      framing: 'success', motion: 'success', actions: 'success',
+      expressive: 'not_run', expressive_reason: 'no_landmark_provider_in_this_build',
+      acoustics: 'success'
+    },
+    actions_sampling: {
+      status: 'success', supported: ['走', '跑'],
+      unsupported: ['拿起', '放下', '打开', '关闭', '递交'], candidates: []
+    },
     model_runs: [],
     content_sampling: {
       status: 'insufficient_samples', returned: 8, required_samples: 9,
-      insufficient_scenes: 1,
+      insufficient_scenes: 1, changes: 0, filtered: 2,
       scene_results: [{status: 'insufficient_samples', message: insufficient}]
     }
   },
@@ -127,6 +136,8 @@ vm.runInContext(implementation, context);
 context.renderVisionJob();
 assert.match(fields['vision-job'].textContent,
   /内容采样 insufficient_samples 8 帧 \/ 需 9 帧（1 个镜头不足）/);
+assert.match(fields['vision-job'].textContent,
+  /六项能力 转场=success 内容=insufficient_samples\(0变化\/2过滤\) 主体\/景别\/运镜=success\/success\/success 动作=success\(0候选;支持走\/跑;未支持拿起\/放下\/打开\/关闭\/递交\) 表情=not_run\(no_landmark_provider_in_this_build\) 声学=success/);
 assert.equal(fields['vision-apply'].hidden, false);
 assert.equal(fields['vision-cancel'].hidden, true);
 """
