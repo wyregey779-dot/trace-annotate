@@ -151,6 +151,25 @@ def fail_code(code, call):
     assert exc.value.code == code
 
 
+def test_content_span_handles_single_boundary_index():
+    assert V._content_span([42]) == 1
+    assert V._content_span([2, 10]) == 9
+
+
+def test_content_overlap_rejects_empty_or_clipped_window():
+    assert V._content_overlap({"n": "5", "d": "1"}, {"n": "5", "d": "1"}) is False
+    assert V._content_overlap({"n": "6", "d": "1"}, {"n": "5", "d": "1"}) is False
+    assert V._content_overlap({"n": "5", "d": "1"}, {"n": "6", "d": "1"}) is True
+
+
+def test_content_clip_keeps_scene_inside_playback_duration():
+    start, end = V._content_clip({"n": "121", "d": "1"},
+                                 {"n": "130", "d": "1"},
+                                 {"n": "120", "d": "1"})
+    assert S.rational_value(start) == 120
+    assert S.rational_value(end) == 120
+
+
 def test_transition_claim_uses_event_interval_not_whole_scene_window():
     candidate = {"job_id": "job-time", "processor_version": "1", "keyframes": [],
                  "boundary_frames": [{"frame_index": 99, "seconds": 9.9},
@@ -190,6 +209,7 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert result["module_status"]["actions"] in {"success", "not_run", "failed"}
     assert result["module_status"]["acoustics"] in {"success", "not_run", "failed"}
     assert result["module_status"]["boundary"] in {"success", "failed", "not_run"}
+    assert "content_reason" in result["module_status"]
     content = result["content_sampling"]
     assert content["status"] == "insufficient_samples"
     assert content["required_samples"] == 9

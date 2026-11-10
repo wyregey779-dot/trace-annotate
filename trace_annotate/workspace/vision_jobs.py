@@ -89,6 +89,29 @@ def _content_uniform(span_frames: int) -> int:
                min(CONTENT_UNIFORM_LONG, math.ceil(span_frames / CONTENT_TARGET_GAP)))
 
 
+def _content_span(bounds: Sequence[int]) -> int:
+    """A window clipped to one admitted frame still spans one frame, not zero."""
+    if not bounds:
+        return 0
+    if len(bounds) == 1:
+        return 1
+    return max(1, bounds[1] - bounds[0] + 1)
+
+
+def _content_overlap(start: Any, end: Any) -> bool:
+    """A scene clipped out of the requested window has no frame to sample."""
+    return S.rational_value(end) > S.rational_value(start)
+
+
+def _content_clip(start: Any, end: Any, duration: Any) -> Tuple[Any, Any]:
+    """Clamp a scene to the registered playback duration before sampling it."""
+    if S.rational_value(start) > S.rational_value(duration):
+        start = duration
+    if S.rational_value(end) > S.rational_value(duration):
+        end = duration
+    return start, end
+
+
 def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE_CONTRACT) -> Dict[str, Any]:
     thresholds = MetricThresholds()
     config = {
@@ -726,19 +749,64 @@ class VisionJobs:
                             if window is not None:
                                 content_start = max(content_start, S.rational_value(window["start"]))
                                 content_end = min(content_end, S.rational_value(window["end"]))
+                            content_start, content_end = _content_clip(
+                                content_start, content_end, job["media_snapshot"]["duration"])
                             content_window = {"start": S.rational(content_start), "end": S.rational(content_end)}
+                            if not _content_overlap(content_start, content_end):
+                                scene_results.append({
+                                    "scene_index": scene_index,
+                                    "window": content_window,
+                                    "frame_map_sha256": None,
+                                    "fingerprint": None,
+                                    "params": None,
+                                    "planned": 0,
+                                    "returned": 0,
+                                    "truncated": False,
+                                    "span_frames": 0,
+                                    "uniform": 0,
+                                    "status": "empty_scene",
+                                    "provided_samples": 0,
+                                    "required_samples": CONTENT_MIN_SAMPLES,
+                                    "message": "场景与请求窗口无重叠帧，未采样",
+                                    "max_gap_frames": 0,
+                                    "changes": 0,
+                                    "filtered": 0,
+                                })
+                                continue
                             bounds = VS.boundary_indices(
                                 self.store, job["media_snapshot"]["id"],
                                 [content_start, content_end])
-                            span_frames = max(1, bounds[1] - bounds[0] + 1)
+                            span_frames = _content_span(bounds)
                             uniform = _content_uniform(span_frames)
-                            plan_c = VS.plan_samples(
-                                self.store, job["media_snapshot"]["id"],
-                                window=content_window,
-                                uniform=uniform, include_edges=True,
-                                budget=VS.SamplingBudget(max_frames=uniform + 2,
-                                                         max_uniform=max(uniform, VS.MAX_UNIFORM),
-                                                         boundary_radius=0))
+                            try:
+                                plan_c = VS.plan_samples(
+                                    self.store, job["media_snapshot"]["id"],
+                                    window=content_window,
+                                    uniform=uniform, include_edges=True,
+                                    budget=VS.SamplingBudget(max_frames=uniform + 2,
+                                                             max_uniform=max(uniform, VS.MAX_UNIFORM),
+                                                             boundary_radius=0))
+                            except SchemaInvalid as exc:
+                                scene_results.append({
+                                    "scene_index": scene_index,
+                                    "window": content_window,
+                                    "frame_map_sha256": None,
+                                    "fingerprint": None,
+                                    "params": None,
+                                    "planned": 0,
+                                    "returned": 0,
+                                    "truncated": False,
+                                    "span_frames": span_frames,
+                                    "uniform": uniform,
+                                    "status": "empty_scene",
+                                    "provided_samples": 0,
+                                    "required_samples": CONTENT_MIN_SAMPLES,
+                                    "message": str(exc),
+                                    "max_gap_frames": 0,
+                                    "changes": 0,
+                                    "filtered": 0,
+                                })
+                                continue
                             decoded_c = VS.decode_samples(
                                 self.store, job["media_snapshot"]["id"], plan_c,
                                 work / "content" / str(scene_index),
@@ -957,6 +1025,8 @@ class VisionJobs:
                 module_status["actions_supported"] = actions_sampling.get("supported")
                 module_status["actions_unsupported"] = actions_sampling.get("unsupported")
                 module_status["expressive_reason"] = "no_landmark_provider_in_this_build"
+                module_status["content_reason"] = (content_sampling.get("message")
+                                                   or content_sampling.get("error"))
                 module_status["acoustics_reason"] = acoustics_sampling.get("reason")
                 if self._extractor_error is not None:
                     extractor_status["extractor_error"] = self._extractor_error
