@@ -52,9 +52,21 @@ def main():
     parser.add_argument("--ffmpeg", default=shutil.which("ffmpeg"))
     parser.add_argument("--channel", default=None, help="Installed browser channel, e.g. chrome")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--device-scale-factor", type=float, default=1.0,
+                        help="Browser device pixel ratio; 2.0 exercises a 200%% display scale")
+    parser.add_argument("--visible-evidence", type=Path, default=None,
+                        help="Screenshot path for a visible (non-headless) run")
+    parser.add_argument("--ready-marker", type=Path, default=None,
+                        help="Write this file once the visible browser is ready for an OS-level capture")
+    parser.add_argument("--hold-seconds", type=float, default=0,
+                        help="Keep the visible browser open this long after the marker")
     args = parser.parse_args()
     if not args.ffmpeg:
         raise RuntimeError("ffmpeg is required")
+    if not (0 < args.device_scale_factor <= 4):
+        raise SystemExit("--device-scale-factor must be within (0, 4]")
+    if not (0 <= args.hold_seconds <= 180):
+        raise SystemExit("--hold-seconds must be within [0, 180]")
     if args.output.exists():
         raise SystemExit("Refusing to overwrite an existing output directory")
     args.output.mkdir(parents=True)
@@ -82,9 +94,12 @@ def main():
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(headless=args.headless,
                                             **({"channel": args.channel} if args.channel else {}))
-        context = browser.new_context(accept_downloads=True, viewport={"width": 1366, "height": 768})
+        context = browser.new_context(accept_downloads=True, viewport={"width": 1366, "height": 768},
+                                      device_scale_factor=args.device_scale_factor)
         page = context.new_page()
         page.on("pageerror", lambda error: summary["page_errors"].append(str(error)))
+        summary["browser"] = {"headless": args.headless, "channel": args.channel,
+                              "viewport": "1366x768", "device_scale_factor": args.device_scale_factor}
 
         def task_id(name):
             return next(item["task_id"] for item in store.list_intakes()
@@ -497,6 +512,17 @@ def main():
 
         if summary["page_errors"]:
             raise AssertionError("Browser page errors: " + str(summary["page_errors"][:3]))
+        if args.visible_evidence:
+            page.screenshot(path=str(args.visible_evidence))
+            summary["visible_evidence"] = {"path": args.visible_evidence.name,
+                                           "sha256": digest(args.visible_evidence),
+                                           "bytes": args.visible_evidence.stat().st_size}
+        if args.ready_marker:
+            args.ready_marker.write_text(json.dumps({"viewport": "1366x768",
+                "device_scale_factor": args.device_scale_factor,
+                "headless": args.headless}) + "\n", encoding="utf-8")
+        if args.hold_seconds:
+            time.sleep(args.hold_seconds)
         context.close()
         browser.close()
         playwright.stop()
