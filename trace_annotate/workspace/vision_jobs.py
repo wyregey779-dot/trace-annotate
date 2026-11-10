@@ -674,6 +674,18 @@ class VisionJobs:
                 scene_result = _run_scenes(detector, Path(source), thresholds)
                 keyframes: List[Dict[str, Any]] = []
                 scene_frames: Dict[int, List[Dict[str, Any]]] = {}
+                motion_by_scene: Dict[int, Dict[str, Any]] = {}
+
+                def flush_scene(index: int) -> None:
+                    samples = scene_frames.pop(index, None)
+                    if not samples or len(samples) < 2:
+                        return
+                    motion_by_scene[index] = analyse_motion(samples)
+                    for keyframe in keyframes:
+                        if keyframe["scene_index"] == index:
+                            keyframe["motion"] = motion_by_scene[index]
+
+                active_scene: Optional[int] = None
                 window = parameters["window"]
                 scenes = scene_result["scenes"]
                 if window is not None:
@@ -696,7 +708,7 @@ class VisionJobs:
                                 "planned": plan["planned"], "returned": plan["returned"],
                                 "coverage": plan["coverage"],
                                 "fingerprint": VS.samples_fingerprint(plan)}
-                    for item in decoded["decoded"]:
+                    for item in sorted(decoded["decoded"], key=lambda entry: int(entry["frame_index"])):
                         if cancelled():
                             raise WorkspaceError("CANCELLED", "Vision cancelled while analysing samples")
                         seconds = S.rational_value(item["seconds"])
@@ -704,6 +716,9 @@ class VisionJobs:
                                             if scene["start"] <= seconds < scene["end"]), None)
                         if scene_index is None:
                             continue
+                        if active_scene is not None and scene_index != active_scene:
+                            flush_scene(active_scene)
+                        active_scene = scene_index
                         frame = _load_frame(Path(item["path"]))
                         face_result = _run_face(frame, extractors["face"])
                         framing_result = _shot_framing(frame, face_result)
@@ -729,14 +744,8 @@ class VisionJobs:
                             "frame": frame})
                 else:
                     sampling = None
-                for scene_index, samples in scene_frames.items():
-                    if len(samples) < 2:
-                        continue
-                    motion = analyse_motion(samples)
-                    for keyframe in keyframes:
-                        if keyframe["scene_index"] == scene_index:
-                            keyframe["motion"] = motion
-                            break
+                for index in list(scene_frames):
+                    flush_scene(index)
                 content_sampling: Dict[str, Any] = {
                     "status": "not_run", "reason": "scene_extraction_not_run"}
                 content_frames: List[Dict[str, Any]] = []

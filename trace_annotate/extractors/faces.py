@@ -60,6 +60,7 @@ class FaceExtractor(BaseExtractor):
         self.thresholds = thresholds or MetricThresholds()
         self.detector = None
         self.detector_kind = None
+        self._input_size = None
         self._init_detector()
 
     @property
@@ -202,7 +203,9 @@ class FaceExtractor(BaseExtractor):
             return self._summary(detected_list)
 
         try:
-            self.detector.setInputSize((w, h))
+            if self._input_size != (w, h):
+                self.detector.setInputSize((w, h))
+                self._input_size = (w, h)
             _, faces = self.detector.detect(img_bgr)
         except Exception as e:
             return {
