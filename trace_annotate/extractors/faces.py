@@ -21,6 +21,32 @@ from trace_annotate.core.hasher import safe_load_image
 from trace_annotate.config import MetricThresholds
 
 
+def _ascii_temp_root() -> str:
+    """Return a temp root OpenCV's byte-oriented ONNX loader can address.
+
+    A workspace may redirect TEMP/TMP into a Chinese directory. OpenCV's
+    ``FaceDetectorYN.create`` takes a byte path, so every copy written there
+    fails to load and the detector silently degrades to None. Pick the first
+    candidate whose path is ASCII; LOCALAPPDATA/ProgramData are ASCII on the
+    supported Windows hosts.
+    """
+    candidates = [
+        tempfile.gettempdir(),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Temp"),
+        os.environ.get("ProgramData", ""),
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            candidate.encode("ascii")
+        except UnicodeEncodeError:
+            continue
+        return candidate
+    return tempfile.gettempdir()
+
+
 class FaceExtractor(BaseExtractor):
     """Detects faces using YuNet ONNX or provides safe fallbacks with explicit status."""
 
@@ -90,7 +116,7 @@ class FaceExtractor(BaseExtractor):
             try:
                 model_path.encode("ascii")
             except UnicodeEncodeError:
-                cache_dir = os.path.join(tempfile.gettempdir(), "traceannotate", "yunet")
+                cache_dir = os.path.join(_ascii_temp_root(), "traceannotate", "yunet")
                 os.makedirs(cache_dir, exist_ok=True)
                 model_path = os.path.join(cache_dir, os.path.basename(self.model_path))
                 if not os.path.exists(model_path) or os.path.getsize(model_path) != os.path.getsize(self.model_path):
