@@ -47,16 +47,18 @@ from .slots import SlotClosed, SlotTimeout, get_prepare_slot
 from .store import _safe
 
 OPERATION = "vision-media"
-VERSION = "1"
+VERSION = "1.1"
 RESULT_KIND = "traceannotate.vision-candidate"
 DOMAIN = "playback_seconds"
 MAX_SCENES = 512
 MAX_KEYFRAMES = 512
 CONTENT_MIN_SAMPLES = minimum_samples()
 CONTENT_UNIFORM = 24
-CONTENT_MAX_FRAMES = 26
+CONTENT_UNIFORM_LONG = 96
+CONTENT_TARGET_GAP = 32
+CONTENT_MAX_FRAMES = CONTENT_UNIFORM_LONG + 2
 MAX_CONTENT_FRAMES = MAX_SCENES * CONTENT_MAX_FRAMES
-CONTENT_EVIDENCE_CONTRACT = "decoded-content-v1"
+CONTENT_EVIDENCE_CONTRACT = "decoded-content-adaptive-v2"
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 FRAME_QUALITY = 3
 CANDIDATE_LABEL_PREFIX = "镜头候选"
@@ -77,6 +79,14 @@ def _finite(value: Any, name: str, *, positive: bool = False) -> float:
     return result
 
 
+def _content_uniform(span_frames: int) -> int:
+    """Scale content sampling with shot length instead of a fixed 26-frame cap."""
+    if span_frames <= 0:
+        return CONTENT_UNIFORM
+    return max(CONTENT_UNIFORM,
+               min(CONTENT_UNIFORM_LONG, math.ceil(span_frames / CONTENT_TARGET_GAP)))
+
+
 def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE_CONTRACT) -> Dict[str, Any]:
     thresholds = MetricThresholds()
     config = {
@@ -92,6 +102,8 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
         "clip_entity_mismatch_cutoff": thresholds.clip_entity_mismatch_cutoff,
         "sampling": {"max_frames": MAX_KEYFRAMES, "boundary_radius": BOUNDARY_RADIUS},
         "content_sampling": {"uniform": CONTENT_UNIFORM,
+                             "uniform_long": CONTENT_UNIFORM_LONG,
+                             "target_gap_frames": CONTENT_TARGET_GAP,
                              "max_frames": CONTENT_MAX_FRAMES,
                              "min_samples": CONTENT_MIN_SAMPLES},
     }
@@ -713,11 +725,17 @@ class VisionJobs:
                                 content_start = max(content_start, S.rational_value(window["start"]))
                                 content_end = min(content_end, S.rational_value(window["end"]))
                             content_window = {"start": S.rational(content_start), "end": S.rational(content_end)}
+                            bounds = VS.boundary_indices(
+                                self.store, job["media_snapshot"]["id"],
+                                [content_start, content_end])
+                            span_frames = max(1, bounds[1] - bounds[0] + 1)
+                            uniform = _content_uniform(span_frames)
                             plan_c = VS.plan_samples(
                                 self.store, job["media_snapshot"]["id"],
                                 window=content_window,
-                                uniform=CONTENT_UNIFORM, include_edges=True,
-                                budget=VS.SamplingBudget(max_frames=CONTENT_MAX_FRAMES,
+                                uniform=uniform, include_edges=True,
+                                budget=VS.SamplingBudget(max_frames=uniform + 2,
+                                                         max_uniform=max(uniform, VS.MAX_UNIFORM),
                                                          boundary_radius=0))
                             decoded_c = VS.decode_samples(
                                 self.store, job["media_snapshot"]["id"], plan_c,
@@ -767,6 +785,8 @@ class VisionJobs:
                                 "planned": plan_c["planned"],
                                 "returned": len(decoded_c["decoded"]),
                                 "truncated": plan_c["truncated"],
+                                "span_frames": span_frames,
+                                "uniform": uniform,
                                 "status": detail["status"],
                                 "provided_samples": detail["provided_samples"],
                                 "required_samples": detail["required_samples"],
@@ -784,6 +804,9 @@ class VisionJobs:
                             "returned": sum(item["returned"] for item in scene_results),
                             "truncated": any(item["truncated"] for item in scene_results),
                             "required_samples": CONTENT_MIN_SAMPLES,
+                            "uniform": CONTENT_UNIFORM,
+                            "uniform_long": CONTENT_UNIFORM_LONG,
+                            "target_gap_frames": CONTENT_TARGET_GAP,
                             "insufficient_scenes": len(insufficient),
                             "max_gap_frames": max((item["max_gap_frames"]
                                                      for item in scene_results), default=0),

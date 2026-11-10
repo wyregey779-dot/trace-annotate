@@ -69,6 +69,20 @@ def content_clip(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
+def long_content_clip(tmp_path_factory):
+    """One 1000-frame shot: the fixed 26-frame content budget must not apply."""
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for vision fixtures")
+    source = tmp_path_factory.mktemp("vision-long-content-source") / "long-content.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin",
+        "-f", "lavfi", "-i", "color=green:s=64x64:r=10:d=100.0",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True, timeout=120)
+    return source
+
+
+@pytest.fixture(scope="module")
 def eight_frame_clip(tmp_path_factory):
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         pytest.skip("FFmpeg and ffprobe are required for vision fixtures")
@@ -229,6 +243,31 @@ def test_content_sampling_returns_at_least_nine_contiguous_frames_for_a_ten_fram
     assert all(keyframe["content_sampling"]["provided_samples"] >= 9
                for keyframe in result["keyframes"])
     jobs.close()
+
+
+def test_long_shot_content_sampling_scales_beyond_the_short_scene_budget(
+        tmp_path, long_content_clip):
+    project = WorkspaceStore(tmp_path / "long-content-workspace")
+    project.create()
+    try:
+        project.import_source(long_content_clip)
+        jobs = V.VisionJobs(project,
+                            clip_model_path="nonexistent-clip-weights",
+                            vlm_model_path="nonexistent-vlm-weights")
+        queued = submit(jobs, command_id="vision-content-long")["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        result = jobs.result(queued["id"])
+        content = result["content_sampling"]
+        assert content["status"] == "success"
+        assert content["scene_results"]
+        assert content["returned"] > 26
+        span = max(1, int(round((result["scenes"][0]["end"]
+                                 - result["scenes"][0]["start"]) * 10)))
+        expected_gap = max(1, -(-span // 32))
+        assert content["max_gap_frames"] <= max(2, expected_gap + 1)
+        jobs.close()
+    finally:
+        project.close()
 
 
 def test_job_status_is_read_only_and_reports_progress(store):
