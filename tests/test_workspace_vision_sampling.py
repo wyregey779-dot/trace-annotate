@@ -129,3 +129,28 @@ def test_plan_fingerprint_is_stable_and_time_independent(store):
     assert VSmp.samples_fingerprint(plan) == VSmp.samples_fingerprint(plan)
     widened = VSmp.plan_samples(store, media_id, uniform=5)
     assert VSmp.samples_fingerprint(plan) != VSmp.samples_fingerprint(widened)
+
+
+def test_decode_splits_many_select_terms_into_bounded_ffmpeg_calls(tmp_path):
+    source = tmp_path / "long.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi",
+        "-i", "testsrc2=s=64x64:r=10:d=6.0", "-c:v", "libx264",
+        "-pix_fmt", "yuv420p", "-g", "10", str(source),
+    ], check=True, capture_output=True, timeout=60)
+    project = WorkspaceStore(tmp_path / "long-workspace")
+    project.create()
+    try:
+        project.import_source(source)
+        media_id = project.get_task(project.list_tasks()[0]["task_id"])["media_id"]
+        plan = VSmp.plan_samples(project, media_id, uniform=60,
+                                 budget=VSmp.SamplingBudget(max_frames=60, max_uniform=60))
+        evidence = VSmp.decode_samples(project, media_id, plan, tmp_path / "long-frames",
+                                       timeout=120)
+        assert len(plan["samples"]) == 60
+        assert len(evidence["decoded"]) == 60
+        assert len(evidence["commands"]) > 1
+        assert [item["frame_index"] for item in evidence["decoded"]] == [
+            item["frame_index"] for item in plan["samples"]]
+    finally:
+        project.close()

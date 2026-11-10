@@ -105,3 +105,22 @@ def test_track_reports_real_frame_identity_not_average_fps():
     track = result["track"]
     assert [entry["frame_index"] for entry in track] == ["0", "1", "2"]
     assert track[2]["seconds"] == {"n": "2", "d": "1"}
+
+
+def test_scene_cut_classifier_accepts_a_persistent_hard_cut():
+    colors = [(20, 20, 20)] * 7 + [(220, 220, 220)] * 8
+    event = SB.classify_scene_cut(_samples(colors), candidate_frame=7)
+    assert event is not None
+    assert event["kind"] == "cut"
+    assert event["anchor_frame"] == "7"
+    assert event["previous_frame"] == "6"
+
+
+def test_scene_cut_classifier_rejects_a_low_contrast_subtitle_step():
+    colors = [(100, 100, 100)] * 7 + [(112, 112, 112)] * 8
+    assert SB.classify_scene_cut(_samples(colors), candidate_frame=7) is None
+
+
+def test_scene_cut_classifier_rejects_a_brightness_exposure_swing():
+    colors = [(200, 200, 200)] * 7 + [(80, 80, 80)] * 2 + [(140, 140, 140)] * 6
+    assert SB.classify_scene_cut(_samples(colors), candidate_frame=7) is None

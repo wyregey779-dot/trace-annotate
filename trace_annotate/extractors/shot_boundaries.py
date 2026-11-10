@@ -36,6 +36,13 @@ BLACK_LEVEL = 10
 WHITE_LEVEL = 248
 NEIGHBOUR_RADIUS = 6
 
+SCENE_CUT_MIN_RAW = 25.0
+SCENE_CUT_MIN_HIST = 0.12
+SCENE_CUT_MIN_HIST_RAW = 32.0
+SCENE_CUT_FLASH_DROP = -45.0
+SCENE_CUT_FLASH_HIST = 0.50
+SCENE_CUT_FLASH_NEXT = 10.0
+
 TRANSITION_KINDS = ("cut", "fade_in", "fade_out", "dissolve", "flash",
                     "unknown_transition")
 
@@ -338,6 +345,83 @@ def _fill_split_points(events: List[Dict[str, Any]]) -> None:
     """Report the new-shot split point separately from the full interval."""
     for event in events:
         event["split_point"] = None if event["kind"] == "flash" else event["anchor_frame"]
+
+
+def _plain_histogram(gray: np.ndarray) -> np.ndarray:
+    values, _ = np.histogram(gray, bins=HIST_BINS, range=(0, 256))
+    total = values.sum()
+    return values.astype(np.float64) / total if total else values.astype(np.float64)
+
+
+def classify_scene_cut(samples: Sequence[Dict[str, Any]], *,
+                       candidate_frame: int) -> Optional[Dict[str, Any]]:
+    """Confirm a scene-detector boundary as a hard cut from dense frames.
+
+    The scene detector proposes boundaries from a sparse global score. This
+    classifier re-measures the candidate on the decoded frames around it, snaps
+    to the strongest adjacent step, and rejects steps that are too small,
+    histogram-flat, or a brightness/exposure swing with an unstable next frame.
+    """
+    entries = sorted(
+        ({"index": int(sample["frame_index"]),
+          "gray": sample["gray"] if "gray" in sample else _to_gray(sample["frame"]),
+          "seconds": sample.get("seconds"),
+          "source_pts": sample.get("source_pts"),
+          "proxy_pts": sample.get("proxy_pts")}
+         for sample in samples),
+        key=lambda item: item["index"])
+    if len(entries) < 5:
+        return None
+    positions = {entry["index"]: offset for offset, entry in enumerate(entries)}
+    candidate = int(candidate_frame)
+    if candidate not in positions:
+        return None
+
+    def raw_step(left: int, right: int) -> float:
+        return float(np.abs(entries[left]["gray"] - entries[right]["gray"]).mean())
+
+    def step_score(offset: int) -> float:
+        return raw_step(offset - 1, offset)
+
+    base = positions[candidate]
+    choices = [offset for offset in range(base - 2, base + 3)
+               if 2 <= offset < len(entries) - 2]
+    if not choices:
+        return None
+    chosen = max(choices, key=step_score)
+    anchor = entries[chosen]["index"]
+    before = np.mean([entry["gray"] for entry in entries[chosen - 2:chosen]], axis=0)
+    after = np.mean([entry["gray"] for entry in entries[chosen:chosen + 2]], axis=0)
+    avg_raw = float(np.abs(before - after).mean())
+    avg_hist = float(np.abs(_plain_histogram(before) - _plain_histogram(after)).sum() / 2)
+    flash = float(max(entries[chosen]["gray"].mean(), entries[chosen + 1]["gray"].mean())
+                  - max(entries[chosen - 2]["gray"].mean(), entries[chosen + 2]["gray"].mean())
+                  )
+    next_raw = raw_step(chosen + 1, chosen + 2)
+    metrics = {"candidate_frame": candidate, "anchor_frame": anchor,
+               "avg_raw": round(avg_raw, 3), "avg_hist": round(avg_hist, 4),
+               "flash": round(flash, 3), "next_raw": round(next_raw, 3),
+               "source": "scene-candidate-structural-v1"}
+
+    if avg_raw < SCENE_CUT_MIN_RAW:
+        return None
+    if avg_hist < SCENE_CUT_MIN_HIST and avg_raw < SCENE_CUT_MIN_HIST_RAW:
+        return None
+    if (flash < SCENE_CUT_FLASH_DROP and avg_hist > SCENE_CUT_FLASH_HIST
+            and next_raw > SCENE_CUT_FLASH_NEXT):
+        return None
+
+    confidence = round(min(0.95, 0.5 + 0.5 * min(1.0, avg_raw / 120.0)), 4)
+    return {"kind": "cut",
+            "anchor_frame": str(anchor),
+            "previous_frame": str(anchor - 1),
+            "representative_frame": str(anchor),
+            "split_point": str(anchor),
+            "confidence": confidence,
+            "uncertainty": None,
+            "metrics": metrics,
+            "needs_review": False,
+            "interval": None}
 
 
 def events_to_claims(events: List[Dict[str, Any]], evidence_id_for) -> List[Dict[str, Any]]:

@@ -32,7 +32,8 @@ from ..extractors.faces import FaceExtractor
 from ..extractors.ocr import OCRExtractor
 from ..extractors.scene import SceneDetector, SceneDetectionError
 from ..extractors.shot_attributes import classify_framing
-from ..extractors.shot_boundaries import detect_shot_boundaries, TRANSITION_KINDS
+from ..extractors.shot_boundaries import (classify_scene_cut, detect_shot_boundaries,
+                                          TRANSITION_KINDS)
 from ..extractors.vlm import VLMExtractor
 from ..temporal.media import stream_sha256
 from . import professional_schema as PS
@@ -52,6 +53,7 @@ RESULT_KIND = "traceannotate.vision-candidate"
 DOMAIN = "playback_seconds"
 MAX_SCENES = 512
 MAX_KEYFRAMES = 512
+BOUNDARY_MAX_FRAMES = MAX_KEYFRAMES * 4
 CONTENT_MIN_SAMPLES = minimum_samples()
 CONTENT_UNIFORM = 24
 CONTENT_UNIFORM_LONG = 96
@@ -841,7 +843,7 @@ class VisionJobs:
                             self.store, job["media_snapshot"]["id"], uniform=0,
                             boundary_frames=[item[0] for item in targets],
                             include_edges=False,
-                            budget=VS.SamplingBudget(max_frames=MAX_KEYFRAMES,
+                            budget=VS.SamplingBudget(max_frames=BOUNDARY_MAX_FRAMES,
                                                      boundary_radius=BOUNDARY_RADIUS))
                         decoded_b = VS.decode_samples(
                             self.store, job["media_snapshot"]["id"], plan_b,
@@ -904,19 +906,13 @@ class VisionJobs:
                             if has_cut or target is None:
                                 final_events[scene_index] = events
                                 continue
-                            previous = target - 1 if target > 0 else None
-                            final_events[scene_index] = [{
-                                "kind": "cut",
-                                "anchor_frame": str(target),
-                                "previous_frame": str(previous) if previous is not None else None,
-                                "representative_frame": str(target),
-                                "split_point": str(target),
-                                "confidence": 0.5,
-                                "uncertainty": "弱视觉差异，切点由 scene-cut-ffmpeg 场景边界给出；边界检测未单独达到阈值",
-                                "metrics": {"source": "scene-cut-ffmpeg", "scene_boundary": True},
-                                "needs_review": True,
-                                "interval": None,
-                            }]
+                            confirmation = classify_scene_cut(
+                                boundary_samples.get(scene_index, []),
+                                candidate_frame=target)
+                            if confirmation is None:
+                                final_events[scene_index] = events
+                                continue
+                            final_events[scene_index] = [confirmation]
                         for scene_index, events in final_events.items():
                             first = next((frame for frame in keyframes
                                           if frame["scene_index"] == scene_index), None)
@@ -1122,7 +1118,7 @@ class VisionJobs:
             if not 0 <= scene["start"] < scene["end"]:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision scene interval is invalid")
         if (not isinstance(value["boundary_frames"], list)
-                or len(value["boundary_frames"]) > MAX_KEYFRAMES * 4):
+                or len(value["boundary_frames"]) > BOUNDARY_MAX_FRAMES):
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision boundary frame list is inconsistent")
         for frame in value["boundary_frames"]:
             base = {"scene_index", "frame_index", "seconds", "evidence_sha256"}

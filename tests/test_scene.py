@@ -144,3 +144,7 @@ def test_unavailable_or_timed_out_tool_is_an_explicit_failure(tmp_path, monkeypa
 def test_invalid_limits_are_not_submitted_to_ffmpeg(kwargs):
     with pytest.raises(ValueError):
         SceneDetector().detect_scenes_ffmpeg("unused.mp4", **kwargs)
+
+
+def test_default_scene_threshold_keeps_short_shot_recall():
+    assert SceneDetector().thresholds.scene_threshold == 0.15

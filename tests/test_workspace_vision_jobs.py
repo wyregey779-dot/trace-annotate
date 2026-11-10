@@ -224,6 +224,10 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert jobs.close()["stopped"]
 
 
+def test_boundary_budget_is_independent_of_keyframe_budget():
+    assert V.BOUNDARY_MAX_FRAMES == V.MAX_KEYFRAMES * 4
+
+
 def test_content_sampling_returns_at_least_nine_contiguous_frames_for_a_ten_frame_scene(
         content_store):
     jobs = V.VisionJobs(content_store,
