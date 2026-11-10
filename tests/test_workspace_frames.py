@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import threading
+import time
 
 from PIL import Image, ImageDraw
 import pytest
@@ -202,6 +204,29 @@ def test_http_frame_bytes_remain_valid_after_cache_eviction_and_close(admitted, 
     assert not second["path"].exists()
     assert S.sha256_bytes(second["data"]) == second["sha256"]
     assert (second["path"].parent / "decode.json").exists()
+
+
+def test_image_waits_for_a_short_concurrent_decode_instead_of_failing(admitted):
+    store, intake, _ = admitted
+    service = FrameService(store)
+    service._decoder.acquire()
+    result = {}
+
+    def decode():
+        try:
+            result.update(service.image(intake["media_id"], 0))
+        except BaseException as error:
+            result["error"] = error
+
+    worker = threading.Thread(target=decode, daemon=True)
+    worker.start()
+    time.sleep(0.25)
+    assert worker.is_alive(), result.get("error")
+    service._decoder.release()
+    worker.join(timeout=60)
+    assert not worker.is_alive()
+    assert "error" not in result
+    assert pixel_identity(result["path"]) == 0
 
 
 def test_inflight_map_change_is_rejected_before_returning_frame(admitted, monkeypatch):

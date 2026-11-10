@@ -28,6 +28,7 @@ MAX_FRAMES = 2_000_000
 MAX_CACHED_IMAGES = 32
 MAX_CACHED_BYTES = 256 * 1024 * 1024
 DECODE_TIMEOUT = 120
+FRAME_LOCK_TIMEOUT = 30
 
 
 def _integer(value, field):
@@ -160,7 +161,11 @@ class FrameService:
         if stream_sha256(path) != playback_hash:
             raise WorkspaceError("RECOVERY_REQUIRED", "Playback bytes changed")
         key = (media_id, playback_hash, media["source_video_stream"], index, "proxy-decoded-rgb-v1")
-        if not self._decoder.acquire(blocking=False):
+        # A preview and a boundary comparison can request different frames at
+        # the same moment. Waiting briefly turns that into a short delay instead
+        # of a user-visible FRAME_SERVICE_BUSY failure; a genuinely stuck decoder
+        # still surfaces as a retryable error.
+        if not self._decoder.acquire(timeout=FRAME_LOCK_TIMEOUT):
             raise DependencyUnavailable("FRAME_SERVICE_BUSY", "A frame is being decoded; retry after it finishes", retryable=True)
         try:
             if key in self._images:
