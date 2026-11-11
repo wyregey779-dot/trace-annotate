@@ -12,7 +12,7 @@ import pytest
 from trace_annotate.temporal import preparation as P
 from trace_annotate.workspace import schema as S
 from trace_annotate.workspace import vision_sampling as VSmp
-from trace_annotate.workspace.errors import SchemaInvalid, WorkspaceError
+from trace_annotate.workspace.errors import DependencyUnavailable, SchemaInvalid, WorkspaceError
 from trace_annotate.workspace.frames import FrameService
 from trace_annotate.workspace.store import WorkspaceStore
 
@@ -135,7 +135,7 @@ def test_plan_fingerprint_is_stable_and_time_independent(store):
     assert VSmp.samples_fingerprint(plan) != VSmp.samples_fingerprint(widened)
 
 
-def test_decode_splits_many_select_terms_into_bounded_ffmpeg_calls(tmp_path):
+def test_decode_many_frames_uses_one_absolute_filter_script(tmp_path):
     source = tmp_path / "long.mp4"
     subprocess.run([
         "ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi",
@@ -153,9 +153,13 @@ def test_decode_splits_many_select_terms_into_bounded_ffmpeg_calls(tmp_path):
                                        timeout=120)
         assert len(plan["samples"]) == 60
         assert len(evidence["decoded"]) == 60
-        assert len(evidence["commands"]) > 1
-        assert [command[command.index("-frames:v") + 1]
-                for command in evidence["commands"]] == ["40", "20"]
+        assert len(evidence["commands"]) == 1
+        command = evidence["commands"][0]
+        assert command[command.index("-frames:v") + 1] == "60"
+        script = tmp_path / "long-frames" / ".decode-0000" / "select.filter"
+        script_option = "-/filter:v" if "-/filter:v" in command else "-filter_script:v"
+        assert command[command.index(script_option) + 1] == str(script)
+        assert script.read_text(encoding="ascii") == "select=between(n\\,0\\,59)"
         assert all("-ss" not in command for command in evidence["commands"])
         assert [item["frame_index"] for item in evidence["decoded"]] == [
             item["frame_index"] for item in plan["samples"]]
@@ -168,6 +172,7 @@ def _fake_binding(monkeypatch, tmp_path, count=1):
     source.write_bytes(b"immutable playback fixture")
     monkeypatch.setattr("trace_annotate.workspace.frames._binding",
                         lambda *args: ({}, source, S.sha256_bytes(source.read_bytes())))
+    monkeypatch.setattr(VSmp, "_filter_script_option", lambda *args: "-/filter:v")
     samples = [{"frame_index": str(index), "source_pts": str(index),
                 "proxy_pts": str(index), "seconds": {"n": str(index), "d": "1"},
                 "roles": ["uniform"]} for index in range(count)]
@@ -220,7 +225,7 @@ def test_decode_stops_owned_process_and_keeps_diagnostics(monkeypatch, tmp_path,
     assert not list(output.glob("sample-*.png"))
 
 
-def test_decode_uses_one_deadline_across_chunks(monkeypatch, tmp_path):
+def test_decode_keeps_one_deadline_during_single_process(monkeypatch, tmp_path):
     plan = _fake_binding(monkeypatch, tmp_path, count=41)
     clock = [0.0]
     calls = []
@@ -229,30 +234,30 @@ def test_decode_uses_one_deadline_across_chunks(monkeypatch, tmp_path):
     def run(command, directory, name, cancelled):
         cancelled()
         calls.append(command)
-        count = int(command[command.index("-frames:v") + 1])
-        for index in range(1, count + 1):
-            (directory / f"frame-{index:04d}.png").write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         clock[0] += 6
+        cancelled()
+        clock[0] += 5
+        cancelled()
 
     monkeypatch.setattr(P, "_run", run)
     with pytest.raises(WorkspaceError) as failure:
         VSmp.decode_samples(None, "med-test", plan, tmp_path / "frames",
                             timeout=10, ffmpeg=sys.executable)
     assert failure.value.code == "FRAME_DECODE_TIMEOUT"
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
-def test_decode_byte_budget_prevents_later_chunks_and_retains_logs(monkeypatch, tmp_path):
+def test_decode_byte_budget_stops_output_before_next_frame(monkeypatch, tmp_path):
     plan = _fake_binding(monkeypatch, tmp_path, count=41)
     calls = []
 
     def run(command, directory, name, cancelled):
         calls.append(command)
-        count = int(command[command.index("-frames:v") + 1])
-        for index in range(1, count + 1):
-            (directory / f"frame-{index:04d}.png").write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        (directory / "frame-0001.png").write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         (directory / "decode.stderr").write_text("retained decoder diagnostic", encoding="utf-8")
         (directory / "commands.jsonl").write_text(json.dumps({"exit_code": 0}) + "\n")
+        cancelled()
+        pytest.fail("byte budget did not stop the decoder")
 
     monkeypatch.setattr(P, "_run", run)
     output = tmp_path / "frames"
@@ -262,9 +267,125 @@ def test_decode_byte_budget_prevents_later_chunks_and_retains_logs(monkeypatch, 
     assert failure.value.code == "FRAME_TOO_LARGE"
     assert len(calls) == 1
     assert not (output / ".decode-0001").exists()
+    assert not (output / ".decode-0000" / "frame-0002.png").exists()
     assert (output / ".decode-0000" / "decode.stderr").read_text() == "retained decoder diagnostic"
     assert json.loads((output / ".decode-0000" / "commands.jsonl").read_text())["exit_code"] == 0
     assert not list(output.glob("sample-*.png"))
+
+
+def test_decode_byte_budget_terminates_owned_process(monkeypatch, tmp_path):
+    plan = _fake_binding(monkeypatch, tmp_path, count=41)
+    original_run = P._run
+    original_popen = P.subprocess.Popen
+    processes = []
+
+    def launch(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def oversized_decoder(command, directory, name, cancelled):
+        writer = ("from pathlib import Path; import sys,time; "
+                  "Path(sys.argv[1]).write_bytes(b'\\x89PNG\\r\\n\\x1a\\n' + b'x'*4096); "
+                  "time.sleep(60)")
+        return original_run([sys.executable, "-c", writer,
+                             str(directory / "frame-0001.png")],
+                            directory, name, cancelled)
+
+    monkeypatch.setattr(P.subprocess, "Popen", launch)
+    monkeypatch.setattr(P, "_run", oversized_decoder)
+    output = tmp_path / "frames"
+    started = time.monotonic()
+    with pytest.raises(WorkspaceError) as failure:
+        VSmp.decode_samples(None, "med-test", plan, output,
+                            timeout=10, max_bytes=1024, ffmpeg=sys.executable)
+    assert failure.value.code == "FRAME_TOO_LARGE"
+    assert time.monotonic() - started < 5
+    assert len(processes) == 1 and processes[0].poll() is not None
+    assert processes[0].pid not in {record["pid"] for record in P.live_media_processes()}
+    entry = json.loads((output / ".decode-0000" / "commands.jsonl").read_text())
+    assert entry["pid"] == processes[0].pid
+    assert entry["exit_code"] is not None and entry["cancelled_or_interrupted"] is True
+    assert not (output / ".decode-0000" / "frame-0002.png").exists()
+    assert not list(output.glob("sample-*.png"))
+
+
+@pytest.mark.parametrize("indices", [[], [1, 1], [3, 2], [-1]])
+def test_select_expression_rejects_nonascending_indices(indices):
+    with pytest.raises(SchemaInvalid):
+        VSmp._select_expression(indices)
+
+
+def test_sparse_filter_script_decodes_beyond_expression_depth_limit(tmp_path):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg is required for sparse filter parser regression")
+    indices = list(range(0, 600, 2))
+    expression = VSmp._select_expression(indices)
+    # The script contains only controlled integer selectors and has logarithmic
+    # parser depth; a left-associated sum of this size fails on FFmpeg 9.
+    script = tmp_path / "sparse.filter"
+    script.write_text(expression, encoding="ascii")
+    output = tmp_path / "sparse-%04d.png"
+    script_option = VSmp._filter_script_option(shutil.which("ffmpeg"), tmp_path, lambda: False)
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-threads", "1",
+               "-filter_threads", "1", "-f", "lavfi", "-i",
+               "testsrc2=s=16x16:r=100:d=6", script_option, str(script),
+               "-fps_mode", "passthrough", "-c:v", "png", "-threads:v", "1",
+               "-frames:v", str(len(indices)), str(output)]
+    subprocess.run(command, check=True, capture_output=True, timeout=60)
+    assert len(list(tmp_path.glob("sparse-*.png"))) == len(indices)
+
+
+@pytest.mark.parametrize("version,option", [("6.0", "-filter_script:v"),
+                                            ("n8.0", "-filter_script:v"),
+                                            ("9.0.1-full_build", "-/filter:v")])
+def test_filter_script_option_matches_released_toolchain(monkeypatch, tmp_path, version, option):
+    def run(command, directory, name, cancelled):
+        assert command == ["ffmpeg", "-version"]
+        cancelled()
+        receipt = directory / f"{name}.stdout"
+        receipt.write_text(f"ffmpeg version {version} Copyright\n", encoding="ascii")
+        return receipt
+
+    monkeypatch.setattr(P, "_run", run)
+    assert VSmp._filter_script_option("ffmpeg", tmp_path, lambda: False) == option
+
+
+@pytest.mark.parametrize("version", ["N-1234-abcdef", "5.1", "custom build"])
+def test_filter_script_option_rejects_unknown_or_unsupported_toolchain(monkeypatch, tmp_path, version):
+    def run(command, directory, name, cancelled):
+        receipt = directory / f"{name}.stdout"
+        receipt.write_text(f"ffmpeg version {version} Copyright\n", encoding="ascii")
+        return receipt
+
+    monkeypatch.setattr(P, "_run", run)
+    with pytest.raises(DependencyUnavailable) as failure:
+        VSmp._filter_script_option("ffmpeg", tmp_path, lambda: False)
+    assert failure.value.code == "UNSUPPORTED_TOOLCHAIN"
+
+
+@pytest.mark.parametrize("max_bytes,timeout", [(0, 1), (True, 1), (1, 0),
+                                               (1, float("nan")), (1, True)])
+def test_decode_rejects_invalid_resource_limits(monkeypatch, tmp_path, max_bytes, timeout):
+    plan = _fake_binding(monkeypatch, tmp_path)
+    with pytest.raises(SchemaInvalid):
+        VSmp.decode_samples(None, "med-test", plan, tmp_path / "frames",
+                            max_bytes=max_bytes, timeout=timeout, ffmpeg=sys.executable)
+
+
+def test_explicit_decoder_still_verifies_playback_when_path_has_no_ffmpeg(monkeypatch, tmp_path):
+    plan = _fake_binding(monkeypatch, tmp_path)
+    monkeypatch.setattr(VSmp.shutil, "which", lambda name: None)
+
+    def run(command, directory, name, cancelled):
+        (directory / "frame-0001.png").write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        (tmp_path / "playback.mp4").write_bytes(b"changed playback")
+
+    monkeypatch.setattr(P, "_run", run)
+    with pytest.raises(WorkspaceError) as failure:
+        VSmp.decode_samples(None, "med-test", plan, tmp_path / "frames",
+                            ffmpeg=sys.executable)
+    assert failure.value.code == "RECOVERY_REQUIRED"
 
 
 @pytest.mark.parametrize("mode", ["failed", "missing", "invalid_png", "byte_budget"])

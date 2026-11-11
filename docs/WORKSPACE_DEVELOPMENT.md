@@ -61,20 +61,20 @@ and ffprobe on PATH. Retain the original media. Install the current checkout:
 
 ```powershell
 python -m pip install -e ".[dev]"
-trace-annotate workspace init --project D:\TraceAnnotateProjects\sample
-trace-annotate workspace import --project D:\TraceAnnotateProjects\sample C:\Videos\one.mp4 C:\Videos\two.mp4
-trace-annotate workspace list --project D:\TraceAnnotateProjects\sample
-trace-annotate workspace intakes --project D:\TraceAnnotateProjects\sample
+trace-annotate workspace init --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample
+trace-annotate workspace import --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample D:\视频标注具身标注\02_PROJECT_DATA\02_MEDIA_INPUT\one.mp4 D:\视频标注具身标注\02_PROJECT_DATA\02_MEDIA_INPUT\two.mp4
+trace-annotate workspace list --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample
+trace-annotate workspace intakes --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample
 ```
 
 Import reports each valid or rejected input and exits nonzero for a partial
 failure. Use task IDs from `list` for a fixed selection. Replace the placeholders:
 
 ```powershell
-trace-annotate workspace batch create --project D:\TraceAnnotateProjects\sample --task-id TASK_ONE --task-id TASK_TWO --command-id cmd-verify-001
-trace-annotate workspace batch run --project D:\TraceAnnotateProjects\sample --batch-id BATCH_ID
-trace-annotate workspace batch show --project D:\TraceAnnotateProjects\sample --batch-id BATCH_ID
-trace-annotate workspace export --project D:\TraceAnnotateProjects\sample --name snapshot-001
+trace-annotate workspace batch create --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample --task-id TASK_ONE --task-id TASK_TWO --command-id cmd-verify-001
+trace-annotate workspace batch run --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample --batch-id BATCH_ID
+trace-annotate workspace batch show --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample --batch-id BATCH_ID
+trace-annotate workspace export --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample --name snapshot-001
 ```
 
 `batch run` returns nonzero while any selected job is failed, cancelled, paused
@@ -84,8 +84,8 @@ Repeating the same creation command returns its original receipt. A changed
 request with the same command ID is rejected.
 
 ```powershell
-trace-annotate workspace batch control --project D:\TraceAnnotateProjects\sample --batch-id BATCH_ID --action pause_dispatch --command-id cmd-pause-001
-trace-annotate workspace batch control --project D:\TraceAnnotateProjects\sample --batch-id BATCH_ID --action resume_dispatch --command-id cmd-resume-001
+trace-annotate workspace batch control --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample --batch-id BATCH_ID --action pause_dispatch --command-id cmd-pause-001
+trace-annotate workspace batch control --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample --batch-id BATCH_ID --action resume_dispatch --command-id cmd-resume-001
 ```
 
 The other actions are `cancel` and `retry_failed`. Pause stops new dispatch;
@@ -140,10 +140,68 @@ paths or run unknown queued processors automatically.
 
 ## Browser workflow
 
+### Visual analysis: resources and explicit retry
+
+Visual candidates remain unreviewed and separate from saved manual annotations.
+Installing the base package does not install optional model runtimes or weights.
+An unavailable runtime or missing checkpoint is reported as `not_run`; querying
+capabilities does not load a model. A verified local checkpoint that fails to load
+is a failed execution, rather than a successful prediction or a missing-model result.
+
+CLIP and VLM run one model at a time in separate owned child processes. The first
+process must exit and be reaped before the next model starts. Default admission
+requires 2 GiB for the model plus a 1 GiB available host-memory reserve. Admission
+waits at most 60 seconds; running workers also check the reserve. These are
+conservative local checks, not an OS memory reservation or a guarantee for every
+model. The model slot is shared by workspaces in the same service process.
+
+Optional environment settings are `TRACE_ANNOTATE_MODEL_BUDGET_MIB` (default 2048,
+minimum 2048), `TRACE_ANNOTATE_MODEL_RESERVE_MIB` (default 1024, minimum 1024),
+`TRACE_ANNOTATE_MODEL_WAIT_SECONDS` (default 60, range 0–600),
+`TRACE_ANNOTATE_MODEL_FRAME_SECONDS` (default 60, range 5–600) and
+`TRACE_ANNOTATE_MODEL_PHASE_SECONDS` (default 3600, range 60–86400). Invalid values
+are rejected. Memory measurement failures, exhausted memory, timeouts and worker
+failures are explicit failures; they do not commit a candidate result. Cancellation
+and timeout terminate the owned model process tree and wait for its wrapper.
+On Windows the service owns the last kill-on-close Job Object handle. This does
+not establish equivalent cleanup after a sudden parent crash on every platform.
+
+The **Retry task** button is available for failed or cancelled visual jobs whose
+saved input still matches the current task. It keeps the original command ID
+while a response is unconfirmed, queries its durable receipt, and displays queued
+only after confirmation. The request to `POST /jobs/{id}/control` uses
+`retry_failed` or `retry_cancelled`, `command_id`, `expected_revision` and
+`expected_sha256`. Revision and hash are an optional pair for job retries;
+legacy callers without this pair keep their existing frozen-input behavior.
+Batch controls and cancellation do not accept these additional fields.
+
+For a new guarded retry, the server checks both the frozen job input and current
+task inside the write transaction. A changed task returns `REVISION_CONFLICT` or
+`MEDIA_CHANGED` without changing the job or recording a successful control.
+An already committed command still returns its original receipt after later
+edits; replay does not start another attempt. A changed model configuration needs
+**Run visual analysis** to submit a new configuration, rather than repeatedly
+retrying a job marked `VISION_RESUBMIT_REQUIRED`. Release resources or correct the
+reported environment problem before retrying; retry is not a quality approval.
+
+Keep workspaces, model caches and diagnostics under the chosen project root.
+For this local deployment that root is `D:\视频标注具身标注`; use
+`02_PROJECT_DATA\03_ANALYSIS_OUTPUT` for workspaces/runs and
+`02_PROJECT_DATA\06_LOCAL_TOOLS\vision-assist` for model tools/caches. Explicitly
+permitted model downloads must be prepared and verified before submitting a job
+with its frozen deployment identity. Preserve successful candidate evidence and
+failure diagnostics; do not delete worker directories to manufacture a pass.
+
+The resource and sampling checks have distinct scopes: a three-frame real model
+run verifies that deployment and process isolation; a 1369-frame decode comparison
+verifies sample identities and bounded decoding. Neither replaces a new full-video
+pipeline run or semantic/reference-label evaluation. Historical full-video runs
+with failed boundary sampling remain failed for those modules.
+
 After initializing a new workspace, run:
 
 ```powershell
-trace-annotate workspace serve --project D:\TraceAnnotateProjects\sample
+trace-annotate workspace serve --project D:\视频标注具身标注\02_PROJECT_DATA\03_ANALYSIS_OUTPUT\workspaces\sample
 ```
 
 Select multiple files in the workbench. Upload and media preparation are separate:

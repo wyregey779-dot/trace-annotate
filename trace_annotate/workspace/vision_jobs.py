@@ -17,6 +17,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+from types import SimpleNamespace
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -28,6 +29,7 @@ from ..extractors.camera_motion import analyse_motion
 from ..extractors.expressive_cues import acoustic_claim, measure_acoustic_window, face_cue_candidates, cues_to_claims
 from ..extractors.persons import PersonExtractor, OFFICIAL_WEIGHTS_SHA256 as PERSON_WEIGHTS_SHA256
 from . import optional_vision as OV
+from . import model_worker as MW
 from ..extractors.scene_change import detect_content_changes, minimum_samples
 from ..extractors.clip_engine import CLIPExtractor
 from ..extractors.faces import FaceExtractor
@@ -116,7 +118,8 @@ def _content_clip(start: Any, end: Any, duration: Any) -> Tuple[Any, Any]:
 
 def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE_CONTRACT,
                   optional_providers: Optional[Dict[str, Any]] = None,
-                  include_optional: bool = True) -> Dict[str, Any]:
+                  include_optional: bool = True, model_resources: Optional[Dict[str, Any]] = None,
+                  include_model_resources: bool = True) -> Dict[str, Any]:
     thresholds = MetricThresholds()
     config = {
         "scene_threshold": thresholds.scene_threshold,
@@ -140,6 +143,9 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
         config["content_sampling"]["evidence_contract"] = content_evidence_contract
     if include_optional:
         config["optional_providers"] = OV.validate_config(optional_providers if optional_providers is not None else OV.provider_config())
+    if include_model_resources:
+        config["model_resources"] = MW.validate_configuration(
+            model_resources if model_resources is not None else MW.configuration())
     return {"pipeline": "vision-assist-v1", "processor_version": VERSION,
             "config_sha256": S.sha256_text(config), "config": config,
             "model_identity": "declared_at_run_not_at_config_query",
@@ -148,7 +154,9 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
 
 def _parameters(window: Optional[Dict[str, Any]] = None,
                 subject_annotation_id: Optional[str] = None, *,
-                optional_providers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                optional_providers: Optional[Dict[str, Any]] = None,
+                model_resources: Optional[Dict[str, Any]] = None,
+                include_model_resources: bool = True) -> Dict[str, Any]:
     if subject_annotation_id is not None:
         S.require_id(subject_annotation_id)
         if window is None:
@@ -159,7 +167,9 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
                 or not 0 <= S.rational_value(window["start"]) < S.rational_value(window["end"])):
             raise SchemaInvalid("SCHEMA_INVALID", "window must be a reduced rational half-open interval")
     return json.loads(S.canonical_json({"window": window, "subject_annotation_id": subject_annotation_id,
-                                        "time_domain": DOMAIN, "job_identity": _job_identity(optional_providers=optional_providers)}))
+                                        "time_domain": DOMAIN, "job_identity": _job_identity(
+                                            optional_providers=optional_providers, model_resources=model_resources,
+                                            include_model_resources=include_model_resources)}))
 
 
 def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -174,17 +184,22 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(identity, dict) or not isinstance(identity.get("config"), dict):
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
     optional = identity["config"].get("optional_providers")
+    resources = identity["config"].get("model_resources")
+    if resources is not None:
+        MW.validate_configuration(resources)
     if optional is not None:
         OV.validate_config(optional)
-    current = _parameters(parameters["window"], parameters["subject_annotation_id"], optional_providers=optional)
+    resource_options = {"model_resources": resources, "include_model_resources": resources is not None}
+    current = _parameters(parameters["window"], parameters["subject_annotation_id"],
+                          optional_providers=optional, **resource_options)
     # Immutable completed candidates remain readable after optional deployment
     # or implementation changes. Execution separately requires the current
     # descriptor, so historical queued work cannot silently use new models.
-    identities = [_job_identity(optional_providers=optional),
-                  _job_identity(optional_providers=optional, content_evidence_contract=None)]
+    identities = [_job_identity(optional_providers=optional, **resource_options),
+                  _job_identity(optional_providers=optional, content_evidence_contract=None, **resource_options)]
     if optional is None:
-        identities.extend([_job_identity(include_optional=False),
-                           _job_identity(include_optional=False, content_evidence_contract=None)])
+        identities.extend([_job_identity(include_optional=False, **resource_options),
+                           _job_identity(include_optional=False, content_evidence_contract=None, **resource_options)])
     if not any(parameters == dict(current, job_identity=item) for item in identities):
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
     media, task = job["media_snapshot"], job["task_snapshot"]
@@ -554,6 +569,10 @@ class VisionJobs:
         self._loaded_optional_config = None
         self._extractors = None
         self._extractor_error = None
+        self._isolated_heavy = False
+
+    def _model_config(self):
+        return MW.configuration(clip_model=self.clip_model_path, vlm_model=self.vlm_model_path)
 
     def _optional_config(self) -> Dict[str, Any]:
         return OV.provider_config(person_model=self.person_model_path or "",
@@ -579,6 +598,8 @@ class VisionJobs:
             if not loaded:
                 return "not_loaded"
             instance = self._extractors.get(key) if self._extractors else None
+            if getattr(instance, "released_worker", False):
+                return "released" if instance.available else "unavailable"
             if key == "face":
                 ready = instance is not None and instance.detector is not None
             elif key == "ocr":
@@ -605,7 +626,8 @@ class VisionJobs:
                expected_sha256: str, window: Optional[Dict[str, Any]] = None,
                subject_annotation_id: Optional[str] = None) -> Dict[str, Any]:
         S.require_id(command_id)
-        parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config())
+        parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config(),
+                                 model_resources=self._model_config())
         items = [{"task_id": task_id, "expected_revision": expected_revision, "expected_sha256": expected_sha256}]
         request = {"kind": "queue.create_batch", "items": items, "operation": OPERATION,
                    "processor_version": VERSION, "parameters": parameters}
@@ -632,7 +654,8 @@ class VisionJobs:
         same receipt instead of creating a second set of candidates.
         """
         S.require_id(command_id)
-        parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config())
+        parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config(),
+                                 model_resources=self._model_config())
         if not isinstance(items, list) or not items:
             raise SchemaInvalid("SCHEMA_INVALID", "Vision batch needs at least one task")
         normalized: List[Dict[str, Any]] = []
@@ -688,18 +711,18 @@ class VisionJobs:
         try:
             face = FaceExtractor(model_path=self.face_model_path, thresholds=thresholds)
             ocr = OCRExtractor(thresholds=thresholds)
-            clip = CLIPExtractor(model_name_or_path=self.clip_model_path, thresholds=thresholds)
-            vlm = VLMExtractor(model_path=self.vlm_model_path)
             person = PersonExtractor(model_path=optional["person"]["model_path"],
                                      expected_sha256=optional["person"]["weights_sha256"])
-            self._extractors = {"face": face, "ocr": ocr, "clip": clip, "vlm": vlm, "person": person}
+            self._extractors = {"face": face, "ocr": ocr, "clip": None, "vlm": None, "person": person}
+            self._isolated_heavy = True
         except Exception as exc:
             self._extractor_error = str(exc)
             self._extractors = {"face": None, "ocr": None, "clip": None, "vlm": None, "person": None}
 
     def _processor(self, job: Dict[str, Any], context: Any) -> Dict[str, Any]:
         parameters = _validate_job(job)
-        if parameters["job_identity"] != _job_identity(optional_providers=self._optional_config()):
+        resources = self._model_config()
+        if parameters["job_identity"] != _job_identity(optional_providers=self._optional_config(), model_resources=resources):
             raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
                                  "Legacy vision configuration is read/apply-only; resubmit a new vision job")
         self._validate_snapshot(job)
@@ -753,7 +776,7 @@ class VisionJobs:
                 ffmpeg = _find_ffmpeg()
                 thresholds = MetricThresholds()
                 self._load_extractors(thresholds)
-                if parameters["job_identity"] != _job_identity(optional_providers=self._optional_config()):
+                if parameters["job_identity"] != _job_identity(optional_providers=self._optional_config(), model_resources=resources):
                     raise WorkspaceError("VISION_RESUBMIT_REQUIRED", "Optional provider configuration changed while loading; resubmit")
                 extractors = self._extractors or {"face": None, "ocr": None, "clip": None}
                 detector = SceneDetector(thresholds=thresholds)
@@ -812,8 +835,8 @@ class VisionJobs:
                         framing_result = _shot_framing(frame, face_result, person_result)
                         landmark_images.append({"path": str(item["path"]), "frame_index": item["frame_index"]})
                         ocr_result = _run_ocr(frame, extractors["ocr"])
-                        clip_result = _run_clip(frame, extractors["clip"])
-                        vlm_result = _run_vlm(frame, extractors["vlm"])
+                        clip_result = _run_clip(frame, extractors["clip"]) if not self._isolated_heavy else {}
+                        vlm_result = _run_vlm(frame, extractors["vlm"]) if not self._isolated_heavy else {}
                         keyframes.append({
                             "scene_index": scene_index,
                             "frame_index": item["frame_index"],
@@ -836,6 +859,20 @@ class VisionJobs:
                     sampling = None
                 for index in list(scene_frames):
                     flush_scene(index)
+                if self._isolated_heavy and keyframes:
+                    decoded_by_index = {item["frame_index"]: item for item in decoded["decoded"]}
+                    images = [{"frame_index": item["frame_index"],
+                               "path": str(decoded_by_index[item["frame_index"]]["path"]),
+                               "sha256": item["evidence_sha256"]} for item in keyframes]
+                    for module in ("clip", "vlm"):
+                        phase = MW.run_phase(module, resources, images, work, cancelled=cancelled)
+                        for frame, result in zip(keyframes, phase["results"]):
+                            frame[module] = result["result"]
+                        # Only JSON identity survives. Native model allocations
+                        # belong to the process already reaped by run_phase.
+                        extractors[module] = SimpleNamespace(
+                            code_identity=phase["identity"], model=None, released_worker=True,
+                            available=phase["available"], task_prompt=phase["identity"].get("task_prompt", CAPTION_TASK))
                 # Only filenames and small geometric results cross the worker
                 # boundary; decoded images are not accumulated for MediaPipe.
                 landmark_result = OV.run_landmarks(parameters["job_identity"]["config"]["optional_providers"],
@@ -1258,7 +1295,11 @@ class VisionJobs:
                 if left <= 0:
                     break
                 self._condition.wait(min(left, .05))
-            return {"stopped": not self._runners and not self._heartbeats and not (self._drainer is not None and self._drainer.is_alive()),
+            stopped = not self._runners and not self._heartbeats and not (self._drainer is not None and self._drainer.is_alive())
+            if stopped:
+                self._extractors = None
+                self._loaded_optional_config = None
+            return {"stopped": stopped,
                     "active_jobs": sorted(self._active_jobs), "closing": True, "drainer_error": self._drainer_error}
 
     def _validate_candidate(self, value: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:

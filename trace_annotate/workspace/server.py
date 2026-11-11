@@ -836,9 +836,20 @@ class _Handler(BaseHTTPRequestHandler):
                     result["imported_count"] = len(import_payload["annotations"])
                     result["endpoint_adjustments"] = len(import_payload["legacy_document_envelope"].get("endpoint_adjustments", []))
                 elif control:
-                    body = _fields(body, {"command_id", "action"})
+                    fields = {"command_id", "action"}
+                    if (isinstance(body, dict) and parts[0] == "jobs"
+                            and body.get("action") in ("retry_failed", "retry_cancelled")
+                            and ("expected_revision" in body or "expected_sha256" in body)):
+                        fields |= {"expected_revision", "expected_sha256"}
+                    body = _fields(body, fields)
                     if not isinstance(body["action"], str):
                         raise SchemaInvalid("SCHEMA_INVALID", "action must be a string")
+                    if "expected_revision" in fields:
+                        if (type(body["expected_revision"]) is not int or
+                                not 0 <= body["expected_revision"] <= MAX_SAFE_INTEGER or
+                                not isinstance(body["expected_sha256"], str) or
+                                HASH_PATTERN.fullmatch(body["expected_sha256"]) is None):
+                            raise SchemaInvalid("SCHEMA_INVALID", "Invalid retry input revision or hash")
                     method = self.server.queue.control_batch if parts[0] == "batches" else self.server.queue.control_job
                     result = method(parts[1], **body)
                 else:

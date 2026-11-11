@@ -463,7 +463,7 @@ class DurableQueue:
             if job["state"] != "failed":
                 raise Conflict("INVALID_JOB_STATE", "Only failed jobs can be retried")
             self.store.conn.execute("UPDATE jobs SET state='queued',worker_id=NULL,session_id=NULL,lease_expires_at=NULL, "
-                                    "error_code=NULL WHERE id=?", (job_id,))
+                                    "error_code=NULL,error_message=NULL WHERE id=?", (job_id,))
             return self.get_job(job_id)
 
     def retry_cancelled(self, job_id: str) -> Dict[str, Any]:
@@ -477,7 +477,7 @@ class DurableQueue:
             if job["state"] != "cancelled":
                 raise Conflict("INVALID_JOB_STATE", "Only cancelled jobs can be resumed")
             self.store.conn.execute("UPDATE jobs SET state='queued',worker_id=NULL,session_id=NULL,lease_expires_at=NULL, "
-                                    "error_code=NULL WHERE id=?", (job_id,))
+                                    "error_code=NULL,error_message=NULL WHERE id=?", (job_id,))
             return self.get_job(job_id)
 
     def control_batch(self, batch_id: str, action: str, *, command_id: Optional[str] = None) -> Dict[str, Any]:
@@ -509,14 +509,33 @@ class DurableQueue:
             self._save_receipt(command_id, request, result)
             return result
 
-    def control_job(self, job_id: str, action: str, *, command_id: Optional[str] = None) -> Dict[str, Any]:
+    def control_job(self, job_id: str, action: str, *, command_id: Optional[str] = None,
+                    expected_revision: Optional[int] = None,
+                    expected_sha256: Optional[str] = None) -> Dict[str, Any]:
         if action not in ("cancel", "retry_failed", "retry_cancelled"):
             raise SchemaInvalid("SCHEMA_INVALID", "Unsupported job control")
         request = {"kind": "queue.control_job", "job_id": job_id, "action": action}
+        guarded = expected_revision is not None or expected_sha256 is not None
+        if guarded:
+            if (action == "cancel" or type(expected_revision) is not int or
+                    not 0 <= expected_revision <= S.MAX_SAFE_INTEGER or
+                    not isinstance(expected_sha256, str) or S.HASH_RE.fullmatch(expected_sha256) is None):
+                raise SchemaInvalid("SCHEMA_INVALID", "Retry input needs a paired valid revision and hash")
+            request.update(expected_revision=expected_revision, expected_sha256=expected_sha256)
         with self.store.transaction():
             receipt = self._receipt(command_id, request)
             if receipt is not None:
                 return receipt
+            if guarded:
+                job = self._job(job_id)
+                current = self.store.get_task(job["task_id"])
+                if job["input_revision"] != expected_revision or current["revision"] != expected_revision:
+                    raise Conflict("REVISION_CONFLICT", "Task changed before retry",
+                                   details={"expected_revision": expected_revision,
+                                            "current_revision": current["revision"]})
+                if (job["input_sha256"] != expected_sha256 or current["content_sha256"] != expected_sha256
+                        or self.store.task_digest(current) != expected_sha256):
+                    raise Conflict("MEDIA_CHANGED", "Task digest changed before retry")
             value = {"cancel": self.cancel, "retry_failed": self.retry_failed,
                      "retry_cancelled": self.retry_cancelled}[action](job_id)
             result = {"job_id": job_id, "action": action, "state": value["state"]}

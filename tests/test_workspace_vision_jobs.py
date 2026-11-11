@@ -1119,7 +1119,8 @@ def test_vision_sampling_uses_pts_anchored_multi_frame_plan(store):
     assert covered == set(range(len(result["scenes"])))
     for item in result["evidence"]:
         relative = PurePosixPath(item["relative_path"])
-        is_diagnostic = (relative.name in {"commands.jsonl", "decode.stdout", "decode.stderr"}
+        is_diagnostic = (relative.name in {"commands.jsonl", "decode.stdout", "decode.stderr",
+                                          "select.filter", "decode-tool.stdout", "decode-tool.stderr"}
                          and relative.parent.name.startswith(".decode-"))
         assert relative.suffix == ".png" or str(relative).endswith("audio/acoustic.m4a") or is_diagnostic
         evidence = store.root / item["relative_path"]
