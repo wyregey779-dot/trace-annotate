@@ -322,3 +322,75 @@ def test_worker_cannot_report_success_without_a_loaded_model(tmp_path,monkeypatc
     with pytest.raises(WorkspaceError) as error:
         M.run_phase('clip',config,images,tmp_path,cancelled=lambda:False)
     assert error.value.code=='MODEL_WORKER_PROTOCOL'
+
+
+@pytest.mark.parametrize('cooperative',[False,True],ids=['uncooperative-owner','cooperative-cancel'])
+def test_server_close_reports_vision_owner_and_preserves_store_until_actual_exit(store,tmp_path,monkeypatch,cooperative):
+    from trace_annotate.workspace import server as HTTP
+    from trace_annotate.workspace.store import WorkspaceStore
+    entered,release,cancel_recorded=threading.Event(),threading.Event(),threading.Event()
+    monkeypatch.setenv('TRACE_ANNOTATE_CLIP_CACHE',str(tmp_path/'empty-close-clip'))
+    monkeypatch.setenv('TRACE_ANNOTATE_VLM_CACHE',str(tmp_path/'empty-close-vlm'))
+    # Keep the real VisionJobs runner, queue ownership and server shutdown;
+    # no optional model construction is needed for this lifecycle boundary.
+    monkeypatch.setattr(V.VisionJobs,'start',lambda self:self)
+    monkeypatch.setattr(V.VisionJobs,'_load_extractors',lambda self,thresholds:None)
+    server=HTTP.make_server(store)
+    assert server.analysis_jobs.close(timeout=5)["stopped"]
+    assert server.render_jobs.close(timeout=5)["stopped"]
+    current=task(store)
+    worker=None
+    def blocked_scene_stage(*args,**kwargs):
+        entered.set()
+        # Cooperative control waits for the real queue cancellation transaction;
+        # the other mode models a native stage ignoring cancellation temporarily.
+        assert (cancel_recorded if cooperative else release).wait(10)
+        raise WorkspaceError('CANCELLED','Controlled vision stage stopped after cancellation')
+    monkeypatch.setattr(V,'_run_scenes',blocked_scene_stage)
+    original_cancel=server.queue.cancel
+    def cancel_and_signal(job_id):
+        result=original_cancel(job_id)
+        cancel_recorded.set()
+        return result
+    monkeypatch.setattr(server.queue,'cancel',cancel_and_signal)
+    queued=server.vision_jobs.submit(current['id'],command_id='vision-close-owner',
+        expected_revision=current['revision'],expected_sha256=current['content_sha256'])['jobs'][0]
+    try:
+        worker=threading.Thread(target=server.vision_jobs.run_pending)
+        worker.start()
+        assert entered.wait(10)
+        monkeypatch.setattr(HTTP,'CLOSE_WORKER_SECONDS',2.0 if cooperative else .01)
+        if cooperative:
+            server.server_close()
+            assert server.shutdown_report['vision_worker']['stopped'] is True
+        else:
+            with pytest.raises(WorkspaceError) as busy_server:
+                server.server_close()
+            assert busy_server.value.code=='WORKSPACE_BUSY'
+            assert 'Vision worker' in str(busy_server.value)
+            assert server.shutdown_report['vision_worker']['stopped'] is False
+            assert worker.is_alive() and store.lock._handle is not None
+            with pytest.raises(WorkspaceError) as busy_store:
+                store.close()
+            assert busy_store.value.code=='WORKSPACE_BUSY'
+            assert task(store)==current
+            # A failed close must retain the actual OS single-writer lock.
+            with pytest.raises(WorkspaceError) as locked:
+                WorkspaceStore(store.root).open()
+            assert locked.value.code=='PROJECT_LOCKED'
+    finally:
+        release.set()
+        if worker is not None:
+            worker.join(10)
+        monkeypatch.setattr(HTTP,'CLOSE_WORKER_SECONDS',2.0)
+        server.server_close()
+    assert worker is not None and not worker.is_alive()
+    assert cancel_recorded.is_set()
+    assert server.shutdown_report['vision_worker']['stopped'] is True
+    terminal=server.queue.get_job(queued['id'])
+    assert terminal['state']=='cancelled' and terminal['commit'] is None
+    assert task(store)==current
+    store.close()
+    store.open()
+    assert task(store)==current
+    assert server.queue.get_job(queued['id'])['state']=='cancelled'

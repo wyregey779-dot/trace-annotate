@@ -175,6 +175,8 @@ class WorkspaceHTTPServer(ThreadingHTTPServer):
             self.image_service.close()
         if report.get("analysis_worker", {}).get("stopped") is False:
             raise Conflict("WORKSPACE_BUSY", "Analysis worker has not stopped; preserve its open workspace and retry shutdown")
+        if report.get("vision_worker", {}).get("stopped") is False:
+            raise Conflict("WORKSPACE_BUSY", "Vision worker has not stopped; preserve its open workspace and retry shutdown")
         if report.get("render_worker", {}).get("stopped") is False:
             raise Conflict("WORKSPACE_BUSY", "Render worker has not stopped; preserve its open workspace and retry shutdown")
 

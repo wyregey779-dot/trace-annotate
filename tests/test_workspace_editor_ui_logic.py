@@ -103,7 +103,8 @@ const implementation = JSON.parse(process.argv[1]);
 const fields = {
   'vision-job': {hidden: true, textContent: ''},
   'vision-cancel': {hidden: false, disabled: false},
-  'vision-apply': {hidden: false, disabled: false}
+  'vision-apply': {hidden: false, disabled: false},
+  'vision-retry': {hidden: false, disabled: false}
 };
 const insufficient = '内容变化检测至少需要 9 个覆盖同一镜头的采样帧，当前只有 8 帧；未判定为无变化。';
 const state = {
@@ -141,6 +142,8 @@ assert.match(fields['vision-job'].textContent,
   /六项能力 转场=success 内容=insufficient_samples\(0变化\/2过滤\) 人体\/人脸\/景别\/运镜=success\/success\/success\/success 人脸关键点=success 动作=success\(0候选;支持走\/跑;未支持拿起\/放下\/打开\/关闭\/递交\) 表情=not_run\(no_landmark_provider_in_this_build\) 声学=success/);
 assert.equal(fields['vision-apply'].hidden, false);
 assert.equal(fields['vision-cancel'].hidden, true);
+assert.equal(fields['vision-retry'].hidden, true);
+assert.equal(fields['vision-retry'].disabled, true);
 """
 
     completed = subprocess.run(
