@@ -219,7 +219,7 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
                for item in content["scene_results"])
     runs = result["model_runs"]
     modules = {"face", "ocr", "clip", "vlm", "scene", "motion", "content",
-               "actions", "acoustics", "boundary"}
+               "actions", "acoustics", "boundary", "person", "landmarks", "expressive"}
     run_ids = {run["id"] for run in runs}
     assert len(run_ids) == len(runs) == len(modules)
     assert run_ids == {V._module_run_id(queued["id"], name) for name in modules}
@@ -232,6 +232,11 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert "insufficient_samples" in content_run["failure_reason"]
     for run in runs:
         assert SS.validate_model_run(run) == run
+    for module in ("person", "landmarks", "expressive"):
+        optional_run = next(run for run in runs if run["id"] == V._module_run_id(queued["id"], module))
+        assert optional_run["status"] == "not_run"
+        assert optional_run["failure_reason"]
+        assert optional_run["output_sha256"] is None
     assert any(run["status"] == "not_run" and run["failure_reason"] for run in runs)
     assert all(run["status"] == "success" or run["failure_reason"] for run in runs)
     assert len(result["scenes"]) >= 1

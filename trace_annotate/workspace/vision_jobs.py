@@ -25,7 +25,9 @@ from ..config import MetricThresholds
 from ..extractors.actions import (ACTION_VOCAB, detect_translation_candidates,
                                   merge_candidates, provider_coverage)
 from ..extractors.camera_motion import analyse_motion
-from ..extractors.expressive_cues import acoustic_claim, measure_acoustic_window
+from ..extractors.expressive_cues import acoustic_claim, measure_acoustic_window, face_cue_candidates, cues_to_claims
+from ..extractors.persons import PersonExtractor, OFFICIAL_WEIGHTS_SHA256 as PERSON_WEIGHTS_SHA256
+from . import optional_vision as OV
 from ..extractors.scene_change import detect_content_changes, minimum_samples
 from ..extractors.clip_engine import CLIPExtractor
 from ..extractors.faces import FaceExtractor
@@ -112,7 +114,9 @@ def _content_clip(start: Any, end: Any, duration: Any) -> Tuple[Any, Any]:
     return start, end
 
 
-def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE_CONTRACT) -> Dict[str, Any]:
+def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE_CONTRACT,
+                  optional_providers: Optional[Dict[str, Any]] = None,
+                  include_optional: bool = True) -> Dict[str, Any]:
     thresholds = MetricThresholds()
     config = {
         "scene_threshold": thresholds.scene_threshold,
@@ -134,6 +138,8 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
     }
     if content_evidence_contract is not None:
         config["content_sampling"]["evidence_contract"] = content_evidence_contract
+    if include_optional:
+        config["optional_providers"] = OV.validate_config(optional_providers if optional_providers is not None else OV.provider_config())
     return {"pipeline": "vision-assist-v1", "processor_version": VERSION,
             "config_sha256": S.sha256_text(config), "config": config,
             "model_identity": "declared_at_run_not_at_config_query",
@@ -141,7 +147,8 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
 
 
 def _parameters(window: Optional[Dict[str, Any]] = None,
-                subject_annotation_id: Optional[str] = None) -> Dict[str, Any]:
+                subject_annotation_id: Optional[str] = None, *,
+                optional_providers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if subject_annotation_id is not None:
         S.require_id(subject_annotation_id)
         if window is None:
@@ -152,7 +159,7 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
                 or not 0 <= S.rational_value(window["start"]) < S.rational_value(window["end"])):
             raise SchemaInvalid("SCHEMA_INVALID", "window must be a reduced rational half-open interval")
     return json.loads(S.canonical_json({"window": window, "subject_annotation_id": subject_annotation_id,
-                                        "time_domain": DOMAIN, "job_identity": _job_identity()}))
+                                        "time_domain": DOMAIN, "job_identity": _job_identity(optional_providers=optional_providers)}))
 
 
 def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -163,11 +170,22 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
             or set(parameters) != {"window", "subject_annotation_id", "time_domain", "job_identity"}
             or parameters["time_domain"] != DOMAIN):
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
-    current = _parameters(parameters["window"], parameters["subject_annotation_id"])
-    # Read/apply the exact pre-evidence (6e52961) contract without accepting
-    # arbitrary frozen configurations. New submissions always use current.
-    legacy = dict(current, job_identity=_job_identity(content_evidence_contract=None))
-    if parameters != current and parameters != legacy:
+    identity = parameters["job_identity"]
+    if not isinstance(identity, dict) or not isinstance(identity.get("config"), dict):
+        raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
+    optional = identity["config"].get("optional_providers")
+    if optional is not None:
+        OV.validate_config(optional)
+    current = _parameters(parameters["window"], parameters["subject_annotation_id"], optional_providers=optional)
+    # Immutable completed candidates remain readable after optional deployment
+    # or implementation changes. Execution separately requires the current
+    # descriptor, so historical queued work cannot silently use new models.
+    identities = [_job_identity(optional_providers=optional),
+                  _job_identity(optional_providers=optional, content_evidence_contract=None)]
+    if optional is None:
+        identities.extend([_job_identity(include_optional=False),
+                           _job_identity(include_optional=False, content_evidence_contract=None)])
+    if not any(parameters == dict(current, job_identity=item) for item in identities):
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
     media, task = job["media_snapshot"], job["task_snapshot"]
     spec = {key: job[key] for key in ("task_id", "operation", "input_revision", "input_sha256", "processor_version", "parameters")}
@@ -240,44 +258,55 @@ def _run_face(frame: Any, face_extractor: Optional[FaceExtractor]) -> Dict[str, 
 
 
 def _subject_tracks(keyframes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Associate sampled face boxes into short per-scene subject tracks.
+    """One-to-one short box tracks; never link across a scene or a >5s gap.
 
-    Only boxes actually measured by the face extractor are used. A track is a
-    measurement of the sampled window, not an identity, and no track is invented
-    for a frame with no box. IoU association is per scene so a cut never links
-    two different subjects.
+    Person xyxy boxes take precedence. Face-only xywh geometry is retained as
+    a labelled fallback, never mixed into a person's trajectory. IoU gives
+    geometric continuity only, not a persistent identity or tracking accuracy.
     """
     tracks: List[Dict[str, Any]] = []
     per_scene: Dict[int, List[Dict[str, Any]]] = {}
-    for keyframe in sorted(keyframes, key=lambda item: (item["scene_index"], float(item["timestamp"]["n"]) / float(item["timestamp"]["d"]))):
+    for keyframe in sorted(keyframes, key=lambda item: (item["scene_index"], S.rational_value(item["timestamp"]))):
+        persons = keyframe.get("person") or {}
         face = keyframe.get("face") or {}
-        if face.get("status") != "success":
-            continue
-        faces = face.get("faces_detected") or []
-        if not faces:
-            continue
-        largest = max(faces, key=lambda item: float(item["box"][2]) * float(item["box"][3]))
-        x, y, box_width, box_height = [float(value) for value in largest["box"]]
-        box = (x, y, x + box_width, y + box_height)
-        seconds = float(keyframe["timestamp"]["n"]) / float(keyframe["timestamp"]["d"])
+        boxes = []
+        kind = "person"
+        if persons.get("status") == "success" and persons.get("persons_detected"):
+            boxes = [list(map(float, item["box"])) for item in persons["persons_detected"]]
+        elif face.get("status") == "success":
+            kind = "face"
+            for item in face.get("faces_detected") or []:
+                x, y, w, h = map(float, item["box"])
+                boxes.append([x, y, x + w, y + h])
+        seconds = float(S.rational_value(keyframe["timestamp"]))
         scene_index = int(keyframe["scene_index"])
         candidates = per_scene.setdefault(scene_index, [])
-        best = None
-        best_iou = 0.0
-        for track in candidates:
-            previous = track["points"][-1]["box"]
-            iou = _box_iou(previous, box)
-            if iou > best_iou:
-                best, best_iou = track, iou
-        if best is None or best_iou < 0.2:
-            best = {"subject_id": f"scene{scene_index}-subject{len(candidates) + 1}",
-                    "scene_index": scene_index, "kind": "face", "points": []}
-            candidates.append(best)
-            tracks.append(best)
-        best["points"].append({"box": [round(value, 2) for value in box],
-                               "frame_index": keyframe["frame_index"], "seconds": seconds})
+        # Assign strongest overlap first and consume both endpoints. A second
+        # detection can never append to the same track in this frame.
+        pairs = []
+        for track_index, track in enumerate(candidates):
+            gap = seconds - track["points"][-1]["seconds"]
+            if track["kind"] != kind or not 0 < gap <= 5:
+                continue
+            for box_index, box in enumerate(boxes):
+                overlap = _box_iou(track["points"][-1]["box"], box)
+                if overlap >= .2:
+                    pairs.append((overlap, track_index, box_index))
+        used_tracks, assigned = set(), {}
+        for _, track_index, box_index in sorted(pairs, reverse=True):
+            if track_index not in used_tracks and box_index not in assigned:
+                used_tracks.add(track_index)
+                assigned[box_index] = candidates[track_index]
+        for box_index, box in enumerate(boxes):
+            track = assigned.get(box_index)
+            if track is None:
+                track = {"subject_id": f"scene{scene_index}-subject{len(candidates) + 1}",
+                         "scene_index": scene_index, "kind": kind, "points": []}
+                candidates.append(track)
+                tracks.append(track)
+            track["points"].append({"box": [round(value, 2) for value in box],
+                                    "frame_index": keyframe["frame_index"], "seconds": seconds})
     return tracks
-
 
 def _box_iou(first: Sequence[float], second: Sequence[float]) -> float:
     left = max(float(first[0]), float(second[0]))
@@ -391,16 +420,18 @@ def _measure_audio(source: Path, ffmpeg: str, work: Path) -> Dict[str, Any]:
             "measurement": measurement}
 
 
-def _shot_framing(frame: Any, face_result: Dict[str, Any]) -> Dict[str, Any]:
-    """Framing from the face boxes this project actually measured.
-
-    A face-only ratio is explicitly downgraded and is never called a close-up
-    merely because the face is large. Without a face result the framing is
-    ``not_applicable``; it is not guessed from the frame.
-    """
+def _shot_framing(frame: Any, face_result: Dict[str, Any],
+                  person_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Use measured person xyxy geometry, with an explicit face-only fallback."""
+    persons = person_result or {}
+    if persons.get("status") == "success" and persons.get("persons_detected"):
+        height, width = frame.shape[:2]
+        result = classify_framing([item["box"] for item in persons["persons_detected"]],
+                                  (width, height), subject_kind="person")
+        result["status"] = "success"
+        return result
     if face_result.get("status") != "success":
-        return {"status": "not_run", "framing": None,
-                "reason": "face extractor did not report boxes"}
+        return {"status": "not_run", "framing": None, "reason": "no_available_subject_boxes"}
     faces = face_result.get("faces_detected") or []
     if not faces:
         return {"status": "success", "framing": "不适用", "subjects": 0,
@@ -414,6 +445,29 @@ def _shot_framing(frame: Any, face_result: Dict[str, Any]) -> Dict[str, Any]:
     result = classify_framing(boxes, (width, height), subject_kind="face")
     result["status"] = "success"
     return result
+
+
+def _run_person(frame: Any, extractor: Optional[PersonExtractor]) -> Dict[str, Any]:
+    if extractor is None:
+        return {"status": "not_run", "reason": "person_weights_unavailable", "persons_detected": []}
+    try:
+        return extractor.detect_people(frame)
+    except Exception as exc:
+        return {"status": "failed", "reason": str(exc)[:300], "persons_detected": []}
+
+
+def _expressive_result(measured: Dict[str, Any], keyframe: Dict[str, Any]) -> Dict[str, Any]:
+    evaluated = [face_cue_candidates(face, frame_index=keyframe["frame_index"],
+                                     evidence_id=keyframe["evidence_sha256"])
+                 for face in measured.get("faces_detected", [])]
+    cues = [cue for result in evaluated for cue in result.get("cues", [])]
+    usable = any(result.get("status") == "success" for result in evaluated)
+    status = "success" if usable else "failed" if measured["status"] == "failed" else "not_run"
+    reason = (None if usable else measured.get("reason") or
+              next((result.get("reason") for result in evaluated if result.get("reason")),
+                   "no_faces_with_usable_landmarks"))
+    return {"status": status, "reason": reason, "cues": cues, "face_results": evaluated,
+            "scope": "sampled_frame_geometry_not_emotion_or_blink_duration"}
 
 
 def _run_ocr(frame: Any, ocr_extractor: Optional[OCRExtractor]) -> Dict[str, Any]:
@@ -457,7 +511,9 @@ class VisionJobs:
     def __init__(self, store: Any, *, queue: Optional[DurableQueue] = None,
                  closing: Optional[threading.Event] = None, poll_seconds: float = .1,
                  slot_wait_seconds: float = 900, face_model_path: Optional[str] = None,
-                 clip_model_path: Optional[str] = None, vlm_model_path: Optional[str] = None):
+                 clip_model_path: Optional[str] = None, vlm_model_path: Optional[str] = None,
+                 person_model_path: Optional[str] = None, landmark_model_path: Optional[str] = None,
+                 landmark_python: Optional[str] = None):
         for value in (poll_seconds, slot_wait_seconds):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise SchemaInvalid("SCHEMA_INVALID", "Vision waits must be finite positive seconds")
@@ -479,8 +535,17 @@ class VisionJobs:
         self.face_model_path = face_model_path
         self.clip_model_path = clip_model_path
         self.vlm_model_path = vlm_model_path
+        self.person_model_path = person_model_path if person_model_path is not None else os.getenv("TRACE_ANNOTATE_PERSON_MODEL")
+        self.landmark_model_path = landmark_model_path if landmark_model_path is not None else os.getenv("TRACE_ANNOTATE_LANDMARK_MODEL")
+        self.landmark_python = landmark_python if landmark_python is not None else os.getenv("TRACE_ANNOTATE_LANDMARK_PYTHON")
+        self._loaded_optional_config = None
         self._extractors = None
         self._extractor_error = None
+
+    def _optional_config(self) -> Dict[str, Any]:
+        return OV.provider_config(person_model=self.person_model_path or "",
+                                  landmark_model=self.landmark_model_path or "",
+                                  landmark_python=self.landmark_python or "")
 
     def is_closing(self) -> bool:
         return self._closing.is_set() or (self._external_closing is not None and self._external_closing.is_set())
@@ -515,6 +580,8 @@ class VisionJobs:
             "ocr": adapter_state("ocr"),
             "clip": adapter_state("clip"),
             "vlm": adapter_state("vlm"),
+            "person": adapter_state("person"),
+            "landmarks": ("not_loaded" if self.landmark_model_path and self.landmark_python else "unavailable"),
         }
         return {"operation": OPERATION, "version": VERSION, "domain": DOMAIN,
                 "capabilities": capabilities, "loaded": loaded,
@@ -525,7 +592,7 @@ class VisionJobs:
                expected_sha256: str, window: Optional[Dict[str, Any]] = None,
                subject_annotation_id: Optional[str] = None) -> Dict[str, Any]:
         S.require_id(command_id)
-        parameters = _parameters(window, subject_annotation_id)
+        parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config())
         items = [{"task_id": task_id, "expected_revision": expected_revision, "expected_sha256": expected_sha256}]
         request = {"kind": "queue.create_batch", "items": items, "operation": OPERATION,
                    "processor_version": VERSION, "parameters": parameters}
@@ -552,7 +619,7 @@ class VisionJobs:
         same receipt instead of creating a second set of candidates.
         """
         S.require_id(command_id)
-        parameters = _parameters(window, subject_annotation_id)
+        parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config())
         if not isinstance(items, list) or not items:
             raise SchemaInvalid("SCHEMA_INVALID", "Vision batch needs at least one task")
         normalized: List[Dict[str, Any]] = []
@@ -601,21 +668,25 @@ class VisionJobs:
         Each extractor swallows its own load failure internally (model=None),
         so one broken adapter never disables the other extractors.
         """
-        if self._extractors is not None:
+        optional = self._optional_config()
+        if self._extractors is not None and self._loaded_optional_config == optional:
             return
+        self._loaded_optional_config = optional
         try:
             face = FaceExtractor(model_path=self.face_model_path, thresholds=thresholds)
             ocr = OCRExtractor(thresholds=thresholds)
             clip = CLIPExtractor(model_name_or_path=self.clip_model_path, thresholds=thresholds)
             vlm = VLMExtractor(model_path=self.vlm_model_path)
-            self._extractors = {"face": face, "ocr": ocr, "clip": clip, "vlm": vlm}
+            person = PersonExtractor(model_path=optional["person"]["model_path"],
+                                     expected_sha256=optional["person"]["weights_sha256"])
+            self._extractors = {"face": face, "ocr": ocr, "clip": clip, "vlm": vlm, "person": person}
         except Exception as exc:
             self._extractor_error = str(exc)
-            self._extractors = {"face": None, "ocr": None, "clip": None, "vlm": None}
+            self._extractors = {"face": None, "ocr": None, "clip": None, "vlm": None, "person": None}
 
     def _processor(self, job: Dict[str, Any], context: Any) -> Dict[str, Any]:
         parameters = _validate_job(job)
-        if parameters["job_identity"] != _job_identity():
+        if parameters["job_identity"] != _job_identity(optional_providers=self._optional_config()):
             raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
                                  "Legacy vision configuration is read/apply-only; resubmit a new vision job")
         self._validate_snapshot(job)
@@ -669,6 +740,8 @@ class VisionJobs:
                 ffmpeg = _find_ffmpeg()
                 thresholds = MetricThresholds()
                 self._load_extractors(thresholds)
+                if parameters["job_identity"] != _job_identity(optional_providers=self._optional_config()):
+                    raise WorkspaceError("VISION_RESUBMIT_REQUIRED", "Optional provider configuration changed while loading; resubmit")
                 extractors = self._extractors or {"face": None, "ocr": None, "clip": None}
                 detector = SceneDetector(thresholds=thresholds)
                 scene_result = _run_scenes(detector, Path(source), thresholds)
@@ -685,6 +758,7 @@ class VisionJobs:
                         if keyframe["scene_index"] == index:
                             keyframe["motion"] = motion_by_scene[index]
 
+                landmark_images = []
                 active_scene: Optional[int] = None
                 window = parameters["window"]
                 scenes = scene_result["scenes"]
@@ -721,7 +795,9 @@ class VisionJobs:
                         active_scene = scene_index
                         frame = _load_frame(Path(item["path"]))
                         face_result = _run_face(frame, extractors["face"])
-                        framing_result = _shot_framing(frame, face_result)
+                        person_result = _run_person(frame, extractors.get("person"))
+                        framing_result = _shot_framing(frame, face_result, person_result)
+                        landmark_images.append({"path": str(item["path"]), "frame_index": item["frame_index"]})
                         ocr_result = _run_ocr(frame, extractors["ocr"])
                         clip_result = _run_clip(frame, extractors["clip"])
                         vlm_result = _run_vlm(frame, extractors["vlm"])
@@ -734,6 +810,7 @@ class VisionJobs:
                             "timestamp": _seconds_ratio(seconds),
                             "evidence_sha256": item["sha256"],
                             "face": face_result,
+                            "person": person_result,
                             "framing": framing_result,
                             "ocr": ocr_result,
                             "clip": clip_result,
@@ -746,6 +823,18 @@ class VisionJobs:
                     sampling = None
                 for index in list(scene_frames):
                     flush_scene(index)
+                # Only filenames and small geometric results cross the worker
+                # boundary; decoded images are not accumulated for MediaPipe.
+                landmark_result = OV.run_landmarks(parameters["job_identity"]["config"]["optional_providers"],
+                                                    landmark_images, work, cancelled=cancelled)
+                landmark_frames = {item["frame_index"]: item for item in landmark_result.get("results", [])}
+                for keyframe in keyframes:
+                    measured = landmark_frames.get(keyframe["frame_index"], {
+                        "status": landmark_result["status"], "reason": landmark_result.get("reason"),
+                        "faces_detected": []})
+                    keyframe["landmarks"] = {key: value for key, value in measured.items()
+                                             if key not in {"path", "cue_results", "claims"}}
+                    keyframe["expressive"] = _expressive_result(measured, keyframe)
                 content_sampling: Dict[str, Any] = {
                     "status": "not_run", "reason": "scene_extraction_not_run"}
                 content_frames: List[Dict[str, Any]] = []
@@ -1015,25 +1104,27 @@ class VisionJobs:
                     "ocr": _aggregate_status(keyframes, "ocr"),
                     "clip": _aggregate_status(keyframes, "clip"),
                     "vlm": _aggregate_status(keyframes, "vlm"),
+                    "person": _aggregate_status(keyframes, "person"),
+                    "landmarks": _aggregate_status(keyframes, "landmarks"),
                 }
                 motion_status = "success" if any(
                     frame.get("motion", {}).get("status") == "success" for frame in keyframes) else "not_run"
                 module_status = dict(extractor_status)
                 module_status.update({
                     "boundary": boundary_sampling.get("status", "not_run"),
-                    "framing": extractor_status["face"],
+                    "framing": _aggregate_status(keyframes, "framing"),
                     "motion": motion_status,
                     "transition": ("success" if any(frame.get("boundary_events") for frame in keyframes)
                                    else boundary_sampling.get("status", "not_run")),
                     "actions": actions_sampling.get("status", "not_run"),
                     "content": content_sampling.get("status", "not_run"),
-                    "expressive": "not_run",
+                    "expressive": _aggregate_status(keyframes, "expressive"),
                     "acoustics": acoustics_sampling.get("status", "not_run"),
                 })
                 module_status["actions_reason"] = actions_sampling.get("reason")
                 module_status["actions_supported"] = actions_sampling.get("supported")
                 module_status["actions_unsupported"] = actions_sampling.get("unsupported")
-                module_status["expressive_reason"] = "no_landmark_provider_in_this_build"
+                module_status["expressive_reason"] = _first_module_reason(keyframes, "expressive") or landmark_result.get("reason")
                 module_status["content_reason"] = (content_sampling.get("message")
                                                    or content_sampling.get("error"))
                 module_status["acoustics_reason"] = acoustics_sampling.get("reason")
@@ -1264,6 +1355,10 @@ class VisionJobs:
             if checked["id"] in run_ids:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision model-run identities are duplicated")
             run_ids.add(checked["id"])
+        optional = parameters["job_identity"]["config"].get("optional_providers")
+        if optional is not None and any(_module_run_id(job["id"], name) not in run_ids
+                                        for name in ("person", "landmarks", "expressive")):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Current vision contract requires optional provider status records")
         content_run = next((run for run in model_runs
                             if run["id"] == _module_run_id(job["id"], "content")), None)
         if requires_content and content_run is None:
@@ -1412,7 +1507,7 @@ def _load_frame(path: Path) -> Any:
 def _aggregate_status(keyframes: List[Dict[str, Any]], extractor: str) -> str:
     if not keyframes:
         return "skipped"
-    statuses = [frame[extractor].get("status", "failed") for frame in keyframes]
+    statuses = [(frame.get(extractor) or {}).get("status", "not_run") for frame in keyframes]
     if all(status == "success" for status in statuses):
         return "success"
     if all(status == "not_run" for status in statuses):
@@ -1594,6 +1689,50 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         code_version=f"vision_jobs={VERSION}; opencv={_package_version('opencv-python')}",
         score_kind="confidence"))
 
+    optional = job["parameters"]["job_identity"]["config"].get("optional_providers")
+    if optional is not None:
+        person = optional["person"]
+        runs.append(_model_run_record(
+            job_id, "person", provider="onnxruntime-cpu",
+            model_name=("NanoDet-m-plus-1.5x_416_2022nov-person" if person["weights_sha256"] ==
+                        PERSON_WEIGHTS_SHA256 else "unverified_local_onnx"),
+            model_version=person["runtime_version"], weights_sha256=person["weights_sha256"],
+            license=("Apache-2.0 (OpenCV Zoo)" if person["weights_sha256"] ==
+                     PERSON_WEIGHTS_SHA256 else "unverified local weights"),
+            preprocessing={"input": "BGR letterbox 416x416", "output_coordinates": "decoded_frame_xyxy"},
+            parameters={"class": "COCO person 0", "score_threshold": .5, "nms_iou": .5,
+                        "max_persons": 100, "score_calibration": "not_established"},
+            input_value=frame_input, output_value=_frame_output(keyframes, "person"),
+            status=module_status.get("person", "not_run"),
+            failure_reason=_first_module_reason(keyframes, "person") or "no sampled frames",
+            code_version="optional-local-providers-v1:" + optional["implementation_sha256"],
+            score_kind="confidence"))
+        landmark = optional["landmarks"]
+        runs.append(_model_run_record(
+            job_id, "landmarks", provider="mediapipe-tasks-cpu", model_name="Face Landmarker / Face Mesh V2",
+            model_version=landmark["runtime"]["mediapipe_version"],
+            weights_sha256=landmark["weights_sha256"],
+            license=("Apache-2.0" if landmark["weights_sha256"] ==
+                     "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff" else "unverified local task"),
+            preprocessing={"input": "RGB decoded keyframes", "mode": "IMAGE", "max_faces": 4,
+                           "worker_python_sha256": landmark["worker_python_sha256"]},
+            parameters={"timeout_seconds": optional["worker_timeout_seconds"], "offline": True},
+            input_value=frame_input, output_value=_frame_output(keyframes, "landmarks"),
+            status=module_status.get("landmarks", "not_run"),
+            failure_reason=module_status.get("expressive_reason") or "no sampled frames",
+            code_version="optional-local-providers-v1:" + optional["implementation_sha256"], score_kind="none"))
+        runs.append(_model_run_record(
+            job_id, "expressive", provider="trace-annotate", model_name="expressive-cues-v1",
+            model_version="1", weights_sha256=None, license="Project source",
+            preprocessing={"input": "measured face landmarks with geometric quality filters"},
+            parameters={"min_face_height": 48, "min_frame_height_ratio": .06,
+                        "eyes_narrowed_ear": .18, "eyes_closed_ear": .10,
+                        "emotion_inference": False, "brow_neutral_baseline_available": False},
+            input_value=_frame_output(keyframes, "landmarks"), output_value=_frame_output(keyframes, "expressive"),
+            status=module_status.get("expressive", "not_run"),
+            failure_reason=module_status.get("expressive_reason") or "no sampled frames",
+            code_version="optional-local-providers-v1:" + optional["implementation_sha256"], score_kind="rule_score"))
+
     ocr_identity = extractor_identity("ocr", "RapidOCR")
     runs.append(_model_run_record(
         job_id, "ocr", provider=ocr_identity.get("provider", "RapidOCR"),
@@ -1713,7 +1852,7 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
     runs.append(_model_run_record(
         job_id, "actions", provider="trace-annotate", model_name="subject-translation-v1",
         model_version="1", weights_sha256=None, license="Project source",
-        preprocessing={"input": "face-box tracks built from sampled keyframes per scene",
+        preprocessing={"input": "one-to-one person xyxy tracks; explicit face xywh fallback; per scene; max gap 5s",
                        "time_domain": DOMAIN},
         parameters={"walk_band_heights_per_s": [0.15, 1.2],
                     "run_band_heights_per_s": [1.2, 6.0],
@@ -1942,7 +2081,7 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                         ids.append(artifact)
                 if ids:
                     claim["evidence_ids"] = ids
-            elif claim["method"]["id"] in {"keyframe-sampling-local", "shot-framing-local"}:
+            elif claim["method"]["id"] in {"keyframe-sampling-local", "shot-framing-local", "person-box-local", "expressive-cues-v1"}:
                 frame_index = str(claim["method"]["parameters"]["frame_index"])
                 if frame_index in frame_artifacts:
                     claim["evidence_ids"] = [frame_artifacts[frame_index]]
@@ -2063,6 +2202,33 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
             "measurement": None,
             "uncertainty_reason": "抽样帧只代表该时刻，不覆盖镜头内全部画面",
         })
+        person = keyframe.get("person") or {}
+        if person.get("status") == "success":
+            count = len(person.get("persons_detected") or [])
+            claims.append({
+                "id": S.make_id("clm", f"{job_id}:{index}:persons"), "claim_type": "observable",
+                "statement": f"关键帧 #{keyframe['frame_index']} 的人物检测器返回 {count} 个人物框候选。",
+                "subject_ref": None, "time_window": window, "evidence_ids": [],
+                "method": {"id": "person-box-local", "version": "1", "parameters": {
+                    "frame_index": keyframe["frame_index"], "coordinate_space": "decoded_frame_xyxy",
+                    "count": count, "score_calibration": "not_established"}},
+                "model_run_id": _module_run_id(job_id, "person"), "score": None,
+                "score_kind": "none", "measurement": None,
+                "uncertainty_reason": "人物框可能误检雕像或屏幕人物；零检测不能证明画面无人，未校准检测准确率"})
+        # Like framing, portable segment claims describe the representative
+        # keyframe; every sampled frame's raw cues remain in the candidate.
+        expressive = keyframe.get("expressive") or {}
+        for number, cue in enumerate(expressive.get("cues") or []):
+            basic = cues_to_claims([cue])[0]
+            basic.update({"id": S.make_id("clm", f"{job_id}:{index}:expressive:{number}"),
+                          "subject_ref": None, "time_window": window, "evidence_ids": [],
+                          "measurement": None, "model_run_id": _module_run_id(job_id, "expressive"),
+                          "method": {"id": "expressive-cues-v1", "version": "1", "parameters": {
+                              "frame_index": keyframe["frame_index"], "kind": cue["kind"],
+                              "metrics": cue.get("metrics"),
+                              "scope": "representative_frame_geometry_not_emotion_or_blink_duration",
+                              "landmark_model_run_id": _module_run_id(job_id, "landmarks")}}})
+            claims.append(basic)
         framing = keyframe.get("framing") or {}
         if (framing.get("status") == "success"
                 and framing.get("framing") in {"远景", "全景", "中景", "近景", "特写"}):
@@ -2071,17 +2237,17 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
             claims.append({
                 "id": S.make_id("clm", f"{job_id}:{index}:framing"),
                 "claim_type": "measured" if isinstance(ratio, (int, float)) else "observable",
-                "statement": (f"按关键帧 #{keyframe['frame_index']} 的人脸框高度占比"
-                              f"测得景别为{framing['framing']}（仅人脸框，需人物框复核）。"),
+                "statement": (f"按关键帧 #{keyframe['frame_index']} 的{'人物' if framing.get('subject_kind') == 'person' else '人脸'}框高度占比"
+                              f"测得景别候选为{framing['framing']}（几何规则，需复核）。"),
                 "subject_ref": None,
                 "time_window": window,
                 "evidence_ids": [],
                 "method": {"id": "shot-framing-local", "version": "1",
                            "parameters": {"framing": framing["framing"],
-                                          "subject_kind": "face",
-                                          "face_height_ratio": ratio,
+                                          "subject_kind": framing.get("subject_kind", "face"),
+                                          "subject_height_ratio": ratio,
                                           "frame_index": keyframe["frame_index"]}},
-                "model_run_id": _module_run_id(job_id, "face"),
+                "model_run_id": _module_run_id(job_id, "person" if framing.get("subject_kind") == "person" else "face"),
                 "score": float(framing.get("confidence") or 0.0),
                 "score_kind": "rule_score",
                 "measurement": ({"value": float(ratio), "unit": "ratio", "basis": "measured",

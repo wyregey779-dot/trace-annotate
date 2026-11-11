@@ -24,7 +24,8 @@ MAX_NODES = 400_000
 MAX_ANNOTATIONS = 20_000
 MAX_REPORTS = 256
 MAX_TEXT_CHARS = 1_000_000
-MAX_EVIDENCE_BASE64_CHARS = 768_000
+MAX_EVIDENCE_BYTES = 512 * 1024
+MAX_EVIDENCE_BASE64_CHARS = 4 * ((MAX_EVIDENCE_BYTES + 2) // 3)
 
 
 def _invalid(message, code="INVALID_PROFESSIONAL_DOCUMENT"):
@@ -285,6 +286,8 @@ def validate_annotation(annotation, media, template, *, artifact_ids=None, actor
         _text(tag)
     if "legacy_id" in annotation:
         _text(annotation["legacy_id"], nonempty=True)
+        if not annotation["legacy_id"].strip():
+            _invalid("Legacy annotation identifier must not be blank")
     _object(annotation["provenance"], {"origin", "actor_id", "job_id"})
     if annotation["provenance"]["origin"] not in ("manual", "imported", "model_candidate", "derived"):
         _invalid("Unknown provenance origin")
@@ -399,6 +402,8 @@ def _validate_document(document):
                 data=base64.b64decode(text,validate=True)
             except (ValueError,TypeError):
                 _invalid("Embedded evidence payload is not valid base64","UNSUPPORTED_PROFESSIONAL_EVIDENCE")
+            if len(data)>MAX_EVIDENCE_BYTES:
+                _invalid("Embedded evidence payload exceeds its byte budget","UNSUPPORTED_PROFESSIONAL_EVIDENCE")
             if (len(data)!=_decimal(artifact["size_bytes"])
                     or hashlib.sha256(data).hexdigest()!=artifact["sha256"]):
                 _invalid("Embedded evidence payload differs from its descriptor","UNSUPPORTED_PROFESSIONAL_EVIDENCE")

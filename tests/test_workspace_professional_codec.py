@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import base64
+import hashlib
 import json
 
 import pytest
@@ -218,3 +220,55 @@ def test_current_review_binding_cannot_be_forged_by_resigning_outer_document():
     a["review_binding"]={"content_sha256":"4"*64,"actor_id":"local-user","command_id":"cmd-review","reviewed_at":"2026-11-01T00:00:00Z","task_revision":1}
     resign(d,task=True)
     with pytest.raises(SchemaInvalid,match="Review binding"):P.validate_document(d)
+
+
+def test_real_document_accepts_the_exact_utf8_byte_budget_and_rejects_one_more_byte():
+    d=document()
+    d["history"]["scope"]="available_local_history"
+    d["history"]["source_envelopes"]=[{"padding":""}]
+    resign(d)
+    remaining=P.MAX_DOCUMENT_BYTES-len(S.canonical_json(d))
+    d["history"]["source_envelopes"][0]["padding"]="中"*(remaining//3)+"x"*(remaining%3)
+    resign(d)
+    data=S.canonical_json(d)
+    assert len(data)==P.MAX_DOCUMENT_BYTES
+    assert P.decode_document(data)==d
+    assert len(d["history"]["source_envelopes"][0]["padding"])<P.MAX_TEXT_CHARS
+    with pytest.raises(SchemaInvalid) as error:P.decode_document(data+b" ")
+    assert error.value.code=="PROFESSIONAL_LIMIT_EXCEEDED"
+
+
+@pytest.mark.parametrize("path",["../outside","/outside","C:/outside","C:\\outside",
+                                 "//server/share/outside","objects/../outside"])
+def test_every_artifact_path_must_be_the_canonical_object_path(path):
+    d=document();d["artifacts"][0]["relative_path"]=path;resign(d)
+    with pytest.raises(SchemaInvalid,match="artifact path"):P.validate_document(d)
+
+
+@pytest.mark.parametrize("damage",["invalid_base64","hash","size"])
+def test_embedded_evidence_is_checked_against_its_descriptor(damage):
+    d=document();data=b"declared portable evidence bytes"
+    digest=hashlib.sha256(data).hexdigest()
+    artifact={"id":S.make_id("art",digest),"relative_path":"objects/"+digest,
+              "sha256":digest,"size_bytes":str(len(data)),
+              "data_base64":base64.b64encode(data).decode("ascii")}
+    if damage=="invalid_base64":artifact["data_base64"]="!not-base64!"
+    elif damage=="hash":artifact["sha256"]="4"*64;artifact["relative_path"]="objects/"+"4"*64
+    else:artifact["size_bytes"]=str(len(data)+1)
+    d["artifacts"].append(artifact);resign(d)
+    with pytest.raises(SchemaInvalid) as error:P.validate_document(d)
+    assert error.value.code=="UNSUPPORTED_PROFESSIONAL_EVIDENCE"
+
+
+def test_embedded_evidence_checks_decoded_bytes_even_when_the_base64_length_fits():
+    d=document();data=b"x"*(512*1024+1)
+    digest=hashlib.sha256(data).hexdigest()
+    text=base64.b64encode(data).decode("ascii")
+    # 512KiB and 512KiB+1 encode to the same base64 character count.
+    assert len(text)==len(base64.b64encode(data[:-1]))
+    assert len(text)<=P.MAX_EVIDENCE_BASE64_CHARS
+    d["artifacts"].append({"id":S.make_id("art",digest),"relative_path":"objects/"+digest,
+                           "sha256":digest,"size_bytes":str(len(data)),"data_base64":text})
+    resign(d)
+    with pytest.raises(SchemaInvalid) as error:P.validate_document(d)
+    assert error.value.code=="UNSUPPORTED_PROFESSIONAL_EVIDENCE"

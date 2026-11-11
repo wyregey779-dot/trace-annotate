@@ -52,16 +52,20 @@ def _to_gray(frame: np.ndarray) -> np.ndarray:
     if frame is None:
         raise ValueError("frame is empty")
     array = np.asarray(frame)
-    if array.ndim == 3:
-        # the pipeline decodes BGR frames; channel order is documented here
-        gray = (0.114 * array[..., 0] + 0.587 * array[..., 1]
-                + 0.299 * array[..., 2])
-    else:
-        gray = array.astype(np.float64)
-    height, width = gray.shape
+    height, width = array.shape[:2]
     step_y = max(1, height // 64)
     step_x = max(1, width // ANALYSIS_WIDTH)
-    return gray[::step_y, ::step_x].astype(np.float64)
+    # Point sampling commutes with the channel-wise luma calculation. Slice
+    # first so a 4K source never allocates several full-size float64 planes
+    # merely to retain a roughly 64x96 patch.
+    small = array[::step_y, ::step_x]
+    if small.ndim == 3:
+        # the pipeline decodes BGR frames; channel order is documented here
+        gray = (0.114 * small[..., 0] + 0.587 * small[..., 1]
+                + 0.299 * small[..., 2])
+    else:
+        gray = small.astype(np.float64)
+    return gray.astype(np.float64, copy=False)
 
 
 def _histogram(gray: np.ndarray) -> np.ndarray:

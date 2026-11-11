@@ -87,7 +87,7 @@ def _render_vision_job_implementation() -> str:
     source = (
         Path(__file__).resolve().parents[1] / "trace_annotate/workspace/ui.py"
     ).read_text("utf-8")
-    begin = source.index("function renderVisionJob(")
+    begin = source.index("function visionInputIsStale(")
     end = source.index("async function pollVision(", begin)
     return source[begin:end]
 
@@ -107,12 +107,13 @@ const fields = {
 };
 const insufficient = '内容变化检测至少需要 9 个覆盖同一镜头的采样帧，当前只有 8 帧；未判定为无变化。';
 const state = {
-  visionJob: {id: 'job-12345678', state: 'succeeded'},
+  task: {id:'task-A', revision:0, content_sha256:'original'},
+  visionJob: {id: 'job-12345678', task_id:'task-A', input_revision:0, input_sha256:'original', state: 'succeeded'},
   visionResult: {
     scenes: [{}, {}],
     keyframes: [{}, {}],
     module_status: {
-      scene: 'success', transition: 'success', face: 'success',
+      scene: 'success', transition: 'success', face: 'success', person:'success', landmarks:'success',
       framing: 'success', motion: 'success', actions: 'success',
       expressive: 'not_run', expressive_reason: 'no_landmark_provider_in_this_build',
       acoustics: 'success'
@@ -137,7 +138,7 @@ context.renderVisionJob();
 assert.match(fields['vision-job'].textContent,
   /内容采样 insufficient_samples 8 帧 \/ 需 9 帧（1 个镜头不足）/);
 assert.match(fields['vision-job'].textContent,
-  /六项能力 转场=success 内容=insufficient_samples\(0变化\/2过滤\) 主体\/景别\/运镜=success\/success\/success 动作=success\(0候选;支持走\/跑;未支持拿起\/放下\/打开\/关闭\/递交\) 表情=not_run\(no_landmark_provider_in_this_build\) 声学=success/);
+  /六项能力 转场=success 内容=insufficient_samples\(0变化\/2过滤\) 人体\/人脸\/景别\/运镜=success\/success\/success\/success 人脸关键点=success 动作=success\(0候选;支持走\/跑;未支持拿起\/放下\/打开\/关闭\/递交\) 表情=not_run\(no_landmark_provider_in_this_build\) 声学=success/);
 assert.equal(fields['vision-apply'].hidden, false);
 assert.equal(fields['vision-cancel'].hidden, true);
 """

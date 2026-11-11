@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-CUE_KINDS = ("smile", "brow_furrow", "mouth_open")
+CUE_KINDS = ("smile", "brow_furrow", "mouth_open", "eyes_closed", "eyes_narrowed")
 F0_MIN = 60.0
 F0_MAX = 500.0
 FRAME_HOP_SECONDS = 0.02
@@ -112,6 +112,11 @@ def face_cue_candidates(face: Dict[str, Any], *, frame_index: str,
         return {"status": "not_applicable", "reason": "人脸占画面过小"}
     if face.get("occluded"):
         return {"status": "not_applicable", "reason": "遮挡"}
+    quality = face.get("quality") or {}
+    if quality.get("side_facing") or quality.get("excessive_roll"):
+        return {"status": "not_applicable", "reason": "侧脸或旋转过大，几何线索不可信"}
+    if quality.get("partial_outside_frame"):
+        return {"status": "not_applicable", "reason": "人脸关键点越出画面，拒绝截断线索"}
     landmarks = face.get("landmarks")
     if not landmarks:
         return {"status": "not_run", "reason": "没有人脸关键点，不能推断表情线索"}
@@ -130,12 +135,35 @@ def face_cue_candidates(face: Dict[str, Any], *, frame_index: str,
                              {"mouth_width_ratio": round(width / float(box[2] - box[0] or 1), 3),
                               "corner_lift": landmarks.get("mouth_corner_lift")}))
     brows = landmarks.get("brows")
-    if brows and len(brows) >= 2:
+    if brows and len(brows) >= 2 and landmarks.get("brow_baseline_available") is not False:
         gap = float(np.hypot(*(np.array(brows[0]) - np.array(brows[1]))))
         eye_gap = float(landmarks.get("eye_gap", 0) or 0)
         if eye_gap and gap / eye_gap < 0.5:
             cues.append(_cue("brow_furrow", frame_index, evidence_id,
                              {"brow_gap_ratio": round(gap / eye_gap, 3)}))
+    eyes = landmarks.get("eyes")
+    if eyes and len(eyes) == 2:
+        ratios = []
+        for eye in eyes:
+            points = np.asarray(eye, dtype=float)
+            if points.shape != (6, 2) or not np.isfinite(points).all():
+                ratios = []
+                break
+            width = float(np.linalg.norm(points[0] - points[3]))
+            if width < 6:
+                ratios = []
+                break
+            opening = float(np.linalg.norm(points[1] - points[5]) +
+                            np.linalg.norm(points[2] - points[4]))
+            ratios.append(opening / (2 * width))
+        if len(ratios) == 2 and all(ratio <= 0.18 for ratio in ratios):
+            kind = "eyes_closed" if all(ratio <= 0.10 for ratio in ratios) else "eyes_narrowed"
+            candidate = _cue(kind, frame_index, evidence_id,
+                             {"eye_aspect_ratios": [round(ratio, 3) for ratio in ratios],
+                              "threshold": 0.10 if kind == "eyes_closed" else 0.18,
+                              "measurement": "single_frame_not_blink_duration"})
+            candidate["uncertainty"] = "未校准眼睑几何候选，低头或视线可影响结果；单帧不能判定眨眼或内心状态"
+            cues.append(candidate)
     return {"status": "success", "frame_index": frame_index, "cues": cues,
             "uncertainty": "几何启发式线索，不表示真实情绪"}
 
@@ -148,7 +176,9 @@ def _cue(kind: str, frame_index: str, evidence_id: str, metrics: Dict[str, Any])
 
 
 def cues_to_claims(cues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    names = {"smile": "嘴角上扬", "brow_furrow": "眉头收紧", "mouth_open": "嘴部张开"}
+    names = {"smile": "嘴角上扬", "brow_furrow": "眉头收紧", "mouth_open": "嘴部张开",
+             "eyes_closed": "双眼接近闭合（单帧候选）",
+             "eyes_narrowed": "双眼睑间距较小（单帧候选）"}
     return [{"claim_type": "observable",
              "statement": f"可观察表情线索：{names.get(cue['kind'], cue['kind'])}",
              "evidence_ids": list(cue.get("evidence_ids", [])),

@@ -10,13 +10,65 @@ import base64
 import copy
 import hashlib
 import json
+import stat
 
 from . import schema as S
 from .errors import SchemaInvalid, WorkspaceError
+from .professional_schema import MAX_EVIDENCE_BYTES
 
 # Leave room for the bounded command identity/revision envelope when a file
 # produced by this exporter is returned through the1MiB HTTP command route.
 EXPORT_DOCUMENT_LIMIT = 1024 * 1024 - 4096
+PORTABLE_EVIDENCE_LIMIT = MAX_EVIDENCE_BYTES
+
+
+def _artifact_descriptor(data):
+    digest = hashlib.sha256(data).hexdigest()
+    return {'id': S.make_id('art', digest), 'relative_path': 'objects/' + digest,
+            'sha256': digest, 'size_bytes': str(len(data))}
+
+
+def _verified_artifact_bytes(store, descriptor, *, limit, portable=False, include_data=True):
+    """Verify a local object before reading a bounded export payload.
+
+    Registration is not proof that the bytes still exist or that an opened
+    workspace's object directory has not since been replaced with a link.
+    """
+    from .store import _safe
+
+    if descriptor['relative_path'] != 'objects/' + descriptor['sha256']:
+        raise WorkspaceError('RECOVERY_REQUIRED', 'Professional artifact path is invalid')
+    path = store.root / descriptor['relative_path']
+    _safe(path)
+    expected_size = int(descriptor['size_bytes'])
+    try:
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size:
+            raise WorkspaceError('RECOVERY_REQUIRED', 'Professional artifact bytes are missing or corrupt')
+        if expected_size > limit:
+            if portable:
+                raise SchemaInvalid('PROFESSIONAL_LIMIT_EXCEEDED',
+                                    'One evidence sample exceeds the portable export budget')
+            raise WorkspaceError('RECOVERY_REQUIRED', 'Professional source archive exceeds its supported bound')
+        data = bytearray() if include_data else None
+        digest, read_size = hashlib.sha256(), 0
+        with path.open('rb') as incoming:
+            # A local admitted media object can be an unembedded evidence
+            # reference. Verify it in bounded chunks without allocating its
+            # entire payload, and read at most one byte beyond its descriptor.
+            while read_size <= expected_size:
+                chunk = incoming.read(min(1024 * 1024, expected_size - read_size + 1))
+                if not chunk:
+                    break
+                read_size += len(chunk)
+                digest.update(chunk)
+                if data is not None:
+                    data.extend(chunk)
+    except OSError as exc:
+        raise WorkspaceError('RECOVERY_REQUIRED', 'Professional artifact bytes are unavailable') from exc
+    if read_size != expected_size or digest.hexdigest() != descriptor['sha256']:
+        raise WorkspaceError('RECOVERY_REQUIRED', 'Professional artifact bytes are corrupt')
+    return bytes(data) if data is not None else None
 
 
 def prepare_task(store, current, operation, payload, *, command_id):
@@ -24,6 +76,7 @@ def prepare_task(store, current, operation, payload, *, command_id):
     from .professional_export import import_payload
 
     task = copy.deepcopy(current)
+    pending_artifacts = []
     media = store.get_media(task['media_id'])
     template = next(t for t in store.list_templates()
                     if (t['id'], t['version']) == (task['template_id'], task['template_version']))
@@ -31,18 +84,21 @@ def prepare_task(store, current, operation, payload, *, command_id):
         if set(payload) != {'document'}:
             raise SchemaInvalid('SCHEMA_INVALID', 'Professional import requires one document')
         imported = import_payload(payload['document'], media, task['id'])
-        # Portable evidence samples travel inside the document as bounded base64.
-        # Register their bytes before the task command validates annotation
-        # evidence ids, otherwise a valid document could not be reconstructed.
+        # Preflight portable object identities before publishing any bytes.
+        # A transaction can roll back registration but not immutable files.
+        declared_artifacts = {}
+        embedded_artifacts = set()
         for artifact in payload['document']['artifacts']:
+            expected = {key: artifact[key] for key in ('id', 'relative_path', 'sha256', 'size_bytes')}
+            declared_artifacts[artifact['id']] = expected
             if 'data_base64' not in artifact:
                 continue
             data = base64.b64decode(artifact['data_base64'], validate=True)
-            descriptor = store._put_artifact(data)
-            expected = {'id': artifact['id'], 'relative_path': artifact['relative_path'],
-                        'sha256': artifact['sha256'], 'size_bytes': artifact['size_bytes']}
-            if descriptor != expected:
-                raise WorkspaceError('RECOVERY_REQUIRED', 'Portable evidence bytes differ from their descriptor')
+            if _artifact_descriptor(data) != expected:
+                raise SchemaInvalid('UNSUPPORTED_PROFESSIONAL_EVIDENCE',
+                                    'Portable evidence identity differs from its bytes')
+            embedded_artifacts.add(artifact['id'])
+            pending_artifacts.append((expected, data))
         task['annotations'] = imported['annotations']
         task['extensions'] = imported['extensions']
         task['legacy_document_metadata'] = imported['legacy_document_metadata']
@@ -51,7 +107,33 @@ def prepare_task(store, current, operation, payload, *, command_id):
         # Keep the original exchange document exactly as JSON in immutable
         # project storage. Embedding it in every later task/export recursively
         # doubles the file on repeated round trips.
-        archive['document_artifact'] = store._put_artifact(S.canonical_json(source_document))
+        source_data = S.canonical_json(source_document)
+        archive['document_artifact'] = _artifact_descriptor(source_data)
+        pending_artifacts.append((archive['document_artifact'], source_data))
+        from .frames import validate_anchor
+        model_run_ids = {run['id'] for run in task['extensions']['professional'].get('model_runs', [])}
+        verified_local = set()
+        for annotation in task['annotations']:
+            available = set(embedded_artifacts)
+            for ident in annotation['evidence_ids']:
+                if ident in embedded_artifacts:
+                    continue
+                row = store.conn.execute('SELECT id,rel_path,sha256,size_bytes FROM artifacts WHERE id=?',
+                                         (ident,)).fetchone()
+                local = ({'id': row[0], 'relative_path': row[1], 'sha256': row[2],
+                          'size_bytes': str(row[3])} if row is not None else None)
+                if local != declared_artifacts[ident]:
+                    raise SchemaInvalid('UNSUPPORTED_PROFESSIONAL_EVIDENCE',
+                                        'Professional evidence is not embedded or matching locally admitted bytes')
+                if ident not in verified_local:
+                    _verified_artifact_bytes(store, local, limit=int(local['size_bytes']), include_data=False)
+                    verified_local.add(ident)
+                available.add(ident)
+            PS.validate_annotation(annotation, media, template, artifact_ids=available,
+                                   model_run_ids=model_run_ids)
+            for key in ('start', 'end', 'at'):
+                if 'anchor' in annotation.get(key, {}):
+                    validate_anchor(store, media, annotation[key])
     elif operation == 'import_vision_candidates':
         candidates = payload.get('candidates')
         source_job_id = payload.get('source_job_id')
@@ -148,6 +230,9 @@ def prepare_task(store, current, operation, payload, *, command_id):
     # recovery envelope. Large media belongs in immutable registered objects.
     if len(S.canonical_json(task)) > 768 * 1024:
         raise SchemaInvalid('PROFESSIONAL_LIMIT_EXCEEDED', 'Professional task exceeds768KiB')
+    for expected, data in pending_artifacts:
+        if store._put_artifact(data) != expected:
+            raise WorkspaceError('RECOVERY_REQUIRED', 'Portable artifact publication changed its identity')
     return task
 
 
@@ -177,6 +262,7 @@ def apply_vision_candidates(store, task_id, *, command_id, expected_revision, ex
 
 def export_professional(store, task_id):
     from .professional_export import build_document
+    from .professional_schema import MAX_DOCUMENT_BYTES
 
     with store.transaction():
         task = store.get_task(task_id)
@@ -230,6 +316,7 @@ def export_professional(store, task_id):
                       if row is not None else None)
             if descriptor != actual:
                 raise WorkspaceError('RECOVERY_REQUIRED', 'Professional source archive is missing or inconsistent')
+            _verified_artifact_bytes(store, actual, limit=MAX_DOCUMENT_BYTES)
             if ident not in known:
                 artifacts.append(actual)
                 known.add(ident)
@@ -240,19 +327,11 @@ def export_professional(store, task_id):
                 row = store.conn.execute('SELECT id,rel_path,sha256,size_bytes FROM artifacts WHERE id=?', (ident,)).fetchone()
                 if row is None:
                     raise WorkspaceError('RECOVERY_REQUIRED', 'Annotation evidence artifact is missing')
-                path = store.root / row[1]
-                try:
-                    data = path.read_bytes()
-                except OSError as exc:
-                    raise WorkspaceError('RECOVERY_REQUIRED', 'Annotation evidence bytes are unavailable') from exc
-                if (len(data) != row[3] or hashlib.sha256(data).hexdigest() != row[2]):
-                    raise WorkspaceError('RECOVERY_REQUIRED', 'Annotation evidence bytes are corrupt')
-                if len(data) > 512 * 1024:
-                    raise SchemaInvalid('PROFESSIONAL_LIMIT_EXCEEDED',
-                                        'One evidence sample exceeds the portable export budget')
-                artifacts.append({'id': row[0], 'relative_path': row[1], 'sha256': row[2],
-                                  'size_bytes': str(row[3]),
-                                  'data_base64': base64.b64encode(data).decode('ascii')})
+                descriptor = {'id': row[0], 'relative_path': row[1], 'sha256': row[2],
+                              'size_bytes': str(row[3])}
+                data = _verified_artifact_bytes(store, descriptor,
+                                                limit=PORTABLE_EVIDENCE_LIMIT, portable=True)
+                artifacts.append({**descriptor, 'data_base64': base64.b64encode(data).decode('ascii')})
                 known.add(ident)
         document = build_document(task, media, template, history=history, artifacts=artifacts)
         data = S.canonical_json(document)

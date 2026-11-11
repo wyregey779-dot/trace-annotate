@@ -37,6 +37,13 @@ cv = [
     "opencv-python>=4.5.0",
     "pillow-heif>=0.8.0"
 ]
+persons = [
+    "onnxruntime>=1.16,<2",
+    "opencv-python>=4.5.0"
+]
+landmarks = [
+    "mediapipe>=0.10.31,<0.11"
+]
 ocr = [
     "rapidocr-onnxruntime>=1.2.0"
 ]
