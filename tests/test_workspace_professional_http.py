@@ -268,6 +268,30 @@ def test_professional_export_rejects_track_options_without_changing_state(api):
     assert store.get_snapshot() == before
 
 
+def test_professional_reference_export_has_explicit_headers_and_loss_disclosure(api):
+    server, store = api
+    original = _seed(server, store)
+    status, headers, document = request(server, "GET", _url(store, "export?format=professional&evidence=references"))
+    assert status == 200, document
+    assert document["task"] == original
+    assert headers["X-TraceAnnotate-Evidence-Mode"] == "references"
+    assert "external" in headers["X-TraceAnnotate-Export-Losses"]
+    _, embedded_headers = _export(server, store)
+    assert embedded_headers["X-TraceAnnotate-Evidence-Mode"] == "embedded"
+
+
+@pytest.mark.parametrize("query", [
+    "format=professional&evidence=unknown", "format=professional&evidence=",
+    "format=professional&evidence=references&evidence=embedded",
+    "format=json&evidence=references", "format=csv&evidence=embedded", "evidence=references",
+])
+def test_professional_reference_query_options_are_strict(api, query):
+    server, store = api
+    before = store.get_snapshot()
+    assert_error(request(server, "GET", _url(store, "export?" + query)), 400, "INVALID_QUERY")
+    assert store.get_snapshot() == before
+
+
 def test_analysis_report_save_is_durable_idempotent_and_does_not_self_invalidate(api):
     server, store = api
     report = _report(store)

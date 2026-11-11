@@ -91,12 +91,15 @@ def cmd_professional(args: argparse.Namespace) -> int:
     store = _open_store(Path(args.project))
     try:
         if args.professional_command == "export":
-            data = export_professional(store, args.task_id)["data"]
+            exported = export_professional(store, args.task_id,
+                                           evidence_mode=getattr(args, 'evidence_mode', 'embedded'))
+            data = exported["data"]
             # Exclusive creation protects any existing user export.
             with Path(args.output).open("xb") as output:
                 output.write(data)
             print(json.dumps({"exported": str(Path(args.output).absolute()),
-                              "sha256": S.sha256_bytes(data)}, ensure_ascii=False))
+                              "sha256": S.sha256_bytes(data), "evidence_mode": exported['evidence_mode'],
+                              "losses": exported['losses']}, ensure_ascii=False))
         else:
             with Path(args.input).open("rb") as incoming:
                 raw = incoming.read(1024 * 1024 + 1)
@@ -211,6 +214,8 @@ def register_workspace_commands(subparsers: argparse._SubParsersAction) -> None:
         command.set_defaults(func=cmd_professional)
         if action == "export":
             command.add_argument("--output", required=True)
+            command.add_argument("--evidence-mode", choices=("embedded", "references"), default="embedded",
+                                 help="Embed bounded evidence bytes or retain verified external object references")
         else:
             command.add_argument("--input", required=True)
             command.add_argument("--command-id", required=True)

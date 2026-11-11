@@ -10,7 +10,7 @@ import pytest
 from tests.test_workspace_backup_recovery import _make_junction
 from tests.test_workspace_professional_codec import resign
 from tests.test_workspace_professional_http import (
-    _commit, _export, _import_body, _seed, _task, _url,
+    _commit, _export, _import_body, _report, _report_body, _seed, _task, _url,
 )
 from tests.test_workspace_server import api, http_video, request, running
 from trace_annotate.workspace import professional_schema as P
@@ -215,3 +215,108 @@ def test_exact_512kib_portable_evidence_survives_independent_workspace_roundtrip
             assert json.loads(export_professional(target, imported["id"])["data"])["task"] == imported
     finally:
         target.close()
+
+
+def test_reference_export_preserves_large_evidence_and_roundtrips_local_objects(api, http_video):
+    server, store = api
+    data = b"large external evidence\x00" * 25000
+    assert len(data) > P.MAX_EVIDENCE_BYTES
+    descriptor = _attach_evidence(server, store, data)
+    original = _task(store)
+    before = store.get_snapshot()
+    with pytest.raises(WorkspaceError) as embedded_error:
+        export_professional(store, original["id"])
+    assert embedded_error.value.code == "PROFESSIONAL_LIMIT_EXCEEDED"
+    exported = export_professional(store, original["id"], evidence_mode="references")
+    document = P.decode_document(exported["data"])
+    assert document["task"] == original
+    assert exported["evidence_mode"] == "references"
+    assert "external" in exported["losses"] and "backup" in exported["losses"]
+    assert next(a for a in document["artifacts"] if a["id"] == descriptor["id"]) == descriptor
+    assert all("data_base64" not in item for item in document["artifacts"])
+    assert len(exported["data"]) <= EXPORT_DOCUMENT_LIMIT
+    assert store.get_snapshot() == before
+    destination = store.import_source(http_video)["task_id"]
+    body = _import_body(store, document, command_id="cmd-import-reference-evidence", task_id=destination)
+    path = _url(store, "professional-import", destination)
+    applied = request(server, "POST", path, body)
+    assert applied[0] == 200, applied[2]
+    assert request(server, "POST", path, body)[2] == applied[2]
+    stale = dict(body, command_id="cmd-stale-reference-import")
+    rejected = request(server, "POST", path, stale)
+    assert rejected[0] == 409 and rejected[2]["error"]["code"] == "REVISION_CONFLICT"
+    restored = _task(store, destination)
+    assert restored["annotations"][0]["evidence_ids"] == [descriptor["id"]]
+    assert (store.root / descriptor["relative_path"]).read_bytes() == data
+    assert _task(store, original["id"]) == original
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+@pytest.mark.parametrize("subject", ["annotation", "media"])
+def test_reference_export_verifies_every_referenced_local_object(api, damage, subject):
+    server, store = api
+    descriptor = _attach_evidence(server, store)
+    if subject == "media":
+        media = store.get_media(_task(store)["media_id"])
+        bindings = json.loads(store.conn.execute("SELECT value FROM meta WHERE key=?",
+                                                 ("media_objects:" + media["id"],)).fetchone()[0])
+        descriptor = bindings["playback_path"]
+    path = store.root / descriptor["relative_path"]
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"x" * path.stat().st_size)
+    before = store.get_snapshot()
+    with pytest.raises(WorkspaceError) as failure:
+        export_professional(store, _task(store)["id"], evidence_mode="references")
+    assert failure.value.code == "RECOVERY_REQUIRED"
+    assert store.get_snapshot() == before
+
+
+def test_reference_export_keeps_the_metadata_byte_budget(api, monkeypatch):
+    from trace_annotate.workspace import professional_store as module
+    _, store = api
+    task_id = _task(store)["id"]
+    exported = export_professional(store, task_id, evidence_mode="references")
+    monkeypatch.setattr(module, "EXPORT_DOCUMENT_LIMIT", len(exported["data"]) - 1)
+    with pytest.raises(WorkspaceError) as failure:
+        export_professional(store, task_id, evidence_mode="references")
+    assert failure.value.code == "PROFESSIONAL_LIMIT_EXCEEDED"
+
+
+def test_reference_export_preserves_saved_analyses_and_the_existing_evidence_contract(api):
+    server, source = api
+    _seed(server, source)
+    report = _report(source, ident="report-external-evidence")
+    response = request(server, "POST", _url(source, "analysis-reports"), _report_body(source, report))
+    assert response[0] == 200, response[2]
+    document = P.decode_document(export_professional(source, _task(source)["id"], evidence_mode="references")["data"])
+    assert document["analyses"] == [report]
+    descriptor = source._put_artifact(b"unsupported report evidence")
+    changed = dict(report, id="report-unsupported-evidence", evidence_ids=[descriptor["id"]])
+    before = source.get_snapshot()
+    rejected = request(server, "POST", _url(source, "analysis-reports"),
+                       _report_body(source, changed, command_id="cmd-unsupported-report-evidence"))
+    assert rejected[0] == 422 and rejected[2]["error"]["code"] == "UNSUPPORTED_PROFESSIONAL_EVIDENCE"
+    assert source.get_snapshot() == before
+
+
+def test_professional_cli_reference_export_uses_the_explicit_parser_option(http_video, tmp_path, capsys):
+    import argparse
+    from trace_annotate.workspace.commands import register_workspace_commands, run_workspace_command
+    project = WorkspaceStore(tmp_path / "cli-reference-workspace")
+    project.create()
+    try:
+        task_id = project.import_source(http_video)["task_id"]
+    finally:
+        project.close()
+    parser = argparse.ArgumentParser()
+    register_workspace_commands(parser.add_subparsers(dest="command", required=True))
+    output = tmp_path / "cli-reference.professional.json"
+    args = parser.parse_args(["workspace", "professional", "export", "--project", str(project.root),
+                              "--task-id", task_id, "--output", str(output), "--evidence-mode", "references"])
+    assert run_workspace_command(args) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["evidence_mode"] == "references" and "external" in receipt["losses"]
+    assert receipt["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert P.decode_document(output.read_bytes())["binding"]["task_id"] == task_id

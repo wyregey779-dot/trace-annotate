@@ -378,7 +378,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if re.search(r"%(?![0-9a-fA-F]{2})", parsed.query):
                     raise ValueError("Malformed percent escape")
                 self._query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True, errors="strict")
-                allowed = {"offset", "limit"} if frame_query else {"format", "track", "track_id"}
+                allowed = {"offset", "limit"} if frame_query else {"format", "track", "track_id", "evidence"}
                 if imports_async:
                     allowed = {"async"}
                 if set(self._query) - allowed or any(len(value) != 1 for value in self._query.values()):
@@ -392,6 +392,9 @@ class _Handler(BaseHTTPRequestHandler):
                     format_value = self._query.get("format", [""])[0]
                     if any(ord(char) < 32 or ord(char) == 127 for char in format_value):
                         raise ValueError("Unsupported format control character")
+                    if "evidence" in self._query and (format_value != "professional" or
+                            self._query["evidence"][0] not in {"embedded", "references"}):
+                        raise ValueError("Evidence mode applies only to professional JSON")
             except (ValueError, UnicodeError) as exc:
                 raise BadRequest("INVALID_QUERY", "Invalid query parameters") from exc
         return parsed.path
@@ -601,6 +604,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._extra_headers = [("Content-Disposition", f'attachment; filename="{item["filename"]}"'),
                         ("X-TraceAnnotate-Task-Revision", str(item['binding']['revision'])),
                         ("X-TraceAnnotate-Content-SHA256", item['binding']['content_sha256']),
+                        ("X-TraceAnnotate-Evidence-Mode", item['evidence_mode']),
                         ("X-TraceAnnotate-Export-Losses", item['losses'])]
                     self._headers(200, len(item['data']), item['content_type'])
                     self.wfile.write(item['data'])
@@ -667,11 +671,14 @@ class _Handler(BaseHTTPRequestHandler):
                         raise BadRequest("INVALID_QUERY", "Task export requires an explicit format")
                     item = export_task(store, parts[1], self._query["format"][0],
                                        track=self._query.get("track", [None])[0],
-                                       track_id=self._query.get("track_id", [None])[0])
+                                       track_id=self._query.get("track_id", [None])[0],
+                                       evidence_mode=self._query.get("evidence", ["embedded"])[0])
                     self._extra_headers = [("Content-Disposition", f'attachment; filename="{item["filename"]}"'),
                                            ("X-TraceAnnotate-Task-Revision", str(item["binding"]["revision"])),
                                            ("X-TraceAnnotate-Content-SHA256", item["binding"]["content_sha256"]),
                                            ("X-TraceAnnotate-Export-Losses", item["losses"])]
+                    if 'evidence_mode' in item:
+                        self._extra_headers.append(("X-TraceAnnotate-Evidence-Mode", item['evidence_mode']))
                     self._headers(200, len(item["data"]), item["content_type"])
                     self.wfile.write(item["data"])
                 return

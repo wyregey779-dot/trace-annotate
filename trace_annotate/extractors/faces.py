@@ -5,7 +5,7 @@ calculating face count, crowd density, and bounding boxes.
 """
 from __future__ import annotations
 import os
-import shutil
+import hashlib
 import tempfile
 from typing import Dict, Any, List, Optional
 import numpy as np
@@ -56,11 +56,13 @@ class FaceExtractor(BaseExtractor):
         weights_path: Optional[str] = None,
         thresholds: Optional[MetricThresholds] = None
     ):
-        self.model_path = model_path or weights_path
+        selected = model_path or weights_path or os.environ.get("TRACE_ANNOTATE_FACE_MODEL")
+        self.model_path = os.fspath(selected) if selected else None
         self.thresholds = thresholds or MetricThresholds()
         self.detector = None
         self.detector_kind = None
         self._input_size = None
+        self.load_error = None
         self._init_detector()
 
     @property
@@ -81,6 +83,7 @@ class FaceExtractor(BaseExtractor):
                 "model_version": getattr(cv2, "__version__", "unknown") if HAS_CV2 else "unavailable",
                 "weights_path": self.model_path,
                 "detector_kind": self.detector_kind,
+                "load_error": self.load_error,
                 "license": "OpenCV Apache-2.0; detector weights license not bundled locally"}
 
     def _init_detector(self) -> None:
@@ -109,43 +112,49 @@ class FaceExtractor(BaseExtractor):
             return
 
         try:
-            # OpenCV's ONNX importer is byte-oriented and fails on a non-ASCII
-            # path. The workspace itself may live under a Chinese directory, so
-            # load an ASCII-named temporary copy of the bundled weights.
+            if not hasattr(cv2, "FaceDetectorYN"):
+                return
             model_path = self.model_path
-            try:
-                model_path.encode("ascii")
-            except UnicodeEncodeError:
-                cache_dir = os.path.join(_ascii_temp_root(), "traceannotate", "yunet")
-                os.makedirs(cache_dir, exist_ok=True)
-                model_path = os.path.join(cache_dir, os.path.basename(self.model_path))
-                if not os.path.exists(model_path) or os.path.getsize(model_path) != os.path.getsize(self.model_path):
-                    shutil.copyfile(self.model_path, model_path)
-            with open(self.model_path, "rb") as f:
-                model_buf = f.read()
-
-            if hasattr(cv2, "FaceDetectorYN"):
+            options = {"input_size": (320, 320),
+                       "score_threshold": self.thresholds.face_min_confidence,
+                       "nms_threshold": 0.3, "top_k": 50}
+            if not model_path.isascii():
+                with open(model_path, "rb") as incoming:
+                    model_buf = incoming.read()
                 try:
+                    # The official overload requires an empty config buffer
+                    # for ONNX, including when the model already contains it.
                     self.detector = cv2.FaceDetectorYN.create(
-                        model=model_path,
-                        config="",
-                        input_size=(320, 320),
-                        score_threshold=self.thresholds.face_min_confidence,
-                        nms_threshold=0.3,
-                        top_k=50
-                    )
+                        "ONNX", np.frombuffer(model_buf, dtype=np.uint8),
+                        np.empty(0, dtype=np.uint8), **options)
                     self.detector_kind = "yunet"
+                    return
                 except Exception:
-                    self.detector = cv2.FaceDetectorYN.create(
-                        "ONNX",
-                        np.frombuffer(model_buf, dtype=np.uint8),
-                        input_size=(320, 320),
-                        score_threshold=self.thresholds.face_min_confidence,
-                        nms_threshold=0.3,
-                        top_k=50
-                    )
-                    self.detector_kind = "yunet"
-        except Exception:
+                    # Older OpenCV versions expose only the file overload.
+                    # An explicit project cache is authoritative for fallback.
+                    cache_dir = os.environ.get("TRACE_ANNOTATE_FACE_CACHE")
+                    if not cache_dir:
+                        cache_dir = os.path.join(_ascii_temp_root(), "traceannotate", "yunet")
+                    os.makedirs(cache_dir, exist_ok=True)
+                    digest = hashlib.sha256(model_buf).hexdigest()
+                    model_path = os.path.join(cache_dir, "yunet-" + digest + ".onnx")
+                    cached = None
+                    if os.path.isfile(model_path):
+                        with open(model_path, "rb") as incoming:
+                            cached = hashlib.sha256(incoming.read()).hexdigest()
+                    if cached != digest:
+                        descriptor, temporary = tempfile.mkstemp(prefix="yunet-", suffix=".onnx", dir=cache_dir)
+                        try:
+                            with os.fdopen(descriptor, "wb") as outgoing:
+                                outgoing.write(model_buf)
+                            os.replace(temporary, model_path)
+                        finally:
+                            if os.path.exists(temporary):
+                                os.unlink(temporary)
+            self.detector = cv2.FaceDetectorYN.create(model=model_path, config="", **options)
+            self.detector_kind = "yunet"
+        except Exception as exc:
+            self.load_error = str(exc)
             self.detector = None
 
     def _summary(self, detected_list: List[Dict[str, Any]]) -> Dict[str, Any]:

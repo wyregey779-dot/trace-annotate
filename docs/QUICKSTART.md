@@ -43,10 +43,41 @@ python -m pip install -e ".[vlm]"    # transformers 4.49.x, einops, timm
 ```
 
 `python -m pip install -e ".[full]"` installs every extra above plus
-`scenedetect`. Nothing is downloaded at import time: the first CLIP/VLM run
-fetches weights into `~/.cache/traceannotate/{clip,vlm}`, and those
-directories can be moved with `TRACE_ANNOTATE_CLIP_CACHE` /
-`TRACE_ANNOTATE_VLM_CACHE`.
+`scenedetect`. On Python3.13 or newer, the OCR extra selects
+`rapidocr>=3.10,<4`; older supported Python versions select
+`rapidocr-onnxruntime>=1.2`. The modern adapter uses its supported bundled
+detector, angle classifier and recognizer through explicit local ONNX paths.
+`TRACE_ANNOTATE_OCR_MODELS` can point to a directory containing those same
+hash-verified model files. Missing local files produce `not_run`; initialization,
+invalid-frame and inference errors produce `failed`. A successful empty OCR
+result has `success` status.
+
+CLIP/VLM loading defaults to offline. Set `TRACE_ANNOTATE_CLIP_CACHE` and
+`TRACE_ANNOTATE_VLM_CACHE` to the prepared local cache directories; their default
+location is `~/.cache/traceannotate/{clip,vlm}`. Provisioning downloads requires
+explicit `TRACE_ANNOTATE_ALLOW_MODEL_DOWNLOAD=1` in a new process with compatible
+Hub offline settings. Return to offline mode after provisioning. Actual selected
+weight hashes and VLM model-code hashes are recorded with the execution result.
+
+The locally exercised CLIP checkpoint is `timm/vit_base_patch32_clip_224.openai`,
+SHA256 `e6d1bd7789aa45192b3bf90570a789b478bae1b74ebcce7eddd908e83a2b7c31`.
+Its checkpoint card declares Apache-2.0; the OpenCLIP runtime uses MIT.
+[Pinned checkpoint card](https://huggingface.co/timm/vit_base_patch32_clip_224.openai/blob/a6f597a30f7b82c51704746581f9a4e41421e878/README.md)
+
+The locally exercised Florence-2-base checkpoint has SHA256
+`03075d2d2d2bbd3e180b9ba0afae4aa8563226e2d32911656966e05b2f2ee060`
+and MIT weight terms. Transformers and the reviewed snapshot's model Python
+code use Apache-2.0. Pin its code revision through
+`TRACE_ANNOTATE_VLM_REVISION=5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac`.
+[Pinned checkpoint card](https://huggingface.co/microsoft/Florence-2-base/blob/5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac/README.md)
+
+Local Windows Python3.13 checks exercised one real frame for OCR (seven text
+boxes), CLIP and VLM. Predictions remain unreviewed drafts. Model scores require
+independent accuracy evaluation. Other Python-version dependency selections were
+checked through marker evaluation only. Professional exports support bounded
+embedded evidence and explicitly selected external references; retain the
+complete project/backup for reference evidence and historical files. See the
+[professional JSON guide](PROFESSIONAL_JSON.md).
 
 FFmpeg and ffprobe are not pip packages and the repository never downloads
 them for you. Install both and make sure they resolve on `PATH` before you

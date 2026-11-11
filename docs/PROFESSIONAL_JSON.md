@@ -58,17 +58,27 @@ owners. Its contents are passive source provenance and are not executed or
 treated as current approval. A standalone professional JSON carries the current
 task in full and historical artifact descriptors, not those artifact bytes.
 
-Version1 accepts the currently supported annotation fields. Nonempty custom
-attributes or evidence-file references are rejected until their own admission
-workflow is available. The failure is explicit; fields are not silently removed.
+Version1 accepts the supported annotation fields, `visual-semantics-v1` claims
+and evidence IDs backed by verifiable registered artifacts. Arbitrary custom
+attributes are rejected explicitly. Semantic claims, model-run provenance,
+review state and evidence descriptors remain in the exported current task.
 Unknown versions, malformed data, invalid digests, stale revisions and reused
 command IDs with different requests are rejected without replacing saved data.
 
 The HTTP command/document limit is1MiB; the exporter reserves4KiB of that limit
 for the import command envelope. The current task must remain within
-768KiB and individual reports within256KiB. Available history can cause an
-export to exceed its limit. Keep the complete project/backup in that case;
-the exporter refuses rather than dropping historical records.
+768KiB and individual reports within256KiB. Default `embedded` export retains
+the512KiB per-evidence-object budget and the document limit. When embedded
+evidence exceeds the export budget, the UI asks for confirmation before retrying
+with `references`. Cancelling leaves the saved task and evidence in place.
+
+Reference mode retains the complete current metadata, claims, exact anchors,
+reports and available audit index. Evidence bytes stay in external objects;
+preserve the complete project or a verified workspace backup. Import requires
+matching, already admitted object hashes in the receiving project and verifies
+their bytes. A reference JSON alone cannot restore those evidence files.
+Reference exports retain the same document-size bound, so an oversized metadata
+or history index still produces an explicit export failure.
 
 ## Analysis reports
 
@@ -110,12 +120,15 @@ interval report stale while preserving the original result and source window.
 ## HTTP and CLI
 
 Export: `GET /api/v1/projects/current/tasks/{task_id}/export?format=professional`.
+Use `&evidence=references` for an explicit reference export. The default is
+`evidence=embedded`; `X-TraceAnnotate-Evidence-Mode` identifies the response mode.
 Import: `POST /api/v1/projects/current/tasks/{task_id}/professional-import` with
 `command_id`, `expected_revision`, `expected_sha256` and `document`.
 All API calls retain the workspace's token/origin checks and stable receipts.
 
 ```text
 trace-annotate workspace professional export --project PROJECT --task-id TASK --output NEW_FILE.json
+trace-annotate workspace professional export --project PROJECT --task-id TASK --evidence-mode references --output NEW_REFERENCES.json
 trace-annotate workspace professional import --project PROJECT --task-id TASK --input FILE.json --command-id COMMAND --expected-revision REVISION --expected-sha256 TASK_SHA256
 ```
 
@@ -142,9 +155,13 @@ the same frozen input after its old processor exits.
 
 The job's video and JSON downloads use the same input revision and task digest.
 Later edits are shown as a different current revision; they do not rewrite an
-old export. The paired JSON contains the complete frozen task and reports, with
-`history.scope=not_included`. Use the ordinary professional export plus the
-project backup when the local audit index and historical files are required.
+old export. The paired JSON contains the complete frozen task, semantic claims,
+reports and verified evidence descriptors, with `history.scope=not_included`
+and reference evidence mode. Keep the same-revision video/JSON together with
+the original project or verified backup containing the referenced object bytes.
+Import requires matching locally admitted evidence objects. Use the ordinary
+professional export plus the project backup for the local audit index and
+historical files.
 Downloads are bounded to512MiB on the server and may be further limited in the
 browser. Current rendering supports the explicitly declared H.264/AAC-or-copy
 recipe and bounded panel/frame counts; it does not promise every codec, HDR

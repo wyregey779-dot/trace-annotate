@@ -13,6 +13,8 @@ import base64
 import shutil
 import subprocess
 import threading
+from pathlib import PurePosixPath
+from types import SimpleNamespace
 
 import pytest
 import numpy as np
@@ -187,6 +189,108 @@ def test_transition_claim_uses_event_interval_not_whole_scene_window():
     assert transition["time_window"]["start"]["seconds"] == {"n": "99", "d": "10"}
     assert transition["time_window"]["end"]["seconds"] == {"n": "10", "d": "1"}
     assert transition["measurement"] is None
+
+
+def test_candidate_projection_clips_rounded_tail_to_exact_media_duration():
+    candidate = {
+        "job_id": "job-rounded-tail", "processor_version": "1", "model_runs": [],
+        "scenes": [{"start": 145.933333, "end": 147.666667}],
+        "keyframes": [{"scene_index": 0, "frame_index": "4378", "source_pts": "145.933333",
+                       "person": {"status": "success", "persons_detected": [{}]},
+                       "motion": {"status": "success", "summary": {
+                           "class": "static", "mean_speed_px_s": 0.0}, "pairs": []}}],
+    }
+    original = copy.deepcopy(candidate)
+    duration = {"n": "443", "d": "3"}
+    annotation = V._candidate_annotations(candidate, duration=duration)[0]
+    assert annotation["end"]["seconds"] == duration
+    claims = annotation["attributes"]["semantic"]["claims"]
+    assert {claim["method"]["id"] for claim in claims} == {
+        "shot-boundary-local", "keyframe-sampling-local", "person-box-local", "camera-motion-local"}
+    for claim in claims:
+        assert claim["time_window"]["end"]["seconds"] == duration
+        if claim["measurement"] is not None:
+            assert claim["measurement"]["analysis_window"] == claim["time_window"]
+    assert candidate == original, "Projection must preserve the immutable detector output"
+    candidate["scenes"][0] = {"start": 1.25, "end": 2.5}
+    assert V._candidate_annotations(candidate, duration=duration) == V._candidate_annotations(candidate)
+    candidate["scenes"][0] = {"start": -0.25, "end": 0.5}
+    assert V._candidate_annotations(candidate, duration=duration)[0]["start"]["seconds"] == S.rational(0)
+    candidate["scenes"][0] = {"start": 147.666667, "end": 148.0}
+    fail_code("VISION_CANDIDATE_OUTSIDE_MEDIA", lambda: V._candidate_annotations(candidate, duration=duration))
+
+
+def test_action_projection_requires_positive_half_open_scene_overlap():
+    candidate = {"job_id": "job-action-window", "processor_version": "1",
+                 "scenes": [{"start": 1.0, "end": 2.0}],
+                 "keyframes": [{"scene_index": 0, "frame_index": "15", "source_pts": "1.5"}],
+                 "actions_sampling": {"candidates": [
+                     {"action": "touch-left", "window_seconds": {"start": 0.0, "end": 1.0}},
+                     {"action": "touch-right", "window_seconds": {"start": 2.0, "end": 3.0}},
+                     {"action": "empty", "window_seconds": {"start": 1.5, "end": 1.5}},
+                     {"action": "walking", "window_seconds": {"start": 1.25, "end": 1.75}},
+                 ]}}
+    annotation = V._candidate_annotations(candidate)[0]
+    assert [tag for tag in annotation["tags"] if tag.startswith("vision-action-")] == ["vision-action-walking"]
+    actions = [claim for claim in annotation["attributes"]["semantic"]["claims"]
+               if claim["method"]["id"] == "subject-translation-v1"]
+    assert len(actions) == 1
+    assert actions[0]["time_window"] == {"start": {"seconds": S.rational(1.25)},
+                                         "end": {"seconds": S.rational(1.75)}}
+
+
+@pytest.mark.parametrize("prompt", [None, "<CAPTION>"])
+def test_vlm_model_run_records_the_actual_adapter_task_prompt(prompt):
+    extractors = {} if prompt is None else {"vlm": SimpleNamespace(task_prompt=prompt, code_identity={})}
+    runs = V._build_model_runs(
+        {"id": "job-prompt", "parameters": {"job_identity": {"config": {}}}},
+        extractors, [], {"status": "not_run", "scenes": []}, None, [], {}, "0" * 64, None)
+    vlm = next(run for run in runs if run["id"] == V._module_run_id("job-prompt", "vlm"))
+    assert vlm["parameters"]["task_prompt"] == (prompt or "<MORE_DETAILED_CAPTION>")
+
+
+@pytest.mark.parametrize("status", ["failed", "not_run", None])
+@pytest.mark.parametrize("engine_loaded", [True, False])
+def test_run_ocr_preserves_explicit_adapter_status(status, engine_loaded):
+    result = {"text": "", "boxes": [], "reason": "runtime test"}
+    if status is not None:
+        result["status"] = status
+    adapter = SimpleNamespace(engine=object() if engine_loaded else None,
+                              extract_text=lambda frame: dict(result))
+    measured = V._run_ocr(np.zeros((4, 4, 3), dtype=np.uint8), adapter)
+    assert measured["status"] == (status or ("success" if engine_loaded else "not_run"))
+    assert measured["text"] == "" and measured["boxes"] == []
+    assert measured["reason"] == "runtime test"
+
+
+def test_model_runs_use_loaded_weight_identity_and_separate_licenses():
+    identity = {"weights_sha256": "a" * 64, "selected_revision": "actual-snapshot",
+                "revision": "requested-main", "runtime_license": "runtime-license",
+                "weights_license": "weights-license", "weights_license_source": "https://example.org/license",
+                "weights_identity_status": "verified", "model_code_sha256": "b" * 64,
+                "model_code_license": "code-license",
+                "weights_files": [{"role": "det", "path": "C:/private/model.onnx",
+                                   "sha256": "c" * 64, "size_bytes": 123}]}
+    extractors = {name: SimpleNamespace(code_identity=dict(identity), task_prompt="<CAPTION>")
+                  for name in ("clip", "vlm", "ocr")}
+    runs = V._build_model_runs(
+        {"id": "job-identity", "parameters": {"job_identity": {"config": {}}}},
+        extractors, [], {"status": "not_run", "scenes": []}, None, [], {}, "0" * 64, None)
+    for module in ("clip", "vlm"):
+        run = next(item for item in runs if item["id"] == V._module_run_id("job-identity", module))
+        assert run["weights_sha256"] == "a" * 64
+        assert run["model_version"] == "actual-snapshot"
+        assert run["license"] == "weights-license"
+        assert run["preprocessing"]["runtime_license"] == "runtime-license"
+        assert run["preprocessing"]["weights_license_source"] == "https://example.org/license"
+    vlm = next(item for item in runs if item["id"] == V._module_run_id("job-identity", "vlm"))
+    assert vlm["preprocessing"]["model_code_sha256"] == "b" * 64
+    assert vlm["preprocessing"]["model_code_license"] == "code-license"
+    assert vlm["parameters"]["requested_revision"] == "requested-main"
+    ocr = next(item for item in runs if item["id"] == V._module_run_id("job-identity", "ocr"))
+    assert ocr["weights_sha256"] == "a" * 64
+    assert ocr["license"] == "weights-license"
+    assert ocr["preprocessing"]["weights_files"] == [{"role": "det", "sha256": "c" * 64, "size_bytes": 123}]
 
 
 def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
@@ -423,6 +527,70 @@ def test_apply_imports_candidates_as_model_candidate_and_refuses_reviewed(store)
             expected_sha256=store.task_digest(after), operation="review_annotation",
             payload={"annotation_id": a["id"], "reviewed": True}, request_body=b'{}'))
     jobs.close()
+
+
+def test_apply_projection_preflight_preserves_receipts_and_immutable_objects(store, monkeypatch):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        current = task(store)
+        queued = submit(jobs, command_id="preflight-submit")["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        candidate = jobs.result(queued["id"])
+        before_objects = {path.name for path in store.objects_dir.iterdir()}
+        before_receipts = list(store.conn.execute("SELECT command_id,request_sha256 FROM command_receipts"))
+        invalid = copy.deepcopy(candidate)
+        invalid["scenes"][0] = {"start": 1.5, "end": 2.0, "duration": 0.5}
+        monkeypatch.setattr(jobs, "result", lambda job_id: invalid)
+        fail_code("VISION_CANDIDATE_OUTSIDE_MEDIA", lambda: jobs.apply(
+            queued["id"], command_id="outside-media", expected_revision=current["revision"],
+            expected_sha256=current["content_sha256"], request_body=b"{}"))
+        monkeypatch.setattr(jobs, "result", lambda job_id: candidate)
+        fail_code("REVISION_CONFLICT", lambda: jobs.apply(
+            queued["id"], command_id="stale-projection", expected_revision=current["revision"] + 1,
+            expected_sha256=current["content_sha256"], request_body=b"{}"))
+        assert task(store) == current
+        assert list(store.conn.execute("SELECT command_id,request_sha256 FROM command_receipts")) == before_receipts
+        assert {path.name for path in store.objects_dir.iterdir()} == before_objects
+    finally:
+        jobs.close()
+
+
+def test_apply_replays_committed_projection_after_mapper_changes(store, monkeypatch):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        current = task(store)
+        queued = submit(jobs, command_id="replay-submit")["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        mapper = V._candidate_annotations
+
+        def old_mapper(candidate, **kwargs):
+            annotations = mapper(candidate, **kwargs)
+            annotations[0]["tags"].append("legacy-projection-preserved")
+            return annotations
+
+        arguments = dict(command_id="replay-apply", expected_revision=current["revision"],
+                         expected_sha256=current["content_sha256"], request_body=b"original-body")
+        with monkeypatch.context() as patch:
+            patch.setattr(V, "_candidate_annotations", old_mapper)
+            original_receipt = jobs.apply(queued["id"], **arguments)
+        after = task(store)
+        objects = {path.name for path in store.objects_dir.iterdir()}
+        # A subsequent edit must not change which historical payload is replayed.
+        store.apply_task_command(
+            command_id="later-edit", task_id=after["id"], expected_revision=after["revision"],
+            expected_sha256=after["content_sha256"], operation="update_annotation",
+            payload={"annotation_id": after["annotations"][0]["id"], "changes": {"text": "later edit"}},
+            request_body=b"{}")
+        edited = task(store)
+        assert jobs.apply(queued["id"], **arguments) == original_receipt
+        assert task(store) == edited
+        assert {path.name for path in store.objects_dir.iterdir()} == objects
+        fail_code("IDEMPOTENCY_CONFLICT", lambda: jobs.apply(
+            queued["id"], **dict(arguments, request_body=b"different-body")))
+    finally:
+        jobs.close()
 
 
 def test_candidate_semantics_survive_professional_export_import(store, clip, tmp_path):
@@ -949,8 +1117,15 @@ def test_vision_sampling_uses_pts_anchored_multi_frame_plan(store):
                for frame in result["keyframes"])
     covered = {frame["scene_index"] for frame in result["keyframes"]}
     assert covered == set(range(len(result["scenes"])))
-    assert all(item["relative_path"].endswith((".png", "audio/acoustic.m4a"))
-               for item in result["evidence"])
+    for item in result["evidence"]:
+        relative = PurePosixPath(item["relative_path"])
+        is_diagnostic = (relative.name in {"commands.jsonl", "decode.stdout", "decode.stderr"}
+                         and relative.parent.name.startswith(".decode-"))
+        assert relative.suffix == ".png" or str(relative).endswith("audio/acoustic.m4a") or is_diagnostic
+        evidence = store.root / item["relative_path"]
+        assert evidence.stat().st_size == int(item["size_bytes"])
+        assert V.stream_sha256(evidence) == item["sha256"]
+    assert any(item["relative_path"].endswith(".png") for item in result["evidence"])
     assert any(item["relative_path"].endswith("audio/acoustic.m4a") for item in result["evidence"])
 
 

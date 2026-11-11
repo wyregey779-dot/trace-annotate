@@ -363,12 +363,35 @@ async function importProfessionalFile(file){
 }
 async function exportProfessionalTask(){
  if(!state.task||state.busy||state.pending||state.loadingTask){notice('请先确认保存结果后再导出。','warning');return;}
+ const taskId=state.task.id,sequence=state.sequence,revision=state.task.revision,sha256=state.task.content_sha256;
+ const isCurrent=()=>state.task?.id===taskId&&state.sequence===sequence&&state.task.revision===revision&&state.task.content_sha256===sha256;
  if(state.dirty&&!await confirmAction('当前草稿尚未保存。专业JSON只导出服务器已保存修订，草稿会继续保留。',{title:'导出已保存专业JSON？',accept:'导出已保存内容',cancel:'返回编辑'}))return;
- const taskId=state.task.id;$('export-professional-btn').disabled=true;
- try{const response=await request('/tasks/'+encodeURIComponent(taskId)+'/export?format=professional');const blob=await response.blob();
- const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='TraceAnnotate-'+taskId+'-r'+response.headers.get('X-TraceAnnotate-Task-Revision')+'.professional.json';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
- notice('专业JSON已下载：包含完整当前任务、精确时间/帧锚、已有报告与历史索引。完整旧修订、导入源文件及媒体请保留项目备份；未测量或听审的信息不会自动补齐。','success');
- }catch(error){notice('导出未完成：'+describeError(error),'error');}finally{$('export-professional-btn').disabled=false;}
+ if(!isCurrent())return;
+ $('export-professional-btn').disabled=true;
+ try{
+  let response,evidenceMode='embedded';
+  const endpoint='/tasks/'+encodeURIComponent(taskId)+'/export?format=professional';
+  try{response=await request(endpoint);}
+  catch(error){
+   if(error.code!=='PROFESSIONAL_LIMIT_EXCEEDED')throw error;
+   if(!isCurrent())return;
+   const accepted=await confirmAction('当前任务的证据或专业JSON体积超过嵌入式导出限制。引用JSON保留当前标注、专业字段和证据引用，但不嵌入证据文件。请保留完整项目或备份，以继续读取和导入对应证据。',{title:'改为导出引用JSON？',accept:'导出引用JSON',cancel:'返回'});
+   if(!accepted||!isCurrent())return;
+   evidenceMode='references';
+   response=await request(endpoint+'&evidence=references');
+  }
+  if(!isCurrent())return;
+  if(response.headers.get('X-TraceAnnotate-Task-Revision')!==String(revision)||response.headers.get('X-TraceAnnotate-Content-SHA256')!==sha256||response.headers.get('X-TraceAnnotate-Evidence-Mode')!==evidenceMode){
+   const error=new Error('导出响应与冻结修订或证据模式不一致，未下载。');error.code='EXPORT_IDENTITY_MISMATCH';throw error;
+  }
+  const blob=await response.blob();
+  if(!isCurrent())return;
+  const url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;a.download='TraceAnnotate-'+taskId+'-r'+revision+(evidenceMode==='references'?'-references':'')+'.professional.json';
+  document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
+  notice(evidenceMode==='references'?'引用专业JSON已下载：保留当前任务、精确时间/帧锚、已有报告与历史索引。证据文件未嵌入，请同时保留完整项目或备份；只有此JSON无法恢复证据文件。':'专业JSON已下载：包含完整当前任务、精确时间/帧锚、已有报告与历史索引。完整旧修订、导入源文件及媒体请保留项目备份；未测量或听审的信息不会自动补齐。','success');
+ }catch(error){if(isCurrent())notice('导出未完成：'+(error.code==='EXPORT_IDENTITY_MISMATCH'?error.message:describeError(error)),'error');}
+ finally{$('export-professional-btn').disabled=false;}
 }
 async function exportTemporalTask(){if(!state.task||state.busy||state.pending){notice('请先确认保存结果后再导出。','warning');return;}try{const exportTaskId=state.task.id;notice('正在生成通用标注 JSON…');const response=await request('/tasks/'+encodeURIComponent(exportTaskId)+'/export?format=temporal');const blob=await response.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='TraceAnnotate-'+exportTaskId+'-r'+response.headers.get('X-TraceAnnotate-Task-Revision')+'.temporal.json';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);notice('已下载通用片段投影；不含工作区历史、回执、事件、整片标注或帧锚点。完整数据请保留项目目录。','warning');}catch(error){notice('导出失败：'+describeError(error),'error');}}
 function renderExportTracks(){const select=$('export-track'),tracks=[...new Set((state.task?.annotations||[]).filter(item=>item.type==='segment').map(item=>item.track))].sort();const previous=select.value;select.replaceChildren();if(!tracks.length){const option=document.createElement('option');option.value='';option.textContent='无片段轨道';select.append(option);select.disabled=true;return;}select.disabled=false;if(tracks.length>1){const option=document.createElement('option');option.value='';option.textContent='选择字幕轨道';select.append(option);}for(const track of tracks){const option=document.createElement('option');option.value=track;option.textContent=track;select.append(option);}const selected=selectedSegment()?.track;if(selected&&tracks.includes(selected))select.value=selected;else if(tracks.includes(previous))select.value=previous;else if(tracks.length===1)select.value=tracks[0];}

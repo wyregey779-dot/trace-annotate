@@ -303,7 +303,7 @@ def _vtt(task, track, track_id=None):
     return _subtitles(task, track, track_id, fmt="vtt")
 
 
-def export_task(store, task_id, format, *, track=None, track_id=None):
+def export_task(store, task_id, format, *, track=None, track_id=None, evidence_mode='embedded'):
     if format not in {"json", "csv", "srt", "vtt", "temporal", "professional"}:
         raise SchemaInvalid("UNSUPPORTED_EXPORT_FORMAT",
                             "Supported task exports are json, csv, srt, vtt, temporal and professional")
@@ -313,9 +313,11 @@ def export_task(store, task_id, format, *, track=None, track_id=None):
         raise SchemaInvalid("UNSUPPORTED_EXPORT_OPTION", "Track selection applies only to SRT and WebVTT")
     if track_id is not None and (not isinstance(track_id, str) or re.fullmatch(r"[0-9a-f]{64}", track_id) is None):
         raise SchemaInvalid("INVALID_TRACK_ID", "Track ID must be a lowercase SHA256 hex digest")
+    if evidence_mode != 'embedded' and format != 'professional':
+        raise SchemaInvalid("UNSUPPORTED_EXPORT_OPTION", "Evidence mode applies only to professional JSON")
     if format == "professional":
         from .professional_store import export_professional
-        return export_professional(store, task_id)
+        return export_professional(store, task_id, evidence_mode=evidence_mode)
     with store.transaction():
         task, media, template = _read_subject(store, task_id)
         report = _report(store, task, media, template)

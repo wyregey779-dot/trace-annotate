@@ -9,8 +9,11 @@ reports success.
 """
 from __future__ import annotations
 import os
-import glob
+import hashlib
+from pathlib import Path
+import re
 from typing import Dict, Any, List, Optional, Tuple
+from urllib.parse import urlsplit
 import numpy as np
 
 from trace_annotate.extractors.base import BaseExtractor, ExtractorStatus
@@ -57,10 +60,14 @@ DEFAULT_PROMPTS = {
     ]
 }
 
-# Default open_clip model and pretrained tag; download happens lazily on first
-# construction and is cached under the user cache directory.
+# Default open_clip model and pretrained tag. Offline construction requires an
+# existing checkpoint; only explicit download opt-in may call a hub/URL loader.
 DEFAULT_MODEL_NAME = "ViT-B-32"
 DEFAULT_PRETRAINED = "openai"
+DEFAULT_WEIGHTS_SHA256 = "e6d1bd7789aa45192b3bf90570a789b478bae1b74ebcce7eddd908e83a2b7c31"
+DEFAULT_WEIGHTS_LICENSE_URL = (
+    "https://huggingface.co/timm/vit_base_patch32_clip_224.openai/blob/"
+    "a6f597a30f7b82c51704746581f9a4e41421e878/README.md")
 
 
 def _cache_dir() -> str:
@@ -70,11 +77,48 @@ def _cache_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".cache", "traceannotate", "clip")
 
 
-def _cached_weights() -> Optional[str]:
-    pattern = os.path.join(_cache_dir(), "models--timm--vit_base_patch32_clip_224.openai",
-                           "snapshots", "*", "open_clip_model.safetensors")
-    files = sorted(glob.glob(pattern))
-    return files[0] if files else None
+def _offline_checkpoint(config: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve only local bytes using the checkpoint conventions of OpenCLIP."""
+    if config.get("file"):
+        return config["file"], None
+    hub = config.get("hf_hub", "")
+    if hub:
+        from huggingface_hub import try_to_load_from_cache
+        from open_clip import pretrained
+
+        repository, filename = os.path.split(hub)
+        default_binary = getattr(pretrained, "HF_WEIGHTS_NAME", "open_clip_pytorch_model.bin")
+        filename = filename or default_binary
+        candidates = []
+        #2.20 supports the binary cache only. Newer versions prefer a safe
+        # alternative when their own safetensors loader is available.
+        if getattr(pretrained, "_has_safetensors", False):
+            if filename == default_binary:
+                candidates.append(getattr(pretrained, "HF_SAFE_WEIGHTS_NAME", "open_clip_model.safetensors"))
+            elif filename.endswith((".bin", ".pth")):
+                candidates.append(filename[:-4] + ".safetensors")
+        candidates.append(filename)
+        for name in candidates:
+            path = try_to_load_from_cache(repository, name, cache_dir=_cache_dir())
+            if isinstance(path, str) and os.path.isfile(path):
+                return path, None
+        return None, None
+    url = urlsplit(config.get("url", ""))
+    filename = os.path.basename(url.path)
+    if not filename:
+        return None, None
+    parts = url.path.rstrip("/").split("/")
+    expected = parts[-2] if len(parts) > 1 else ""
+    if "openaipublic" in (url.hostname or ""):
+        if re.fullmatch(r"[0-9a-fA-F]{64}", expected) is None:
+            raise ValueError("The OpenAI checkpoint URL has no valid expected SHA256")
+    elif "mlfoundations" in (url.hostname or ""):
+        expected = os.path.splitext(filename)[0].split("-")[-1]
+        if re.fullmatch(r"[0-9a-fA-F]{8,64}", expected) is None:
+            expected = ""
+    else:
+        expected = ""
+    return os.path.join(_cache_dir(), filename), expected.lower() or None
 
 
 class CLIPExtractor(BaseExtractor):
@@ -99,6 +143,10 @@ class CLIPExtractor(BaseExtractor):
         self._prompt_layout: List[Tuple[str, List[Any]]] = []
         self.load_error: Optional[str] = None
         self.load_policy = load_policy()
+        self._weights_path: Optional[str] = None
+        self._weights_sha256: Optional[str] = None
+        self._selected_revision: Optional[str] = None
+        self._checkpoint_loader: Optional[str] = None
         self._init_model()
 
     @property
@@ -108,9 +156,19 @@ class CLIPExtractor(BaseExtractor):
     @property
     def code_identity(self) -> Dict[str, Any]:
         """Weight and loader identity for the model-run record."""
+        known_default = self._weights_sha256 == DEFAULT_WEIGHTS_SHA256
         return {"model_name": self.model_path or DEFAULT_MODEL_NAME,
                 "pretrained": DEFAULT_PRETRAINED,
-                "weights_path": _cached_weights(),
+                "weights_path": self._weights_path,
+                "weights_sha256": self._weights_sha256,
+                "selected_revision": self._selected_revision,
+                "checkpoint_loader": self._checkpoint_loader,
+                "weights_identity_status": (
+                    "unknown" if self._weights_path is None else
+                    "loaded" if self.model is not None else "selected"),
+                "runtime_license": "MIT (OpenCLIP)",
+                "weights_license": "Apache-2.0" if known_default else None,
+                "weights_license_source": DEFAULT_WEIGHTS_LICENSE_URL if known_default else None,
                 "force_quick_gelu": True,
                 "offline": self.load_policy["offline"],
                 "downloads_allowed": self.load_policy["downloads_allowed"]}
@@ -120,6 +178,10 @@ class CLIPExtractor(BaseExtractor):
         self.model = None
         self._text_features = None
         self._prompt_layout = []
+        self._weights_path = None
+        self._weights_sha256 = None
+        self._selected_revision = None
+        self._checkpoint_loader = None
         # Pin the hub to local files before open_clip imports huggingface_hub:
         # a missing weight must fail fast as not_run, never start a download.
         enforce_offline_environment()
@@ -133,9 +195,58 @@ class CLIPExtractor(BaseExtractor):
         try:
             model_name = self.model_path or DEFAULT_MODEL_NAME
             os.makedirs(_cache_dir(), exist_ok=True)
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                model_name, pretrained=DEFAULT_PRETRAINED, cache_dir=_cache_dir(),
-                force_quick_gelu=True)
+            config = open_clip.get_pretrained_cfg(model_name, DEFAULT_PRETRAINED)
+            if self.load_policy["offline"] and not config:
+                raise ValueError("Offline loading cannot verify this custom CLIP model's local checkpoint")
+            pretrained = DEFAULT_PRETRAINED
+            preprocess_options = {}
+            legacy_openai = False
+            if config:
+                # Use the library's resolver, then load that exact checkpoint.
+                # A second snapshot elsewhere in the cache is unrelated.
+                legacy_openai = not config.get("hf_hub") and "openaipublic" in (urlsplit(config.get("url", "")).hostname or "")
+                expected_sha256 = None
+                if self.load_policy["offline"]:
+                    selected, expected_sha256 = _offline_checkpoint(config)
+                else:
+                    selected = open_clip.download_pretrained(config, cache_dir=_cache_dir())
+                if not selected or not os.path.isfile(selected):
+                    raise FileNotFoundError("The selected CLIP checkpoint is unavailable")
+                path = Path(os.path.abspath(selected))
+                hasher = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(block)
+                checksum = hasher.hexdigest()
+                if expected_sha256 and not checksum.startswith(expected_sha256):
+                    raise ValueError("The cached CLIP checkpoint SHA256 does not match its source URL")
+                self._weights_path = str(path)
+                self._weights_sha256 = checksum
+                if path.parent.parent.name == "snapshots":
+                    self._selected_revision = path.parent.name
+                pretrained = str(path)
+                # Passing a checkpoint path bypasses the factory's tag config.
+                # Carry its inference preprocessing through unchanged.
+                for key, option in (("mean", "image_mean"), ("std", "image_std"),
+                                    ("interpolation", "image_interpolation"),
+                                    ("resize_mode", "image_resize_mode")):
+                    if key in config:
+                        preprocess_options[option] = config[key]
+            if legacy_openai:
+                # The2.20 OpenAI checkpoint is a JIT archive. Its public
+                # loader accepts an exact local path without resolving a URL.
+                from open_clip.transform import image_transform
+                self._checkpoint_loader = "open_clip.load_openai_model_local_path"
+                model = open_clip.load_openai_model(pretrained, device="cpu", precision="fp32")
+                preprocess = image_transform(
+                    model.visual.image_size, is_train=False,
+                    mean=preprocess_options.get("image_mean") or model.visual.image_mean,
+                    std=preprocess_options.get("image_std") or model.visual.image_std)
+            else:
+                self._checkpoint_loader = "open_clip.create_model_and_transforms"
+                model, _, preprocess = open_clip.create_model_and_transforms(
+                    model_name, pretrained=pretrained, cache_dir=_cache_dir(),
+                    force_quick_gelu=True, **preprocess_options)
             model.eval()
             self.model = model
             self.preprocess = preprocess

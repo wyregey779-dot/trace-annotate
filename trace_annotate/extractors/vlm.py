@@ -10,7 +10,8 @@ only a real forward pass reports success.
 """
 from __future__ import annotations
 import os
-import glob
+import hashlib
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 import numpy as np
 
@@ -29,6 +30,15 @@ REVISION_ENV = "TRACE_ANNOTATE_VLM_REVISION"
 # The task prompt requests a dense, literal caption (as opposed to a single
 # sentence or a decorative description), which is what an annotation draft needs.
 CAPTION_TASK = "<MORE_DETAILED_CAPTION>"
+DEFAULT_WEIGHTS_SHA256 = "03075d2d2d2bbd3e180b9ba0afae4aa8563226e2d32911656966e05b2f2ee060"
+DEFAULT_WEIGHTS_LICENSE_URL = (
+    "https://huggingface.co/microsoft/Florence-2-base/blob/"
+    "5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac/README.md")
+DEFAULT_MODEL_CODE_SHA256 = {
+    "configuration_florence2.py": "de2e45a975b3582de05d2f4d963a3e9f9a3d20dccf78d28e0052932a0be93bdf",
+    "modeling_florence2.py": "5162bf465e61b6e29cc113a467630ec3cb56ed8e4d46eb6207157f10fb9b8a24",
+    "processing_florence2.py": "f146023a507c009f425a49ee39aa037f4f25c64e14336e3e4f3f1d7377a68e98",
+}
 
 
 def _cache_dir() -> str:
@@ -36,13 +46,6 @@ def _cache_dir() -> str:
     if override:
         return override
     return os.path.join(os.path.expanduser("~"), ".cache", "traceannotate", "vlm")
-
-
-def _cached_weights() -> Optional[str]:
-    pattern = os.path.join(_cache_dir(), "models--microsoft--Florence-2-base",
-                           "snapshots", "*", "model.safetensors")
-    files = sorted(glob.glob(pattern))
-    return files[0] if files else None
 
 
 class VLMExtractor(BaseExtractor):
@@ -58,6 +61,10 @@ class VLMExtractor(BaseExtractor):
         self.processor = None
         self.load_error: Optional[str] = None
         self.load_policy = load_policy()
+        self._weights_path: Optional[str] = None
+        self._weights_sha256: Optional[str] = None
+        self._selected_revision: Optional[str] = None
+        self._model_code_sha256: Dict[str, str] = {}
         self._init_model()
 
     @property
@@ -68,6 +75,10 @@ class VLMExtractor(BaseExtractor):
         """Load the VLM once; every failure degrades to not_run."""
         self.model = None
         self.processor = None
+        self._weights_path = None
+        self._weights_sha256 = None
+        self._selected_revision = None
+        self._model_code_sha256 = {}
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoProcessor
@@ -77,17 +88,51 @@ class VLMExtractor(BaseExtractor):
         try:
             os.makedirs(_cache_dir(), exist_ok=True)
             enforce_offline_environment()
+            selected = None
+            if os.path.isdir(self.model_path):
+                local_weight = os.path.join(self.model_path, "model.safetensors")
+                if os.path.isfile(local_weight):
+                    selected = local_weight
+            else:
+                from transformers.utils.hub import cached_file
+                try:
+                    selected = cached_file(
+                        self.model_path, "model.safetensors", cache_dir=_cache_dir(),
+                        local_files_only=self.load_policy["offline"], revision=self.revision,
+                        _raise_exceptions_for_missing_entries=False)
+                except (OSError, ValueError):
+                    # Another supported checkpoint layout may still load, but
+                    # its weights must not inherit an unrelated cache identity.
+                    selected = None
+            load_path = self.model_path
+            model_options = {}
+            if selected and os.path.isfile(selected):
+                path = Path(os.path.abspath(selected))
+                self._weights_path = str(path)
+                hasher = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        hasher.update(block)
+                self._weights_sha256 = hasher.hexdigest()
+                if path.parent.parent.name == "snapshots":
+                    self._selected_revision = path.parent.name
+                load_path = str(path.parent)
+                model_options["use_safetensors"] = True
+                for filename in DEFAULT_MODEL_CODE_SHA256:
+                    code_path = path.parent / filename
+                    if code_path.is_file():
+                        self._model_code_sha256[filename] = hashlib.sha256(code_path.read_bytes()).hexdigest()
             # Florence-2 ships its processor/model code in the repository, so
             # trust_remote_code=True is the vendor-documented requirement. The
             # local_files_only flag keeps a missing weight from reaching the hub.
             self.processor = AutoProcessor.from_pretrained(
-                self.model_path, cache_dir=_cache_dir(), trust_remote_code=True,
+                load_path, cache_dir=_cache_dir(), trust_remote_code=True,
                 local_files_only=self.load_policy["offline"],
                 revision=self.revision)
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path, cache_dir=_cache_dir(), trust_remote_code=True,
+                load_path, cache_dir=_cache_dir(), trust_remote_code=True,
                 local_files_only=self.load_policy["offline"],
-                revision=self.revision)
+                revision=self.revision, **model_options)
             self.model.eval()
         except Exception as exc:  # noqa: BLE001 - download/load failure disables inference
             self.model = None
@@ -97,8 +142,21 @@ class VLMExtractor(BaseExtractor):
     @property
     def code_identity(self) -> Dict[str, Any]:
         """What code was actually executed, for the model-run record."""
+        known_weights = self._weights_sha256 == DEFAULT_WEIGHTS_SHA256
+        known_code = self._model_code_sha256 == DEFAULT_MODEL_CODE_SHA256
         return {"model_path": self.model_path,
-                "weights_path": _cached_weights(),
+                "weights_path": self._weights_path,
+                "weights_sha256": self._weights_sha256,
+                "selected_revision": self._selected_revision,
+                "weights_identity_status": (
+                    "unknown" if self._weights_path is None else
+                    "loaded" if self.model is not None else "selected"),
+                "runtime_license": "Apache-2.0 (Transformers)",
+                "weights_license": "MIT" if known_weights else None,
+                "weights_license_source": DEFAULT_WEIGHTS_LICENSE_URL if known_weights else None,
+                "model_code_sha256": dict(self._model_code_sha256),
+                "model_code_license": "Apache-2.0" if known_code else None,
+                "task_prompt": self.task_prompt,
                 "trust_remote_code": True,
                 "revision": self.revision or "unpinned",
                 "revision_env": REVISION_ENV,

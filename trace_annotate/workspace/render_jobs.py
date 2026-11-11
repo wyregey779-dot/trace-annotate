@@ -598,11 +598,35 @@ class RenderJobs(AnalysisJobs):
         result = self.result(job_id)
         job = self.queue.get_job(job_id)
         p = self._job(job, allow_legacy_read=True)
-        document = build_document(job["task_snapshot"], job["media_snapshot"], p["template"], artifacts=p["artifacts"])
+        # Keep the acknowledged enqueue parameters unchanged. Evidence IDs are
+        # already frozen in the task; resolve their immutable objects for this
+        # paired document without consulting the task's later revision.
+        with self.store.transaction():
+            artifacts = list(p["artifacts"])
+            known = {descriptor["id"] for descriptor in artifacts}
+            owners = list(job["task_snapshot"]["annotations"])
+            owners.extend(job["task_snapshot"].get("extensions", {}).get("professional", {}).get("analysis_reports", []))
+            for owner in owners:
+                for ident in owner.get("evidence_ids", []):
+                    if ident in known:
+                        continue
+                    row = self.store.conn.execute(
+                        "SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?", (ident,)).fetchone()
+                    if row is None:
+                        raise WorkspaceError("RECOVERY_REQUIRED", "Frozen annotation evidence is missing")
+                    artifacts.append({"id": ident, "relative_path": row[0], "sha256": row[1], "size_bytes": str(row[2])})
+                    known.add(ident)
+            for descriptor in artifacts:
+                try:
+                    self._artifact(descriptor)
+                except OSError as exc:
+                    raise WorkspaceError("RECOVERY_REQUIRED", "Frozen evidence bytes are unavailable") from exc
+            document = build_document(job["task_snapshot"], job["media_snapshot"], p["template"], artifacts=artifacts)
         data = S.canonical_json(document)
         if len(data) > MAX_JSON_BYTES:
             raise WorkspaceError("PROFESSIONAL_LIMIT_EXCEEDED", "Frozen render JSON exceeds its export bound")
         return {"data": data, "content_type": "application/json; charset=utf-8",
                 "filename": f"TraceAnnotate-{job['task_id']}-r{job['input_revision']}.render.professional.json",
                 "binding": result["input_binding"],
-                "losses": "Complete frozen task; history not included; media and archived source bytes not embedded. Pair with this exact render candidate."}
+                "evidence_mode": "references",
+                "losses": "Complete frozen task; history not included; media, archived source and evidence bytes are external references. Retain the complete project/backup for evidence import. Pair with this exact render candidate."}

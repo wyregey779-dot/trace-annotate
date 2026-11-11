@@ -120,6 +120,57 @@ def test_actual_renderer_publishes_five_pinned_files_and_paired_json(store):
     assert task(store) == initial and jobs.close()["stopped"]
 
 
+@pytest.mark.parametrize("damage", [None, "missing", "corrupt"])
+def test_frozen_evidence_pairing_uses_the_render_snapshot_and_verified_objects(store, damage):
+    descriptor = store._put_artifact(b"Controlled annotation evidence bytes")
+    current = task(store)
+    store.apply_task_command(
+        command_id="attach-render-evidence", task_id=current["id"], expected_revision=current["revision"],
+        expected_sha256=current["content_sha256"], operation="add_annotation", payload={"annotation": {
+            "id": "ann-render-evidence", "type": "whole_clip", "label": "Evidence rendering fixture",
+            "text": "Actual short render with an external evidence object", "track": "main", "tags": [],
+            "attributes": {}, "evidence_ids": [descriptor["id"]]}}, request_body=b"evidence-fixture")
+    jobs = manager(store)
+    try:
+        initial = task(store)
+        queued = submit(jobs)["jobs"][0]
+        parameters = copy.deepcopy(queued["parameters"])
+        assert descriptor not in parameters["artifacts"], "Preserve historical enqueue identity"
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        video = jobs.video(queued["id"])
+        after = task(store)
+        store.apply_task_command(
+            command_id="clear-current-evidence", task_id=after["id"], expected_revision=after["revision"],
+            expected_sha256=after["content_sha256"], operation="update_annotation",
+            payload={"annotation_id": "ann-render-evidence", "changes": {"evidence_ids": []}}, request_body=b"clear-evidence")
+        path = store.root / descriptor["relative_path"]
+        if damage == "missing":
+            path.unlink()
+        elif damage == "corrupt":
+            path.write_bytes(b"x" * path.stat().st_size)
+        if damage:
+            error("RECOVERY_REQUIRED", lambda: jobs.frozen_document(queued["id"]))
+        else:
+            exported = jobs.frozen_document(queued["id"])
+            document = json.loads(exported["data"])
+            assert document["task"] == initial
+            assert document["history"]["scope"] == "not_included"
+            assert next(item for item in document["artifacts"] if item["id"] == descriptor["id"]) == descriptor
+            assert exported["evidence_mode"] == "references" and "external" in exported["losses"]
+            paired = store.exports_dir / "frozen-evidence.professional.json"
+            paired.write_bytes(exported["data"])
+            (store.exports_dir / "frozen-evidence-proof.json").write_bytes(S.canonical_json({
+                "scope": "controlled real 0.6-second renderer fixture, not natural annotation accuracy",
+                "job_id": queued["id"], "frozen_binding": exported["binding"],
+                "video": {"path": str(video[0]), "sha256": video[1], "bytes": video[2]},
+                "paired_json": {"path": str(paired), "sha256": S.sha256_bytes(exported["data"])},
+                "external_evidence": descriptor}))
+        assert jobs.queue.get_job(queued["id"])["parameters"] == parameters
+        assert jobs.video(queued["id"]) == video
+    finally:
+        jobs.close()
+
+
 def test_missing_trusted_font_only_disables_render(store, tmp_path):
     jobs = J.RenderJobs(store, font_path=tmp_path / "missing.otf", font_license="Test")
     assert jobs.options()["available"] is False and jobs.options()["reason"]

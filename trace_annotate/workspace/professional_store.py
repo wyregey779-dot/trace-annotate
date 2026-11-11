@@ -113,22 +113,24 @@ def prepare_task(store, current, operation, payload, *, command_id):
         from .frames import validate_anchor
         model_run_ids = {run['id'] for run in task['extensions']['professional'].get('model_runs', [])}
         verified_local = set()
-        for annotation in task['annotations']:
-            available = set(embedded_artifacts)
-            for ident in annotation['evidence_ids']:
+        evidence_owners = list(task['annotations'])
+        evidence_owners.extend(task['extensions']['professional'].get('analysis_reports', []))
+        for owner in evidence_owners:
+            for ident in owner.get('evidence_ids', []):
                 if ident in embedded_artifacts:
                     continue
                 row = store.conn.execute('SELECT id,rel_path,sha256,size_bytes FROM artifacts WHERE id=?',
                                          (ident,)).fetchone()
                 local = ({'id': row[0], 'relative_path': row[1], 'sha256': row[2],
                           'size_bytes': str(row[3])} if row is not None else None)
-                if local != declared_artifacts[ident]:
+                if ident not in declared_artifacts or local != declared_artifacts[ident]:
                     raise SchemaInvalid('UNSUPPORTED_PROFESSIONAL_EVIDENCE',
                                         'Professional evidence is not embedded or matching locally admitted bytes')
                 if ident not in verified_local:
                     _verified_artifact_bytes(store, local, limit=int(local['size_bytes']), include_data=False)
                     verified_local.add(ident)
-                available.add(ident)
+        for annotation in task['annotations']:
+            available = embedded_artifacts | set(annotation['evidence_ids'])
             PS.validate_annotation(annotation, media, template, artifact_ids=available,
                                    model_run_ids=model_run_ids)
             for key in ('start', 'end', 'at'):
@@ -260,10 +262,12 @@ def apply_vision_candidates(store, task_id, *, command_id, expected_revision, ex
         request_body=request_body)['response']
 
 
-def export_professional(store, task_id):
+def export_professional(store, task_id, *, evidence_mode='embedded'):
     from .professional_export import build_document
     from .professional_schema import MAX_DOCUMENT_BYTES
 
+    if evidence_mode not in {'embedded', 'references'}:
+        raise SchemaInvalid('UNSUPPORTED_EXPORT_OPTION', 'Evidence mode must be embedded or references')
     with store.transaction():
         task = store.get_task(task_id)
         media = store.get_media(task['media_id'])
@@ -308,7 +312,11 @@ def export_professional(store, task_id):
             row = store.conn.execute('SELECT id,rel_path,sha256,size_bytes FROM artifacts WHERE id=?', (ident,)).fetchone()
             if row is None:
                 raise WorkspaceError('RECOVERY_REQUIRED', 'Professional export artifact is missing')
-            artifacts.append({'id': row[0], 'relative_path': row[1], 'sha256': row[2], 'size_bytes': str(row[3])})
+            descriptor = {'id': row[0], 'relative_path': row[1], 'sha256': row[2], 'size_bytes': str(row[3])}
+            if evidence_mode == 'references':
+                _verified_artifact_bytes(store, descriptor, limit=int(descriptor['size_bytes']),
+                                         include_data=False)
+            artifacts.append(descriptor)
         known = {a['id'] for a in artifacts}
         for ident, descriptor in sorted(source_artifacts.items()):
             row = store.conn.execute('SELECT id,rel_path,sha256,size_bytes FROM artifacts WHERE id=?', (ident,)).fetchone()
@@ -316,12 +324,14 @@ def export_professional(store, task_id):
                       if row is not None else None)
             if descriptor != actual:
                 raise WorkspaceError('RECOVERY_REQUIRED', 'Professional source archive is missing or inconsistent')
-            _verified_artifact_bytes(store, actual, limit=MAX_DOCUMENT_BYTES)
+            _verified_artifact_bytes(store, actual, limit=MAX_DOCUMENT_BYTES, include_data=False)
             if ident not in known:
                 artifacts.append(actual)
                 known.add(ident)
-        for annotation in task['annotations']:
-            for ident in annotation.get('evidence_ids', []):
+        evidence_owners = list(task['annotations'])
+        evidence_owners.extend(task.get('extensions', {}).get('professional', {}).get('analysis_reports', []))
+        for owner in evidence_owners:
+            for ident in owner.get('evidence_ids', []):
                 if ident in known:
                     continue
                 row = store.conn.execute('SELECT id,rel_path,sha256,size_bytes FROM artifacts WHERE id=?', (ident,)).fetchone()
@@ -329,17 +339,25 @@ def export_professional(store, task_id):
                     raise WorkspaceError('RECOVERY_REQUIRED', 'Annotation evidence artifact is missing')
                 descriptor = {'id': row[0], 'relative_path': row[1], 'sha256': row[2],
                               'size_bytes': str(row[3])}
-                data = _verified_artifact_bytes(store, descriptor,
-                                                limit=PORTABLE_EVIDENCE_LIMIT, portable=True)
-                artifacts.append({**descriptor, 'data_base64': base64.b64encode(data).decode('ascii')})
+                if evidence_mode == 'references':
+                    _verified_artifact_bytes(store, descriptor, limit=int(descriptor['size_bytes']),
+                                             include_data=False)
+                    artifacts.append(descriptor)
+                else:
+                    data = _verified_artifact_bytes(store, descriptor,
+                                                    limit=PORTABLE_EVIDENCE_LIMIT, portable=True)
+                    artifacts.append({**descriptor, 'data_base64': base64.b64encode(data).decode('ascii')})
                 known.add(ident)
         document = build_document(task, media, template, history=history, artifacts=artifacts)
         data = S.canonical_json(document)
         if len(data) > EXPORT_DOCUMENT_LIMIT:
             raise SchemaInvalid('PROFESSIONAL_LIMIT_EXCEEDED',
                                 'Professional export exceeds its round-trip budget; keep the full project/backup')
+        losses = 'Complete current task; audit index only, not historical revision bodies or archived source bytes. No media bytes. Preserve the full project/backup for history. Existing admitted source required for import.'
+        if evidence_mode == 'references':
+            losses += ' Evidence bytes are external object references. Evidence import requires matching locally admitted object hashes from the complete project/backup.'
         return {'data': data, 'content_type': 'application/json; charset=utf-8',
                 'filename': f'TraceAnnotate-{task_id}-r{task["revision"]}.professional.json',
                 'binding': {'task_id': task_id, 'revision': task['revision'],
                             'content_sha256': task['content_sha256']},
-                'losses': 'Complete current task; audit index only, not historical revision bodies or archived source bytes. No media bytes. Preserve the full project/backup for history. Existing admitted source required for import.'}
+                'evidence_mode': evidence_mode, 'losses': losses}

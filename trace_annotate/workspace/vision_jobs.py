@@ -36,14 +36,14 @@ from ..extractors.scene import SceneDetector, SceneDetectionError
 from ..extractors.shot_attributes import classify_framing
 from ..extractors.shot_boundaries import (classify_scene_cut, detect_shot_boundaries, frame_features,
                                           TRANSITION_KINDS)
-from ..extractors.vlm import VLMExtractor
+from ..extractors.vlm import CAPTION_TASK, VLMExtractor
 from ..temporal.media import stream_sha256
 from . import professional_schema as PS
 from . import schema as S
 from . import semantic_schema as SS
 from . import vision_sampling as VS
 from .semantic_schema import SEMANTIC_VERSION
-from .errors import Conflict, SchemaInvalid, WorkspaceError
+from .errors import Conflict, SchemaInvalid, WorkspaceError, revision_conflict
 from .http_media import resolve_media_object
 from .queue import DurableQueue, MAX_RESULT_BYTES
 from .slots import SlotClosed, SlotTimeout, get_prepare_slot
@@ -482,13 +482,15 @@ def _boundary_sample(item: Dict[str, Any], seconds: float) -> Dict[str, Any]:
 
 
 def _run_ocr(frame: Any, ocr_extractor: Optional[OCRExtractor]) -> Dict[str, Any]:
-    if ocr_extractor is None or ocr_extractor.engine is None:
+    if ocr_extractor is None:
         return {"status": "not_run", "reason": "ocr_runtime_unavailable"}
     try:
         result = ocr_extractor.extract_text(frame)
     except Exception as exc:
         return {"status": "failed", "error": str(exc)}
-    result["status"] = "success"
+    result.setdefault("status", "not_run" if ocr_extractor.engine is None else "success")
+    if result["status"] == "not_run":
+        result.setdefault("reason", "ocr_runtime_unavailable")
     return result
 
 
@@ -1479,20 +1481,61 @@ class VisionJobs:
         from .professional_store import apply_vision_candidates
 
         with self.store.transaction():
+            S.require_id(command_id)
+            S.require_hash(expected_sha256)
+            if type(expected_revision) is not int or not 0 <= expected_revision <= S.MAX_SAFE_INTEGER:
+                raise SchemaInvalid("SCHEMA_INVALID", "Expected revision must be a nonnegative safe integer")
+            if not isinstance(request_body, bytes):
+                raise SchemaInvalid("SCHEMA_INVALID", "Invalid command payload")
             result = self.result(job_id)
-            annotations = _candidate_annotations(result)
-            _attach_candidate_evidence(self.store, result, annotations)
-            arguments = dict(store=self.store, command_id=command_id, task_id=result["task_id"],
-                expected_revision=expected_revision, expected_sha256=expected_sha256,
-                candidates=annotations, source_job_id=result["job_id"],
-                model_runs=result.get("model_runs") or [], request_body=request_body)
-            if self.store.conn.execute("SELECT 1 FROM command_receipts WHERE command_id=?", (command_id,)).fetchone():
+            receipt = self.store.conn.execute(
+                "SELECT response FROM command_receipts WHERE command_id=?", (command_id,)).fetchone()
+            if receipt:
+                # Replay the payload that was actually committed, even when a
+                # later mapper fixes projection rules or the task is edited.
+                response = json.loads(receipt[0]) if receipt[0] else {}
+                row = self.store.conn.execute(
+                    "SELECT body FROM task_revisions WHERE task_id=? AND revision=?",
+                    (result["task_id"], response.get("revision"))).fetchone()
+                if row is None:
+                    raise Conflict("IDEMPOTENCY_CONFLICT", "Command does not identify this candidate import")
+                historical = json.loads(row[0])
+                saved = {annotation["id"]: annotation for annotation in historical["annotations"]
+                         if annotation.get("provenance", {}).get("job_id") == result["job_id"]}
+                identifiers = [S.make_id("ann", result["job_id"] + ":" + str(index))
+                               for index in range(len(result["scenes"]))]
+                if any(identifier not in saved for identifier in identifiers):
+                    raise Conflict("IDEMPOTENCY_CONFLICT", "Command does not identify this candidate import")
+                annotations = [saved[identifier] for identifier in identifiers]
                 return self.store.apply_task_command(command_id=command_id, task_id=result["task_id"],
                     expected_revision=expected_revision, expected_sha256=expected_sha256,
                     operation="import_vision_candidates", payload={"candidates": annotations,
                     "source_job_id": result["job_id"],
                     "model_runs": result.get("model_runs") or []}, request_body=request_body)["response"]
-            return apply_vision_candidates(**arguments)
+            current = self.store.get_task(result["task_id"])
+            if current["revision"] != expected_revision:
+                raise revision_conflict(expected_revision, current["revision"])
+            if current["content_sha256"] != expected_sha256 or self.store.task_digest(current) != expected_sha256:
+                raise Conflict("MEDIA_CHANGED", "Task content hash mismatch",
+                               details={"expected_sha256": expected_sha256,
+                                        "current_sha256": current["content_sha256"]})
+            media = self.queue.get_job(job_id)["media_snapshot"]
+            annotations = _candidate_annotations(result, duration=media["duration"])
+            template = next(value for value in self.store.list_templates()
+                            if (value["id"], value["version"]) ==
+                            (current["template_id"], current["template_version"]))
+            model_runs = result.get("model_runs") or []
+            # Validate before publishing thumbnails: rolling back SQLite cannot
+            # remove immutable objects written for a rejected projection.
+            for annotation in annotations:
+                PS.validate_annotation(annotation, media, template,
+                                       model_run_ids={run["id"] for run in model_runs})
+            _attach_candidate_evidence(self.store, result, annotations)
+            return apply_vision_candidates(
+                store=self.store, command_id=command_id, task_id=result["task_id"],
+                expected_revision=expected_revision, expected_sha256=expected_sha256,
+                candidates=annotations, source_job_id=result["job_id"],
+                model_runs=model_runs, request_body=request_body)
 
 
 def _find_ffmpeg() -> str:
@@ -1745,9 +1788,15 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         job_id, "ocr", provider=ocr_identity.get("provider", "RapidOCR"),
         model_name=ocr_identity.get("model_name", "RapidOCR default det+cls+rec"),
         model_version=ocr_identity.get("model_version", "unavailable"),
-        weights_sha256=_weights_digest(ocr_identity.get("weights_path")),
-        license=ocr_identity.get("license", "Apache-2.0"),
-        preprocessing={"input": "BGR frame as decoded", "orientation": "as-shot"},
+        weights_sha256=ocr_identity.get("weights_sha256") or _weights_digest(ocr_identity.get("weights_path")),
+        license=ocr_identity.get("weights_license") or "unverified local weights",
+        preprocessing={"input": "BGR frame as decoded", "orientation": "as-shot",
+                       "runtime_backend": ocr_identity.get("runtime_backend"),
+                       "code_license": ocr_identity.get("code_license"),
+                       "weights_license": ocr_identity.get("weights_license"),
+                       "weights_hash_policy": ocr_identity.get("weights_hash_policy"),
+                       "weights_files": [{key: item[key] for key in ("role", "sha256", "size_bytes")}
+                                         for item in ocr_identity.get("weights_files", [])]},
         parameters={"ocr_min_confidence": thresholds.ocr_min_confidence,
                     "ocr_min_height_ratio": thresholds.ocr_min_height_ratio},
         input_value=frame_input, output_value=_frame_output(keyframes, "ocr"),
@@ -1761,13 +1810,16 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
     runs.append(_model_run_record(
         job_id, "clip", provider=clip_identity.get("provider", "open_clip"),
         model_name=clip_identity.get("model_name", "ViT-B-32"),
-        model_version=clip_identity.get("pretrained", "openai"),
-        weights_sha256=_weights_digest(clip_identity.get("weights_path")),
-        license=clip_identity.get("license", "MIT (open_clip); pretrained weights terms not declared locally"),
+        model_version=clip_identity.get("selected_revision") or clip_identity.get("pretrained", "unresolved"),
+        weights_sha256=clip_identity.get("weights_sha256") or _weights_digest(clip_identity.get("weights_path")),
+        license=clip_identity.get("weights_license") or clip_identity.get("license", "not declared"),
         preprocessing={"input": "BGR frame converted to RGB",
                        "transform": "open_clip pretrained eval transform",
                        "offline": clip_identity.get("offline"),
-                       "downloads_allowed": clip_identity.get("downloads_allowed")},
+                       "downloads_allowed": clip_identity.get("downloads_allowed"),
+                       "runtime_license": clip_identity.get("runtime_license"),
+                       "weights_license_source": clip_identity.get("weights_license_source"),
+                       "weights_identity_status": clip_identity.get("weights_identity_status")},
         parameters={"clip_binary_confidence": thresholds.clip_binary_confidence,
                     "clip_multiclass_confidence": thresholds.clip_multiclass_confidence,
                     "clip_entity_mismatch_cutoff": thresholds.clip_entity_mismatch_cutoff,
@@ -1783,15 +1835,21 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
     runs.append(_model_run_record(
         job_id, "vlm", provider=vlm_identity.get("provider", "transformers"),
         model_name=vlm_identity.get("model_path", "microsoft/Florence-2-base"),
-        model_version=vlm_identity.get("revision", "unpinned"),
-        weights_sha256=_weights_digest(vlm_identity.get("weights_path")),
-        license=vlm_identity.get("license", "MIT (Florence-2); local weight terms not declared"),
+        model_version=vlm_identity.get("selected_revision") or "unresolved",
+        weights_sha256=vlm_identity.get("weights_sha256") or _weights_digest(vlm_identity.get("weights_path")),
+        license=vlm_identity.get("weights_license") or vlm_identity.get("license", "not declared"),
         preprocessing={"input": "BGR frame converted to RGB PIL image",
                        "trust_remote_code": vlm_identity.get("trust_remote_code"),
                        "offline": vlm_identity.get("offline"),
-                       "downloads_allowed": vlm_identity.get("downloads_allowed")},
-        parameters={"task_prompt": "CAPTION", "max_new_tokens": 192,
-                    "num_beams": 3, "do_sample": False},
+                       "downloads_allowed": vlm_identity.get("downloads_allowed"),
+                       "runtime_license": vlm_identity.get("runtime_license"),
+                       "weights_license_source": vlm_identity.get("weights_license_source"),
+                       "weights_identity_status": vlm_identity.get("weights_identity_status"),
+                       "model_code_sha256": vlm_identity.get("model_code_sha256"),
+                       "model_code_license": vlm_identity.get("model_code_license")},
+        parameters={"task_prompt": getattr(extractors.get("vlm"), "task_prompt", CAPTION_TASK), "max_new_tokens": 192,
+                    "num_beams": 3, "do_sample": False,
+                    "requested_revision": vlm_identity.get("revision")},
         input_value=frame_input, output_value=_frame_output(keyframes, "vlm"),
         status=module_status.get("vlm", "not_run"),
         failure_reason=_first_module_reason(keyframes, "vlm")
@@ -2334,7 +2392,8 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 right = float(window_seconds.get("end"))
             except (TypeError, ValueError):
                 continue
-            if right < float(scene["start"]) or left > float(scene["end"]):
+            if (not math.isfinite(left) or not math.isfinite(right)
+                    or max(left, float(scene["start"])) >= min(right, float(scene["end"]))):
                 continue
             claims.append({
                 "id": S.make_id("clm", f"{job_id}:{index}:action:{number}"),
@@ -2453,7 +2512,8 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
     return {"version": SEMANTIC_VERSION, "claims": claims}
 
 
-def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _candidate_annotations(candidate: Dict[str, Any], *,
+                           duration: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     """Map a vision candidate into model_candidate segment annotations.
 
     Only time boundaries and objective extractor evidence are carried over.
@@ -2466,6 +2526,12 @@ def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
     for index, scene in enumerate(candidate["scenes"]):
         start = _seconds_ratio(float(scene["start"]))
         end = _seconds_ratio(float(scene["end"]))
+        if duration is not None:
+            start = max((S.rational(0), start), key=S.rational_value)
+            start, end = _content_clip(start, end, duration)
+            if not _content_overlap(start, end):
+                raise SchemaInvalid("VISION_CANDIDATE_OUTSIDE_MEDIA",
+                                    "Scene candidate has no interval inside the registered playback")
         keyframe = next((frame for frame in candidate["keyframes"]
                          if frame["scene_index"] == index), None)
         tags = ["vision-candidate", "auto-scene-cut"]
@@ -2508,7 +2574,8 @@ def _candidate_annotations(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
                     right = float(window_seconds.get("end"))
                 except (TypeError, ValueError):
                     continue
-                if right >= float(scene["start"]) and left <= float(scene["end"]):
+                if (math.isfinite(left) and math.isfinite(right)
+                        and max(left, float(scene["start"])) < min(right, float(scene["end"]))):
                     tags.append("vision-action-" + str(action.get("action")))
             if index == 0 and (candidate.get("acoustics_sampling") or {}).get("status") == "success":
                 tags.append("vision-acoustics")

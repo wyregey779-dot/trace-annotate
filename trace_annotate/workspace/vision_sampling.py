@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import math
 import shutil
-import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..temporal.media import stream_sha256
+from ..temporal import preparation as P
 from . import schema as S
 from .errors import DependencyUnavailable, NotFound, SchemaInvalid, WorkspaceError
 from .frames import FrameService
@@ -195,6 +196,17 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
                    max_bytes: Optional[int] = None,
                    ffmpeg: Optional[str] = None) -> Dict[str, Any]:
     """Decode planned frames in bounded select-expression chunks; verify identity."""
+    started = time.monotonic()
+
+    def control() -> bool:
+        if cancelled is not None and cancelled():
+            raise WorkspaceError("CANCELLED", "Sample decode was cancelled")
+        if time.monotonic() - started >= timeout:
+            raise WorkspaceError("FRAME_DECODE_TIMEOUT",
+                                 "Sample decode exceeded its time budget")
+        return False
+
+    control()
     Path(output).mkdir(parents=True, exist_ok=True)
     _safe(Path(output))
     frames = plan["samples"]
@@ -208,7 +220,9 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
     indices = [int(item["frame_index"]) for item in frames]
     produced: List[Path] = []
     commands: List[List[str]] = []
+    decoded_bytes = 0
     for chunk_number, start in enumerate(range(0, len(indices), DECODE_SELECT_TERMS)):
+        control()
         chunk = indices[start:start + DECODE_SELECT_TERMS]
         chunk_dir = Path(output) / f".decode-{chunk_number:04d}"
         chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -216,43 +230,42 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
         pattern = str(chunk_dir / "frame-%04d.png")
         command = [ffmpeg, "-hide_banner", "-v", "error", "-nostdin", "-n", "-xerror",
                    "-protocol_whitelist", "file,pipe", "-err_detect", "explode",
+                   "-threads", "1", "-filter_threads", "1",
                    "-i", str(path), "-map", "0:v:0", "-vf", expression,
                    "-fps_mode", "passthrough", "-c:v", "png", "-pix_fmt", "rgb24",
+                   "-threads:v", "1", "-frames:v", str(len(chunk)),
                    "-f", "image2", pattern]
         commands.append(command)
         try:
-            result = subprocess.run(command, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                    timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            raise WorkspaceError("FRAME_DECODE_TIMEOUT",
-                                 "Sample decode exceeded its time budget") from exc
+            P._run(command, chunk_dir, "decode", control)
+        except (P.MediaPreparationError, OSError) as exc:
+            diagnostic = str(exc)[-600:]
+            raise WorkspaceError("FRAME_DECODE_FAILED",
+                                 f"Sample decoder failed in chunk {chunk_number}; "
+                                 f"ffmpeg={diagnostic}") from exc
+        control()
         chunk_files = sorted(chunk_dir.glob("frame-*.png"))
-        if result.returncode or len(chunk_files) != len(chunk):
-            diagnostic = (result.stderr or b"").decode("utf-8", "replace").strip()[-600:]
+        if len(chunk_files) != len(chunk):
             raise WorkspaceError(
                 "FRAME_DECODE_FAILED",
                 f"Decoder produced {len(chunk_files)} of {len(chunk)} planned frames "
-                f"in chunk {chunk_number}"
-                + (f"; ffmpeg={diagnostic}" if diagnostic else ""))
+                f"in chunk {chunk_number}")
+        decoded_bytes += sum(file.stat().st_size for file in chunk_files)
+        if decoded_bytes > (max_bytes or MAX_OUTPUT_BYTES):
+            raise WorkspaceError("FRAME_TOO_LARGE", "Decoded samples exceed the byte budget")
         produced.extend(chunk_files)
-        if cancelled is not None and cancelled():
-            raise WorkspaceError("CANCELLED", "Sample decode was cancelled")
     expected = len(frames)
     if len(produced) != expected:
         raise WorkspaceError("FRAME_DECODE_FAILED",
                              f"Decoder produced {len(produced)} of {expected} planned frames")
     for position, file in enumerate(produced, start=1):
+        control()
         file.replace(Path(output) / f"sample-{position:04d}.png")
-    for start in range(0, len(indices), DECODE_SELECT_TERMS):
-        chunk_dir = Path(output) / f".decode-{start // DECODE_SELECT_TERMS:04d}"
-        try:
-            chunk_dir.rmdir()
-        except OSError:
-            pass
+    # Keep the owned-process receipts and bounded decoder diagnostics per chunk.
     evidence: List[Dict[str, Any]] = []
     total_bytes = 0
     for item, position in zip(frames, range(1, expected + 1)):
+        control()
         file = Path(output) / f"sample-{position:04d}.png"
         data = file.read_bytes()
         if data[:8] != b"\x89PNG\r\n\x1a\n":
@@ -264,7 +277,7 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
                          "proxy_pts": item["proxy_pts"], "seconds": item["seconds"],
                          "roles": item["roles"], "path": str(file),
                          "sha256": S.sha256_bytes(data), "size_bytes": len(data)})
-    if shutil.which("ffmpeg") and stream_sha256(path) != playback_hash:
+    if shutil.which("ffmpeg") and stream_sha256(path, cancelled=control) != playback_hash:
         raise WorkspaceError("RECOVERY_REQUIRED", "Playback changed during sample decode")
     return {"media_id": media_id, "frame_map_sha256": plan["frame_map_sha256"],
             "playback_sha256": playback_hash, "decoded": evidence,
