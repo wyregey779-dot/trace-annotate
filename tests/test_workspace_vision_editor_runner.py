@@ -153,3 +153,43 @@ def test_worker_start_failure_has_a_final_record(tmp_path, runner):
     result = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert result["status"] == "FAIL" and result["finished_utc"]
     assert result["failed_phase"] == "worker.starting" and (output / "failure.log").is_file()
+
+def test_installed_config_is_utf8_under_legacy_windows_locale(tmp_path, runner, monkeypatch):
+    """Python -I ignores PYTHONUTF8; venv.cfg itself is always UTF-8."""
+    import types
+    package = tmp_path / 'venv/Lib/site-packages/trace_annotate'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_bytes(b'# installed package\n')
+    prefix = tmp_path / 'venv'
+    (prefix / 'pyvenv.cfg').write_text(
+        'include-system-site-packages = false\ncommand = D:/视频标注/运行环境\n', encoding='utf-8')
+    wheel = tmp_path / 'candidate.whl'
+    with zipfile.ZipFile(wheel, 'w') as archive:
+        archive.writestr('trace_annotate/__init__.py', b'# installed package\n')
+    for name in list(sys.modules):
+        if name == 'trace_annotate' or name.startswith('trace_annotate.'):
+            monkeypatch.delitem(sys.modules, name)
+    module = types.ModuleType('trace_annotate')
+    module.__file__ = str(package / '__init__.py')
+    monkeypatch.setitem(sys.modules, 'trace_annotate', module)
+    for name, attr in [('trace_annotate.workspace.server', 'make_server'),
+                       ('trace_annotate.workspace.store', 'WorkspaceStore')]:
+        fake = types.ModuleType(name)
+        setattr(fake, attr, object())
+        monkeypatch.setitem(sys.modules, name, fake)
+    monkeypatch.setattr(sys, 'prefix', str(prefix))
+    monkeypatch.setattr(sys, 'base_prefix', str(tmp_path / 'base'))
+    flags = SimpleNamespace(**{key: getattr(sys.flags, key) for key in dir(sys.flags)
+                               if not key.startswith('_')})
+    flags.isolated = 1
+    monkeypatch.setattr(sys, 'flags', flags)
+    monkeypatch.setattr(runner.site, 'ENABLE_USER_SITE', False)
+    monkeypatch.setattr(runner.sysconfig, 'get_path', lambda _: str(package.parent))
+    original = Path.read_text
+    def legacy_windows_read(path, encoding=None, errors=None, **kwargs):
+        return original(path, encoding=encoding or 'cp936', errors=errors, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', legacy_windows_read)
+    runtime = runner.load_runtime(wheel)
+    assert runtime.identity['mode'] == 'installed-wheel'
+    assert runtime.identity['isolated'] is True and runtime.identity['user_site'] is False
+    assert runtime.package == package

@@ -34,7 +34,7 @@ from ..extractors.faces import FaceExtractor
 from ..extractors.ocr import OCRExtractor
 from ..extractors.scene import SceneDetector, SceneDetectionError
 from ..extractors.shot_attributes import classify_framing
-from ..extractors.shot_boundaries import (classify_scene_cut, detect_shot_boundaries,
+from ..extractors.shot_boundaries import (classify_scene_cut, detect_shot_boundaries, frame_features,
                                           TRANSITION_KINDS)
 from ..extractors.vlm import VLMExtractor
 from ..temporal.media import stream_sha256
@@ -468,6 +468,17 @@ def _expressive_result(measured: Dict[str, Any], keyframe: Dict[str, Any]) -> Di
                    "no_faces_with_usable_landmarks"))
     return {"status": status, "reason": reason, "cues": cues, "face_results": evaluated,
             "scope": "sampled_frame_geometry_not_emotion_or_blink_duration"}
+
+
+def _boundary_sample(item: Dict[str, Any], seconds: float) -> Dict[str, Any]:
+    """Release the decoded full frame immediately; retain only small features.
+
+    Overlapping boundary windows can share these read-only measurements. The
+    original decoded image and its evidence digest remain unchanged on disk.
+    """
+    return {"frame_index": item["frame_index"], "seconds": seconds,
+            "source_pts": item["source_pts"], "proxy_pts": item["proxy_pts"],
+            **frame_features(_load_frame(Path(item["path"])))}
 
 
 def _run_ocr(frame: Any, ocr_extractor: Optional[OCRExtractor]) -> Dict[str, Any]:
@@ -1042,11 +1053,7 @@ class VisionJobs:
                                 "seconds": seconds,
                                 "evidence_sha256": item["sha256"],
                             })
-                            sample = {"frame_index": item["frame_index"],
-                                      "seconds": seconds,
-                                      "source_pts": item["source_pts"],
-                                      "proxy_pts": item["proxy_pts"],
-                                      "frame": _load_frame(Path(item["path"]))}
+                            sample = _boundary_sample(item, seconds)
                             for scene_index in scene_indices:
                                 boundary_samples.setdefault(scene_index, []).append(dict(sample))
                         scene_events: Dict[int, List[Dict[str, Any]]] = {}

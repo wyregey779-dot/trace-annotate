@@ -98,7 +98,7 @@ def load_runtime(installed_wheel):
                 or not any(root in package.parents for root in roots)):
             raise RuntimeError("Installed acceptance must load a separate venv site-packages, without user-site or checkout imports")
         configuration = Path(sys.prefix) / "pyvenv.cfg"
-        if not configuration.is_file() or "include-system-site-packages = false" not in configuration.read_text().lower():
+        if not configuration.is_file() or "include-system-site-packages = false" not in configuration.read_text(encoding='utf-8').lower():
             raise RuntimeError("Installed acceptance requires a venv without system-site-packages")
         installed_wheel = installed_wheel.expanduser().resolve(strict=True)
         identity = {"mode": "installed-wheel", "wheel": str(installed_wheel),

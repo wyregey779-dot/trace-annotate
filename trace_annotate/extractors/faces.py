@@ -74,12 +74,11 @@ class FaceExtractor(BaseExtractor):
         YuNet weights are an external file, so their hash is computed by the
         caller from ``model_path``; this property never invents a digest.
         """
-        import cv2
         return {"provider": "opencv",
                 "model_name": ("YuNet" if self.detector_kind == "yunet"
                                else "Haar cascade" if self.detector_kind == "haar"
                                else "unavailable"),
-                "model_version": getattr(cv2, "__version__", "unknown"),
+                "model_version": getattr(cv2, "__version__", "unknown") if HAS_CV2 else "unavailable",
                 "weights_path": self.model_path,
                 "detector_kind": self.detector_kind,
                 "license": "OpenCV Apache-2.0; detector weights license not bundled locally"}
