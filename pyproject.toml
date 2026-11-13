@@ -9,7 +9,7 @@ description = "Local media review, general video segment annotation, and embodie
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "trace_annotate/models/YUNET-LICENSE.txt"]
 authors = [
     { name = "TraceAnnotate Contributors" }
 ]
@@ -88,4 +88,4 @@ where = ["."]
 include = ["trace_annotate*"]
 
 [tool.setuptools.package-data]
-trace_annotate = ["templates/*.json", "templates/*.xml", "embodied/ui/*.html", "temporal/ui/*.html", "temporal/ui/*.js", "temporal/ui/*.txt", "workspace/fonts/*.otf", "workspace/fonts/*.txt", "workspace/fonts/*.json", "workspace/fonts/*.md", "models/*.onnx", "models/*.md"]
+trace_annotate = ["templates/*.json", "templates/*.xml", "embodied/ui/*.html", "temporal/ui/*.html", "temporal/ui/*.js", "temporal/ui/*.txt", "workspace/fonts/*.otf", "workspace/fonts/*.txt", "workspace/fonts/*.json", "workspace/fonts/*.md", "models/*.onnx", "models/*.md", "models/*.txt"]

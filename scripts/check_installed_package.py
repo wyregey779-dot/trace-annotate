@@ -27,6 +27,13 @@ site_roots = {Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "pl
 assert any(root in installed_path.parents for root in site_roots), f"Not installed in site-packages: {installed_path}"
 assert metadata.version("trace-annotate") == trace_annotate.__version__
 package = resources.files("trace_annotate")
+yunet_license = package.joinpath("models", "YUNET-LICENSE.txt").read_bytes()
+assert __import__("hashlib").sha256(yunet_license).hexdigest() == "c83b8120c50ccbd4c4f96edf53141bdd566ebb8f8e9227e415326aa1b1aba958"
+distribution = metadata.distribution("trace-annotate")
+license_entries = [item for item in distribution.files or []
+                   if item.name == "YUNET-LICENSE.txt" and ".dist-info" in str(item)]
+assert len(license_entries) == 1, "YuNet license missing from installed distribution metadata"
+assert Path(distribution.locate_file(license_entries[0])).read_bytes() == yunet_license
 for name in ("schema_v2.json", "default_vocab.json"):
     json.loads(package.joinpath("templates", name).read_text(encoding="utf-8"))
 assert ET.fromstring(package.joinpath("templates", "label_studio_embodied_v2.1.xml").read_text(encoding="utf-8")).tag == "View"

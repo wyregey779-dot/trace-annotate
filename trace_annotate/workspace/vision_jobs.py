@@ -1918,15 +1918,21 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         return instance.code_identity
 
     face_identity = extractor_identity("face", "YuNet")
+    face_weights = _weights_digest(face_identity.get("weights_path"))
+    known_yunet = face_weights == "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
     runs.append(_model_run_record(
         job_id, "face", provider=face_identity.get("provider", "opencv"),
         model_name=face_identity.get("model_name", "YuNet"),
         model_version=face_identity.get("model_version", "unknown"),
-        weights_sha256=_weights_digest(face_identity.get("weights_path")),
-        license=face_identity.get("license", "not declared"),
+        weights_sha256=face_weights,
+        license="MIT" if known_yunet else face_identity.get("license", "not declared"),
         preprocessing={"input": "BGR frame as decoded",
                        "detector_kind": face_identity.get("detector_kind"),
-                       "detector_input": "320x320" if face_identity.get("detector_kind") == "yunet" else "native"},
+                       "detector_input": "decoded_frame_width_height" if face_identity.get("detector_kind") == "yunet" else "native",
+                       "detector_initial_input": [320, 320] if face_identity.get("detector_kind") == "yunet" else None,
+                       "runtime_license": "Apache-2.0 (OpenCV)" if face_identity.get("provider") == "opencv" else None,
+                       "weights_license_source": ("https://raw.githubusercontent.com/opencv/opencv_zoo/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/LICENSE"
+                                                  if known_yunet else None)},
         parameters={"face_min_confidence": thresholds.face_min_confidence},
         input_value=frame_input, output_value=_frame_output(keyframes, "face"),
         status=module_status.get("face", "not_run"),
