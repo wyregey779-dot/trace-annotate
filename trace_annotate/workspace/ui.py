@@ -149,7 +149,7 @@ function showTime(r){const n=BigInt(r.n),d=BigInt(r.d);let q=d;while(q%2n===0n)q
 function compareTime(a,b){const x=BigInt(a.n)*BigInt(b.d)-BigInt(b.n)*BigInt(a.d);return x<0n?-1:x>0n?1:0;}
 function seconds(r){return Number(r.n)/Number(r.d);}
 function clone(v){return JSON.parse(JSON.stringify(v));}
-const state={snapshot:null,intakes:[],task:null,media:null,selected:null,original:null,dirty:false,busy:false,loadingTask:false,playGeneration:0,playIntent:false,playWaiting:false,playError:null,segmentPlayback:null,playRAF:null,pending:null,conflict:false,sequence:0,frameSequence:0,frame:null,frameBlob:null,loadingFrame:false,importing:false,stopImport:false,maxUpload:512*1024*1024,uploadRows:[],anchors:{},formBase:null,anchorBase:null,intakeCommands:[],intakePoll:null,batch:null,batchRunId:null,batchController:null,statusUnavailable:false,visionScene:false,visionJob:null,visionResult:null,visionTimer:null,visionGeneration:0,visionAbort:null,compareToken:0,compareBlobs:[]};
+const state={snapshot:null,intakes:[],task:null,media:null,selected:null,original:null,dirty:false,busy:false,loadingTask:false,playGeneration:0,playIntent:false,playWaiting:false,playError:null,segmentPlayback:null,segmentStartClock:null,playRAF:null,pending:null,conflict:false,sequence:0,frameSequence:0,frame:null,frameBlob:null,loadingFrame:false,importing:false,stopImport:false,maxUpload:512*1024*1024,uploadRows:[],anchors:{},formBase:null,anchorBase:null,intakeCommands:[],intakePoll:null,batch:null,batchRunId:null,batchController:null,statusUnavailable:false,visionScene:false,visionJob:null,visionResult:null,visionTimer:null,visionGeneration:0,visionAbort:null,compareToken:0,compareBlobs:[]};
 // Read-only observability for the browser control script: the exact command id
 // a button click used, so a terminal-state replay can be checked against the
 // persisted receipt instead of guessing an id.
@@ -633,11 +633,64 @@ function playbackAllowed(){return Boolean(state.task&&!state.loadingTask&&!$('co
 function selectedSegment(){return state.task?.annotations.find(a=>a.id===state.selected&&a.type==='segment')||null;}
 function renderPlayback(){const player=$('player'),isFrame=$('frame-mode').checked,disabled=!state.task||state.loadingTask,playing=!player.paused||state.playIntent;const button=$('play-toggle');button.disabled=disabled;button.textContent=isFrame?'▶ 从此处播放':playing?'Ⅱ 暂停':'▶ 播放视频';button.setAttribute('aria-pressed',String(!isFrame&&playing));for(const id of ['skip-back','skip-forward','playback-rate','frame-mode'])$(id).disabled=disabled;const selected=selectedSegment();$('play-selection').disabled=disabled||!selected;$('loop-selection').disabled=disabled||!selected;$('preview-mode').textContent=isFrame?'静态取帧 · 非播放':'连续播放 · 秒级导航';$('mode-help').textContent=isFrame?'当前是静态图像。上方“从此处播放”返回视频并从该帧时间播放；草稿保持。':'主播放从当前位置连续播放；片段按钮从片段起点播放。Space 播放/暂停 · I/O 取边界，输入框内不触发。';const status=$('playback-status');if(disabled){status.textContent=state.loadingTask?'正在加载视频任务…':'选择任务后即可播放';status.dataset.state='loading';}else if(state.playError){status.textContent=state.playError;status.dataset.state='error';}else if(isFrame){status.textContent=state.loadingFrame?'正在获取确定帧，静态取证不播放声音':state.frame?'已显示确定帧 #'+state.frame.frame_index+'；可取精确边界，或点击上方继续播放':'静态取帧模式：输入帧序号后点击“显示帧”';status.dataset.state='frame';}else if(state.playWaiting){status.textContent='正在载入视频数据…可再次点击暂停';status.dataset.state='loading';}else{const selection=state.segmentPlayback;status.textContent=selection?($('loop-selection').checked?'循环片段':'播放片段')+' · '+selection.start.toFixed(3)+'–'+selection.end.toFixed(3)+' s':player.ended?'播放结束，可点击重播':player.paused?'视频已暂停 · 点击上方播放按钮':'正在播放 · '+player.playbackRate+'×';status.dataset.state=player.paused?'paused':'playing';}}
 function clearPlaybackRAF(){if(state.playRAF!==null){cancelAnimationFrame(state.playRAF);state.playRAF=null;}}
-function pausePlayback({clearSegment=false}={}){state.playGeneration++;state.playIntent=false;state.playWaiting=false;clearPlaybackRAF();$('player').pause();if(clearSegment)state.segmentPlayback=null;renderPlayback();}
+function clearSegmentPlayback(){state.segmentPlayback=null;state.segmentStartClock=null;clearPlaybackRAF();}
+function pausePlayback({clearSegment=false}={}){state.playGeneration++;state.playIntent=false;state.playWaiting=false;clearPlaybackRAF();$('player').pause();if(clearSegment)clearSegmentPlayback();renderPlayback();}
 function leaveFrameForPlayback(){const time=state.frame?seconds(state.frame.seconds):null;if($('frame-mode').checked){releaseFrame();$('frame-mode').checked=false;$('player').hidden=false;$('frame-controls').hidden=true;$('frame-identity').hidden=true;$('seek').disabled=false;if(time!==null)seekPlayback(time,{clearSegment:false});}return time;}
-function seekPlayback(target,{clearSegment=true}={}){if(!state.media||state.loadingTask||!Number.isFinite(target))return false;if(clearSegment)state.segmentPlayback=null;const player=$('player'),limit=Number.isFinite(player.duration)?Math.min(player.duration,seconds(state.media.duration)):seconds(state.media.duration);try{player.currentTime=Math.max(0,Math.min(limit,target));updatePlaybackTime();return true;}catch(_){state.playError='视频尚未就绪，暂时无法定位；请等待加载后重试。';renderPlayback();return false;}}
-function watchSegment(){clearPlaybackRAF();const check=()=>{state.playRAF=null;const active=state.segmentPlayback,player=$('player');if(!active||player.paused||state.loadingTask||$('frame-mode').checked||active.taskId!==state.task?.id)return;if(player.currentTime>=active.end){if($('loop-selection').checked){seekPlayback(active.start,{clearSegment:false});}else{pausePlayback({clearSegment:true});seekPlayback(active.end,{clearSegment:false});return;}}state.playRAF=requestAnimationFrame(check);};state.playRAF=requestAnimationFrame(check);}
-async function beginPlayback({segment=null}={}){if(!playbackAllowed())return;leaveFrameForPlayback();const player=$('player');state.playError=null;if(segment){state.segmentPlayback=segment;if(!seekPlayback(segment.start,{clearSegment:false}))return;}else{state.segmentPlayback=null;clearPlaybackRAF();if(player.ended||player.currentTime>=seconds(state.media.duration))seekPlayback(0);}const generation=++state.playGeneration,taskId=state.task.id;state.playIntent=true;state.playWaiting=player.readyState<3;renderPlayback();let timeout;try{const result=player.play();await Promise.race([Promise.resolve(result),new Promise((_,reject)=>{timeout=setTimeout(()=>{const e=new Error('Playback timeout');e.name='TimeoutError';reject(e);},15000);})]);if(generation!==state.playGeneration||taskId!==state.task?.id)return;state.playWaiting=false;watchSegment();renderPlayback();}catch(error){if(generation!==state.playGeneration||taskId!==state.task?.id)return;state.playGeneration++;state.playIntent=false;state.playWaiting=false;player.pause();clearPlaybackRAF();state.playError=error.name==='NotAllowedError'?'浏览器拒绝播放，请直接点击播放按钮重试。':error.name==='NotSupportedError'?'浏览器无法解码该视频，可重试或切换确定帧查看。':error.name==='TimeoutError'?'视频加载超过 15 秒，已暂停；检查本机服务后点击重试。':'播放未能开始（'+(error.name||'PlaybackError')+'），请点击播放按钮重试。';renderPlayback();}finally{clearTimeout(timeout);}}
+function seekPlayback(target,{clearSegment=true}={}){
+ if(!state.media||state.loadingTask||!Number.isFinite(target))return false;
+ if(clearSegment)clearSegmentPlayback();
+ const player=$('player'),active=state.segmentPlayback;
+ const limit=Number.isFinite(player.duration)?Math.min(player.duration,seconds(state.media.duration)):seconds(state.media.duration);
+ try{
+  player.currentTime=Math.max(0,Math.min(limit,target));
+  if(active&&target===active.start){
+   // currentTime's setter updates the official clock before asynchronous seek
+   // completion. Keep its actual precision, never a guessed tolerance or a
+   // rewritten annotation boundary. Bind this transient value to this range.
+   const observed=player.currentTime;
+   state.segmentStartClock=Number.isFinite(observed)?{active,time:Math.min(active.start,observed)}:null;
+  }
+  updatePlaybackTime();return true;
+ }catch(_){
+  state.playError='视频尚未就绪，暂时无法定位；请等待加载后重试。';renderPlayback();return false;
+ }
+}
+function enforceSegmentBoundary(){
+ const active=state.segmentPlayback,player=$('player');
+ if(!active||player.paused||state.loadingTask||$('frame-mode').checked||active.taskId!==state.task?.id)return false;
+ // A seek may still expose the old clock position until seeked is delivered.
+ if(player.seeking)return true;
+ const clock=state.segmentStartClock,lower=clock?.active===active?clock.time:active.start;
+ if(player.currentTime<lower){
+  // A completed native seek before the observed start leaves the selection;
+  // it must not play a long out-of-range prelude or pull user navigation back.
+  clearSegmentPlayback();renderPlayback();return false;
+ }
+ if(player.currentTime>=active.end){
+  if(!$('loop-selection').checked){
+   pausePlayback({clearSegment:true});seekPlayback(active.end,{clearSegment:false});return false;
+  }
+  if(!seekPlayback(active.start,{clearSegment:false})){
+   pausePlayback({clearSegment:true});return false;
+  }
+ }
+ return true;
+}
+function watchSegment(){
+ clearPlaybackRAF();
+ const active=state.segmentPlayback,generation=state.playGeneration;
+ if(!active)return;
+ let scheduled;
+ const check=()=>{
+  // A cancelled callback may already be queued when a new playback is started.
+  if(state.playRAF!==scheduled)return;
+  state.playRAF=null;
+  if(generation!==state.playGeneration||state.segmentPlayback!==active||!enforceSegmentBoundary())return;
+  scheduled=requestAnimationFrame(check);state.playRAF=scheduled;
+ };
+ scheduled=requestAnimationFrame(check);state.playRAF=scheduled;
+}
+async function beginPlayback({segment=null}={}){if(!playbackAllowed())return;leaveFrameForPlayback();const player=$('player');state.playError=null;if(segment){state.segmentPlayback=segment;if(!seekPlayback(segment.start,{clearSegment:false})){pausePlayback({clearSegment:true});return;}}else{clearSegmentPlayback();if(player.ended||player.currentTime>=seconds(state.media.duration))seekPlayback(0);}const generation=++state.playGeneration,taskId=state.task.id;state.playIntent=true;state.playWaiting=player.readyState<3;renderPlayback();let timeout;try{const result=player.play();await Promise.race([Promise.resolve(result),new Promise((_,reject)=>{timeout=setTimeout(()=>{const e=new Error('Playback timeout');e.name='TimeoutError';reject(e);},15000);})]);if(generation!==state.playGeneration||taskId!==state.task?.id)return;state.playWaiting=false;watchSegment();renderPlayback();}catch(error){if(generation!==state.playGeneration||taskId!==state.task?.id)return;state.playGeneration++;state.playIntent=false;state.playWaiting=false;player.pause();clearPlaybackRAF();state.playError=error.name==='NotAllowedError'?'浏览器拒绝播放，请直接点击播放按钮重试。':error.name==='NotSupportedError'?'浏览器无法解码该视频，可重试或切换确定帧查看。':error.name==='TimeoutError'?'视频加载超过 15 秒，已暂停；检查本机服务后点击重试。':'播放未能开始（'+(error.name||'PlaybackError')+'），请点击播放按钮重试。';renderPlayback();}finally{clearTimeout(timeout);}}
 async function togglePlayback(){if(!playbackAllowed())return;if(!$('frame-mode').checked&&(!$('player').paused||state.playIntent)){pausePlayback();return;}await beginPlayback();}
 function skipPlayback(delta){if(!playbackAllowed())return;const from=$('frame-mode').checked&&state.frame?seconds(state.frame.seconds):$('player').currentTime;leaveFrameForPlayback();seekPlayback(from+delta);renderPlayback();}
 async function playSelected(){if(!playbackAllowed())return;const annotation=selectedSegment();if(!annotation)return;const start=seconds(annotation.start.seconds),end=seconds(annotation.end.seconds);if(!(Number.isFinite(start)&&Number.isFinite(end)&&start<end)){notice('所选片段时间无效。','error');return;}await beginPlayback({segment:{taskId:state.task.id,annotationId:annotation.id,start,end}});}
@@ -785,7 +838,27 @@ function bind(){
  $('split-segment').addEventListener('click',splitSegment);$('merge-next').addEventListener('click',mergeNextSegment);$('measurement-save').addEventListener('click',saveMeasurement);$('measurement-claim').addEventListener('change',()=>renderMeasurementSelection(state.original));$('compare-refresh').addEventListener('click',scheduleCompare);$('export-text-btn').addEventListener('click',exportTextTask);$('export-text-format').addEventListener('change',()=>{$('export-track').hidden=!['srt','vtt'].includes($('export-text-format').value);});
  $('mark-start').addEventListener('click',()=>captureTime('start'));$('mark-end').addEventListener('click',()=>captureTime('end'));$('use-video-end').addEventListener('click',()=>{if(!state.media)return;state.anchors.end={seconds:clone(state.media.video_end)};$('segment-end').value=showTime(state.media.video_end);updateAnchorLabels();clearReviewIntent();updateDirty();});
  $('play-toggle').addEventListener('click',togglePlayback);$('skip-back').addEventListener('click',()=>skipPlayback(-5));$('skip-forward').addEventListener('click',()=>skipPlayback(5));$('play-selection').addEventListener('click',playSelected);$('loop-selection').addEventListener('change',renderPlayback);$('playback-rate').addEventListener('change',()=>{const rate=Number($('playback-rate').value);if([.25,.5,.75,1,1.25,1.5,2].includes(rate))$('player').playbackRate=rate;renderPlayback();});
- $('player').addEventListener('timeupdate',()=>{updatePlaybackTime();if(state.segmentPlayback&&!$('player').paused&&$('player').currentTime>=state.segmentPlayback.end)watchSegment();});$('player').addEventListener('loadedmetadata',()=>{if(!state.loadingTask){state.playError=null;$('player').playbackRate=Number($('playback-rate').value);}updatePlaybackTime();renderPlayback();});$('player').addEventListener('play',()=>{if(state.loadingTask||$('frame-mode').checked){$('player').pause();return;}const active=state.segmentPlayback;if(active&&(active.taskId!==state.task?.id||$('player').currentTime<active.start||$('player').currentTime>=active.end))state.segmentPlayback=null;state.playIntent=true;state.playError=null;watchSegment();renderPlayback();});$('player').addEventListener('playing',()=>{state.playWaiting=false;renderPlayback();});$('player').addEventListener('waiting',()=>{if(!$('player').paused&&!$('frame-mode').checked){state.playWaiting=true;renderPlayback();}});$('player').addEventListener('pause',()=>{if($('player').paused){state.playIntent=false;state.playWaiting=false;clearPlaybackRAF();renderPlayback();}});$('player').addEventListener('ended',()=>{const active=state.segmentPlayback;if(active&&active.taskId===state.task?.id&&$('loop-selection').checked&&!state.loadingTask)beginPlayback({segment:active});else{state.playIntent=false;state.playWaiting=false;renderPlayback();}});$('player').addEventListener('error',handlePlaybackError);$('player').addEventListener('ratechange',()=>{const rate=String($('player').playbackRate);if(Array.from($('playback-rate').options).some(o=>o.value===rate))$('playback-rate').value=rate;renderPlayback();});$('seek').addEventListener('input',()=>{if(!$('frame-mode').checked)seekPlayback(Number($('seek').value));});$('frame-mode').addEventListener('change',toggleFrameMode);$('frame-show').addEventListener('click',()=>showFrame($('frame-index').value));for(const [id,delta]of [['frame-prev',-1n],['frame-next',1n]])$(id).addEventListener('click',()=>{try{showFrame((BigInt($('frame-index').value)+delta).toString());}catch(_){notice('请输入有效帧序号。','error');}});
+ // timeupdate continues to enforce the range when background tabs suspend rAF.
+ $('player').addEventListener('timeupdate',()=>{updatePlaybackTime();enforceSegmentBoundary();});
+ $('player').addEventListener('seeked',()=>{updatePlaybackTime();enforceSegmentBoundary();});
+ $('player').addEventListener('loadedmetadata',()=>{if(!state.loadingTask){state.playError=null;$('player').playbackRate=Number($('playback-rate').value);}updatePlaybackTime();renderPlayback();});
+ $('player').addEventListener('play',()=>{
+  if(state.loadingTask||$('frame-mode').checked){$('player').pause();return;}
+  if($('player').paused)return;
+  const active=state.segmentPlayback;
+  // Native clocks may round a requested start down (983/30 -> 32.766666).
+  // Ownership, not that rounded readback, determines whether a range is active.
+  // The seek slider, skip buttons and ordinary play explicitly leave the range.
+  if(active&&active.taskId!==state.task?.id)clearSegmentPlayback();
+  state.playIntent=true;state.playError=null;watchSegment();renderPlayback();
+ });
+ $('player').addEventListener('playing',()=>{state.playWaiting=false;renderPlayback();});$('player').addEventListener('waiting',()=>{if(!$('player').paused&&!$('frame-mode').checked){state.playWaiting=true;renderPlayback();}});$('player').addEventListener('pause',()=>{if($('player').paused){state.playIntent=false;state.playWaiting=false;clearPlaybackRAF();renderPlayback();}});
+ $('player').addEventListener('ended',()=>{
+  const active=state.segmentPlayback;
+  if(active&&active.taskId===state.task?.id&&$('loop-selection').checked&&!state.loadingTask&&!$('frame-mode').checked)beginPlayback({segment:active});
+  else pausePlayback({clearSegment:true});
+ });
+ $('player').addEventListener('error',handlePlaybackError);$('player').addEventListener('ratechange',()=>{const rate=String($('player').playbackRate);if(Array.from($('playback-rate').options).some(o=>o.value===rate))$('playback-rate').value=rate;renderPlayback();});$('seek').addEventListener('input',()=>{if(!$('frame-mode').checked)seekPlayback(Number($('seek').value));});$('frame-mode').addEventListener('change',toggleFrameMode);$('frame-show').addEventListener('click',()=>showFrame($('frame-index').value));for(const [id,delta]of [['frame-prev',-1n],['frame-next',1n]])$(id).addEventListener('click',()=>{try{showFrame((BigInt($('frame-index').value)+delta).toString());}catch(_){notice('请输入有效帧序号。','error');}});
  window.addEventListener('beforeunload',event=>{if(state.dirty||state.pending||state.importing||state.loadingTask||Boolean(state.batch&&state.batch.running)){event.preventDefault();event.returnValue='';}});
  document.addEventListener('keydown',event=>{if(event.isComposing||event.keyCode===229||$('confirm-dialog').open)return;if((event.ctrlKey||event.metaKey)&&!event.altKey&&!keyboardTargetIsInteractive(event.target)){const k=event.key.toLowerCase();if(k==='z'){event.preventDefault();if(event.shiftKey)performRedo();else performUndo();return;}if(k==='y'){event.preventDefault();performRedo();return;}}if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='s'){event.preventDefault();if(state.task&&!state.busy&&!state.pending&&!state.loadingTask)$('segment-form').requestSubmit();return;}if(event.ctrlKey||event.metaKey||event.altKey||event.shiftKey||event.repeat||keyboardTargetIsInteractive(event.target)||!playbackAllowed())return;const key=event.key.toLowerCase();if(event.code==='Space'||event.key===' '){event.preventDefault();togglePlayback();}else if(key==='i'||key==='o'){event.preventDefault();captureTime(key==='i'?'start':'end');}});
 }
