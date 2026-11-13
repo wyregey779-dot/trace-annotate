@@ -157,6 +157,18 @@ def test_dissolve_fit_accepts_a_textured_nonlinear_crossfade():
     assert fit["relative_residual"] < .02
 
 
+def test_dissolve_fit_has_identical_metrics_for_uint8_and_float_tracks():
+    y, x = np.indices((48, 64))
+    first = (((x // 4 + y // 6) % 2) * 180 + 35).astype(float)
+    last = (((x // 9 + y // 3) % 2) * 150 + 70).astype(float)
+    track = [{"gray": np.round((1 - a) * first + a * last).astype(np.uint8)}
+             for a in np.linspace(0, 1, 12)]
+    reference = [{"gray": item["gray"].astype(np.float64)} for item in track]
+    result = SB._dissolve_fit(track, 0, len(track) - 1)
+    assert result is not None
+    assert result == SB._dissolve_fit(reference, 0, len(reference) - 1)
+
+
 @pytest.mark.parametrize("color", [BLACK, WHITE])
 def test_static_polarity_hold_is_not_a_fade(color):
     assert SB.detect_shot_boundaries(_samples([color] * 12))["events"] == []

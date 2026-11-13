@@ -144,7 +144,8 @@ def _dissolve_fit(track: List[Dict[str, Any]], start: int, end: int) -> Optional
     """
     if end - start < 2:
         return None
-    first, last = track[start]["gray"], track[end]["gray"]
+    first = np.asarray(track[start]["gray"], dtype=np.float64)
+    last = np.asarray(track[end]["gray"], dtype=np.float64)
     far = float(np.abs(first - last).mean() / 255.0)
     if far < DISSOLVE_FAR:
         return None
@@ -154,7 +155,7 @@ def _dissolve_fit(track: List[Dict[str, Any]], start: int, end: int) -> Optional
         return None
     residuals, alphas = [], []
     for index in range(start + 1, end):
-        current = track[index]["gray"]
+        current = np.asarray(track[index]["gray"], dtype=np.float64)
         alpha = float(np.sum((current - first) * delta) / energy)
         if not -DISSOLVE_REVERSAL_TOLERANCE <= alpha <= 1 + DISSOLVE_REVERSAL_TOLERANCE:
             return None

@@ -136,6 +136,29 @@ def test_byte_cap_marks_an_active_fade_interval_as_clipped(admitted, tmp_path):
     assert "字节预算" in event["uncertainty"]
 
 
+def test_full_global_interval_is_retained_beside_a_short_local_candidate(admitted, tmp_path):
+    from trace_annotate.workspace import vision_jobs as V
+    store, item = admitted
+    partial = discovery().scan_transitions(
+        store, item["media_id"], tmp_path / "partial-local-measurement",
+        window={"start": S.rational(0), "end": S.rational("3/2")})
+    local = next(event for event in partial["events"] if event["kind"] == "fade_in")
+    local = copy.deepcopy(local)
+    local["metrics"]["analysis_scope"] = "scene_start_neighbourhood"
+    original = copy.deepcopy(local)
+    first = {"scene_index": 0, "frame_index": "0", "boundary_events": [local]}
+    frames = []
+    result = V._attach_global_transitions(store, item["media_id"], store.tmp_dir,
+        [first], [{"start": 0.0, "end": 4.5}], frames, None, shutil.which("ffmpeg"), None)
+    assert result["projected_events"] == 1
+    assert first["boundary_events"][0] == original
+    full = first["boundary_events"][1]
+    assert int(full["interval"]["end_frame"]) > int(local["interval"]["end_frame"])
+    assert full["needs_review"] is True
+    assert full["metrics"]["overlapping_local_anchors"] == [local["anchor_frame"]]
+    assert any(frame["frame_index"] == full["interval"]["end_frame"] for frame in frames)
+
+
 def test_normal_vision_entry_finds_fade_in_single_scene_and_exports_unreviewed(admitted, monkeypatch):
     from trace_annotate.workspace import vision_jobs as V
     store, item = admitted
@@ -168,14 +191,60 @@ def test_normal_vision_entry_finds_fade_in_single_scene_and_exports_unreviewed(a
         jobs.close()
 
 
-def test_normal_entry_decodes_slow_textured_crossfade_and_saves_bound_evidence(tmp_path, monkeypatch):
+def test_completed_old_transition_jobs_remain_readable_while_queued_jobs_require_resubmit(admitted, monkeypatch):
+    from trace_annotate.workspace import vision_jobs as V
+    store, item = admitted
+    current = store.get_task(item["task_id"])
+    configuration = discovery().configuration
+    legacy = configuration()
+    legacy.pop("long_dissolve", None)
+    assert legacy != configuration()
+    jobs = V.VisionJobs(store, person_model_path="", landmark_model_path="", landmark_python="",
+                        face_model_path="missing", clip_model_path="missing", vlm_model_path="missing")
+    def unavailable(thresholds):
+        jobs._extractors = {name: None for name in ("face", "person", "ocr", "clip", "vlm")}
+    monkeypatch.setattr(jobs, "_load_extractors", unavailable)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(discovery(), "configuration", lambda: copy.deepcopy(legacy))
+            old = jobs.submit(current["id"], command_id="old-transition-completed", expected_revision=0,
+                              expected_sha256=current["content_sha256"])
+            assert jobs.run_pending()[0]["state"] == "succeeded"
+        old_job = old["jobs"][0]
+        saved_result = jobs.result(old_job["id"])
+        old_parameters = V._parameters(window={"start": S.rational(0), "end": S.rational(1)},
+            optional_providers=old_job["parameters"]["job_identity"]["config"]["optional_providers"],
+            model_resources=old_job["parameters"]["job_identity"]["config"]["model_resources"],
+            transition_configuration=legacy)
+        pending = jobs.queue.create_batch([{"task_id": current["id"], "expected_revision": 0,
+            "expected_sha256": current["content_sha256"]}], operation=V.OPERATION,
+            processor_version=V.VERSION, parameters=old_parameters, command_id="old-transition-pending")
+        rejected = jobs.run_pending(batch_id=pending["id"])[0]
+        assert rejected["state"] == "failed"
+        assert rejected["error_code"] == "VISION_RESUBMIT_REQUIRED"
+        fresh = jobs.submit(current["id"], command_id="new-transition-configuration", expected_revision=0,
+                            expected_sha256=current["content_sha256"])
+        assert fresh["jobs"][0]["id"] != old_job["id"]
+        assert jobs.result(old_job["id"]) == saved_result
+        jobs.apply(old_job["id"], command_id="old-transition-apply", expected_revision=0,
+                   expected_sha256=current["content_sha256"], request_body=b"{}")
+        assert all(a["review_status"] == "unreviewed" for a in store.get_task(current["id"])["annotations"])
+    finally:
+        jobs.close()
+
+
+@pytest.mark.parametrize("transition_frames,selected_window", [
+    (100, None), (400, None), (1000, None),
+    (1000, {"start": S.rational(5), "end": S.rational(30)})])
+def test_normal_entry_decodes_slow_textured_crossfade_and_saves_bound_evidence(
+        tmp_path, monkeypatch, transition_frames, selected_window):
     from trace_annotate.workspace import vision_jobs as V
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         pytest.skip("FFmpeg and ffprobe required for an encoded crossfade fixture")
     y, x = np.indices((48, 64))
     first = (((x // 4 + y // 6) % 2) * 180 + 35).astype(float)
     last = (((x // 9 + y // 3) % 2) * 150 + 70).astype(float)
-    weights = [0.0] * 8 + list(np.linspace(0, 1, 100)) + [1.0] * 8
+    weights = [0.0] * 20 + list(np.linspace(0, 1, transition_frames)) + [1.0] * 20
     data = b"".join(np.repeat(np.round((1 - a) * first + a * last).astype(np.uint8)[..., None],
                                3, axis=2).tobytes() for a in weights)
     source = tmp_path / "slow-textured-crossfade.mp4"
@@ -195,14 +264,24 @@ def test_normal_entry_decodes_slow_textured_crossfade_and_saves_bound_evidence(t
             jobs._extractors = {name: None for name in ("face", "person", "ocr", "clip", "vlm")}
         monkeypatch.setattr(jobs, "_load_extractors", unavailable)
         batch = jobs.submit(current["id"], command_id="encoded-slow-crossfade", expected_revision=0,
-                            expected_sha256=current["content_sha256"])
+                            expected_sha256=current["content_sha256"], window=selected_window)
         assert jobs.run_pending()[0]["state"] == "succeeded"
         candidate = jobs.result(batch["jobs"][0]["id"])
         assert len(candidate["scenes"]) == 1
         global_result = candidate["boundary_sampling"]["global_discovery"]
         assert global_result["coverage"]["complete"] is True
         event = next(e for e in global_result["events"] if e["kind"] == "dissolve")
-        assert int(event["interval"]["end_frame"]) - int(event["interval"]["start_frame"]) >= 50
+        expected_frames = (transition_frames if selected_window is None else
+            int(30 * (S.rational_value(selected_window["end"]) - S.rational_value(selected_window["start"]))))
+        assert int(event["interval"]["end_frame"]) - int(event["interval"]["start_frame"]) >= expected_frames * .75
+        if selected_window is not None:
+            assert event["previous_frame"] is None
+            assert event["metrics"]["window_clipped"] is True
+            start_row = store._frame_service.row(item["media_id"], int(event["interval"]["start_frame"]))
+            assert event["time_window"] == {"start": {"seconds": start_row["seconds"]},
+                                            "end": {"seconds": selected_window["end"]}}
+            assert S.rational_value(selected_window["start"]) <= S.rational_value(start_row["seconds"])
+            assert S.rational_value(start_row["seconds"]) <= S.rational_value(selected_window["start"]) + S.rational_value(S.rational("16/30"))
         assert event["time_window"]["start"]["seconds"]["d"]
         assert store.get_task(current["id"]) == current
         jobs.apply(batch["jobs"][0]["id"], command_id="encoded-slow-crossfade-save",

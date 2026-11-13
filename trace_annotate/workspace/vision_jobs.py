@@ -121,7 +121,8 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
                   optional_providers: Optional[Dict[str, Any]] = None,
                   include_optional: bool = True, model_resources: Optional[Dict[str, Any]] = None,
                   include_model_resources: bool = True,
-                  include_transition_discovery: bool = True) -> Dict[str, Any]:
+                  include_transition_discovery: bool = True,
+                  transition_configuration: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     thresholds = MetricThresholds()
     config = {
         "scene_threshold": thresholds.scene_threshold,
@@ -149,7 +150,8 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
         config["model_resources"] = MW.validate_configuration(
             model_resources if model_resources is not None else MW.configuration())
     if include_transition_discovery:
-        config["transition_discovery"] = TD.configuration()
+        config["transition_discovery"] = TD.validate_configuration(
+            TD.configuration() if transition_configuration is None else transition_configuration)
     return {"pipeline": "vision-assist-v1", "processor_version": VERSION,
             "config_sha256": S.sha256_text(config), "config": config,
             "model_identity": "declared_at_run_not_at_config_query",
@@ -161,7 +163,8 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
                 optional_providers: Optional[Dict[str, Any]] = None,
                 model_resources: Optional[Dict[str, Any]] = None,
                 include_model_resources: bool = True,
-                include_transition_discovery: bool = True) -> Dict[str, Any]:
+                include_transition_discovery: bool = True,
+                transition_configuration: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if subject_annotation_id is not None:
         S.require_id(subject_annotation_id)
         if window is None:
@@ -175,7 +178,8 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
                                         "time_domain": DOMAIN, "job_identity": _job_identity(
                                             optional_providers=optional_providers, model_resources=model_resources,
                                             include_model_resources=include_model_resources,
-                                            include_transition_discovery=include_transition_discovery)}))
+                                            include_transition_discovery=include_transition_discovery,
+                                            transition_configuration=transition_configuration)}))
 
 
 def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -196,7 +200,8 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     if optional is not None:
         OV.validate_config(optional)
     resource_options = {"model_resources": resources, "include_model_resources": resources is not None,
-                        "include_transition_discovery": "transition_discovery" in identity["config"]}
+                        "include_transition_discovery": "transition_discovery" in identity["config"],
+                        "transition_configuration": identity["config"].get("transition_discovery")}
     current = _parameters(parameters["window"], parameters["subject_annotation_id"],
                           optional_providers=optional, **resource_options)
     # Immutable completed candidates remain readable after optional deployment
@@ -525,12 +530,19 @@ def _attach_global_transitions(store, media_id, work, keyframes, scenes,
         interval = event.get("interval") or {}
         left = int(interval.get("start_frame", event["anchor_frame"]))
         right = int(interval.get("end_frame", event["anchor_frame"]))
-        duplicate = any(old.get("kind") == event["kind"]
+        overlapping = [old for old in first.get("boundary_events", [])
+            if old.get("kind") == event["kind"]
             and int((old.get("interval") or {}).get("start_frame", old["anchor_frame"])) <= right
-            and int((old.get("interval") or {}).get("end_frame", old["anchor_frame"])) >= left
-            for old in first.get("boundary_events", []))
-        if duplicate:
+            and int((old.get("interval") or {}).get("end_frame", old["anchor_frame"])) >= left]
+        covered = any(int((old.get("interval") or {}).get("start_frame", old["anchor_frame"])) <= left
+            and int((old.get("interval") or {}).get("end_frame", old["anchor_frame"])) >= right
+            for old in overlapping)
+        if covered:
+            omitted.append({"anchor_frame": event["anchor_frame"], "reason": "covered_by_local_event"})
             continue
+        if overlapping:
+            event["metrics"]["overlapping_local_anchors"] = [old["anchor_frame"] for old in overlapping]
+            event["uncertainty"] += "；与局部转场候选重叠，请核对完整区间后归并"
         if per_scene.get(scene_index, 0) >= 4:
             omitted.append({"anchor_frame": event["anchor_frame"], "reason": "scene_claim_projection_budget"})
             continue
