@@ -230,7 +230,8 @@ def run_owned(command, directory, *, settings, cancelled, timeout, progress_path
                     time.sleep(.05)
                 receipt["actual_exit_code"] = process.returncode
                 if process.returncode != 0:
-                    code = {75: "MODEL_MEMORY_FAILED", 76: "MODEL_TIMEOUT", 77: "MODEL_LOAD_FAILED"}.get(
+                    code = {75: "MODEL_MEMORY_FAILED", 76: "MODEL_TIMEOUT", 77: "MODEL_LOAD_FAILED",
+                            78: "MODEL_PROGRESS_FAILED"}.get(
                         process.returncode, "MODEL_WORKER_FAILED")
                     raise WorkspaceError(code, "Model worker exited unsuccessfully", retryable=True,
                                          details={"exit_code": process.returncode})

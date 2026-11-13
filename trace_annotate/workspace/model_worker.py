@@ -17,10 +17,37 @@ from .errors import WorkspaceError
 CONTRACT = "isolated-frame-models-v1"
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_FRAMES = 512
+PROGRESS_REPLACE_ATTEMPTS = 20
+PROGRESS_RETRY_SECONDS = .05
 
 
 class ModelLoadFailed(RuntimeError):
     """A selected local checkpoint failed to construct a usable adapter."""
+
+
+class ModelProgressFailed(RuntimeError):
+    """Windows progress replacement remained unavailable after bounded retries."""
+
+
+def _publish_progress(output, phase, frame_index=None):
+    progress = output.parent / "progress.json"
+    temporary = progress.with_suffix(".pending")
+    value = {"phase": phase, "started_at": time.time()}
+    if frame_index is not None:
+        value["frame_index"] = frame_index
+    temporary.write_text(json.dumps(value), encoding="utf-8")
+    for attempt in range(PROGRESS_REPLACE_ATTEMPTS):
+        try:
+            temporary.replace(progress)
+            return attempt
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32, 33}:
+                raise
+            if attempt + 1 == PROGRESS_REPLACE_ATTEMPTS:
+                raise ModelProgressFailed(
+                    "Progress file replacement failed after " + str(PROGRESS_REPLACE_ATTEMPTS)
+                    + " attempts (Windows error " + str(exc.winerror) + ")") from exc
+            time.sleep(PROGRESS_RETRY_SECONDS)
 
 
 def _reject_memory_failure(value):
@@ -204,7 +231,7 @@ def run_phase(module, config, images, work, *, cancelled):
                  "from trace_annotate.workspace.resource_budget import join_owned_job;"
                  "join_owned_job(os.environ.get('TRACE_ANNOTATE_OWNED_MODEL_JOB',''));"
                  "runpy.run_module('trace_annotate.workspace.model_worker',run_name='__main__')")
-    command = [config["python"], "-I", "-B", "-c", bootstrap, str(Path(__file__).resolve().parents[2]),
+    command = [config["python"], "-X", "utf8", "-I", "-B", "-c", bootstrap, str(Path(__file__).resolve().parents[2]),
                "--request", str(request_path), "--output", str(result_path)]
     timeout = min(config["policy"]["phase_seconds"], 120 + len(images) * config["policy"]["frame_seconds"])
     execution = R.run_owned(command, directory / "execution", settings=config["policy"],
@@ -286,16 +313,13 @@ def execute(request, output):
     identity = _check_loaded_adapter(adapter)
     from ..core.hasher import safe_load_image
     results = []
+    progress_retries = 0
     for image in images:
         if _digest(image["path"]) != image["sha256"]:
             raise ValueError("Decoded frame identity changed")
         frame = safe_load_image(image["path"])
         started = time.monotonic()
-        progress = output.parent / "progress.json"
-        temporary = progress.with_suffix(".pending")
-        temporary.write_text(json.dumps({"phase": "frame", "frame_index": image["frame_index"],
-                                         "started_at": time.time()}), encoding="utf-8")
-        temporary.replace(progress)
+        progress_retries += _publish_progress(output, "frame", image["frame_index"])
         result = adapter.classify(frame) if module == "clip" else adapter.caption(frame)
         _reject_memory_failure(result.get("error"))
         results.append({"frame_index": image["frame_index"], "path": image["path"],
@@ -303,15 +327,13 @@ def execute(request, output):
                         "elapsed_seconds": time.monotonic() - started})
         if time.monotonic() - started > config["policy"]["frame_seconds"]:
             raise TimeoutError("Model frame exceeded its execution budget")
-    progress = output.parent / "progress.json"
-    temporary = progress.with_suffix(".pending")
-    temporary.write_text(json.dumps({"phase": "finalizing", "started_at": time.time()}), encoding="utf-8")
-    temporary.replace(progress)
+    progress_retries += _publish_progress(output, "finalizing")
     if configuration(clip_model=config["clip"]["requested"], vlm_model=config["vlm"]["requested"]) != config:
         raise ValueError("Frozen model deployment changed during inference")
     value = {"contract": CONTRACT, "module": module, "identity": identity,
              "available": adapter.model is not None, "results": results,
              "thread_policy": threads,
+             "progress_publish_retries": progress_retries,
              "actual_pid": os.getpid(), "actual_parent_pid": os.getppid(), "peak_working_set_bytes": _peak_memory()}
     raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
     if len(raw) > MAX_OUTPUT_BYTES:
@@ -342,3 +364,7 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         raise SystemExit(77)
+    except ModelProgressFailed:
+        import traceback
+        traceback.print_exc()
+        raise SystemExit(78)

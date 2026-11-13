@@ -166,6 +166,12 @@ and timeout terminate the owned model process tree and wait for its wrapper.
 On Windows the service owns the last kill-on-close Job Object handle. This does
 not establish equivalent cleanup after a sudden parent crash on every platform.
 
+On Windows, publishing model progress retries sharing or access conflicts at
+most 20 times, 50 ms apart, while keeping the previous complete JSON visible.
+Persistent contention produces `MODEL_PROGRESS_FAILED` and retains the pending
+file and process log. Other filesystem errors propagate immediately. This retry
+does not change model-result publication or execution deadlines.
+
 The **Retry task** button is available for failed or cancelled visual jobs whose
 saved input still matches the current task. It keeps the original command ID
 while a response is unconfirmed, queries its durable receipt, and displays queued
