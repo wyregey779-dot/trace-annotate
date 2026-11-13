@@ -1026,13 +1026,15 @@ def test_http_vision_job_reports_eight_frames_need_nine(tmp_path, eight_frame_cl
                 thread.join(timeout=10)
             server.server_close()
         project.close()
-def test_http_vision_chain_submit_result_apply_status(store, clip):
+def test_http_vision_chain_submit_result_apply_status(store, clip, monkeypatch):
     """Exercise the loopback HTTP vision routes end to end on a real import."""
     import threading
     import time
     import urllib.request
     from trace_annotate.workspace.server import TOKEN_HEADER, make_server
 
+    monkeypatch.setenv("TRACE_ANNOTATE_CLIP_CACHE", str(store.root / "missing-clip-cache"))
+    monkeypatch.setenv("TRACE_ANNOTATE_VLM_CACHE", str(store.root / "missing-vlm-cache"))
     server = make_server(store)
     # Replace the auto-started worker with one that degrades CLIP/VLM to
     # not_run: this test exercises the HTTP contract, not real model weights.
@@ -1122,7 +1124,11 @@ def test_vision_sampling_uses_pts_anchored_multi_frame_plan(store):
         is_diagnostic = (relative.name in {"commands.jsonl", "decode.stdout", "decode.stderr",
                                           "select.filter", "decode-tool.stdout", "decode-tool.stderr"}
                          and relative.parent.name.startswith(".decode-"))
-        assert relative.suffix == ".png" or str(relative).endswith("audio/acoustic.m4a") or is_diagnostic
+        is_global_scan = (relative.parent.name == "transitions-global" and relative.name in {
+            "commands.jsonl", "discovery.json", "frames.gray", "scan.stderr", "scan.stdout"})
+        is_model_run = ("models" in relative.parts and relative.name in {
+            "request.json", "result.json", "progress.json", "process-receipt.json", "worker.log"})
+        assert relative.suffix == ".png" or str(relative).endswith("audio/acoustic.m4a") or is_diagnostic or is_global_scan or is_model_run
         evidence = store.root / item["relative_path"]
         assert evidence.stat().st_size == int(item["size_bytes"])
         assert V.stream_sha256(evidence) == item["sha256"]

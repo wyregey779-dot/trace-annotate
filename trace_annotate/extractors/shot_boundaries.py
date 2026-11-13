@@ -32,6 +32,10 @@ FLASH_RATIO = 0.5
 MIN_GRADUAL_FRAMES = 3
 DISSOLVE_RESIDUAL = 0.20
 DISSOLVE_FAR = 0.15
+DISSOLVE_RELATIVE_RESIDUAL = 0.20
+DISSOLVE_MIN_INTERIOR = 3
+DISSOLVE_ALPHA_MARGIN = 0.10
+DISSOLVE_REVERSAL_TOLERANCE = 0.03
 BLACK_LEVEL = 10
 WHITE_LEVEL = 248
 NEIGHBOUR_RADIUS = 6
@@ -132,34 +136,52 @@ def _neighbour_median(track: List[Dict[str, Any]], index: int,
 
 
 def _dissolve_fit(track: List[Dict[str, Any]], start: int, end: int) -> Optional[Dict[str, float]]:
-    """Test whether frames between start/end are a linear blend of the endpoints."""
+    """Require multiple observed mixtures progressing between both endpoints.
+
+    A small absolute residual alone also fits a translated edge or an abrupt
+    cut. Compare residual to the actual endpoint change and require internal
+    blend weights, allowing nonlinear timing while rejecting reversals.
+    """
     if end - start < 2:
         return None
     first, last = track[start]["gray"], track[end]["gray"]
     far = float(np.abs(first - last).mean() / 255.0)
     if far < DISSOLVE_FAR:
         return None
-    residuals = []
-    count = end - start
-    for offset, index in enumerate(range(start + 1, end + 1)):
-        alpha = (offset + 1) / count
+    delta = last - first
+    energy = float(np.sum(delta * delta))
+    if energy <= 0:
+        return None
+    residuals, alphas = [], []
+    for index in range(start + 1, end):
+        current = track[index]["gray"]
+        alpha = float(np.sum((current - first) * delta) / energy)
+        if not -DISSOLVE_REVERSAL_TOLERANCE <= alpha <= 1 + DISSOLVE_REVERSAL_TOLERANCE:
+            return None
+        alpha = max(0.0, min(1.0, alpha))
+        alphas.append(alpha)
         blend = (1 - alpha) * first + alpha * last
-        residuals.append(float(np.abs(track[index]["gray"] - blend).mean() / 255.0))
+        residuals.append(float(np.abs(current - blend).mean() / 255.0))
     residual = max(residuals) if residuals else 1.0
-    if residual > DISSOLVE_RESIDUAL:
+    interior = sum(DISSOLVE_ALPHA_MARGIN < value < 1 - DISSOLVE_ALPHA_MARGIN for value in alphas)
+    relative = residual / far
+    if (residual > DISSOLVE_RESIDUAL or relative > DISSOLVE_RELATIVE_RESIDUAL
+            or interior < DISSOLVE_MIN_INTERIOR
+            or any(right + DISSOLVE_REVERSAL_TOLERANCE < left for left, right in zip(alphas, alphas[1:]))):
         return None
     return {"endpoint_distance": round(far, 4), "max_residual": round(residual, 4),
-            "mean_residual": round(float(np.mean(residuals)), 4)}
+            "mean_residual": round(float(np.mean(residuals)), 4),
+            "relative_residual": round(relative, 4), "interior_mixture_frames": interior}
 
 
-def _gradual_candidates(track: List[Dict[str, Any]]) -> List[Tuple[int, int]]:
+def _gradual_candidates(track: List[Dict[str, Any]], low: float = GRADUAL_LOW) -> List[Tuple[int, int]]:
     """Runs of sustained change that are not one-frame spikes.
 
     The band reaches above the cut threshold so a dissolve whose per-step score
     momentarily looks like a cut is still treated as one transition instead of a
     string of hard cuts.
     """
-    low, high = GRADUAL_LOW, CUT_THRESHOLD * 2.5
+    high = CUT_THRESHOLD * 2.5
     runs: List[Tuple[int, int]] = []
     start: Optional[int] = None
     for index in range(1, len(track)):
@@ -196,42 +218,87 @@ def _polarity_runs(track: List[Dict[str, Any]]) -> List[Tuple[int, int, str]]:
             start, polarity = index, current
     if start is not None:
         runs.append((start, len(track) - 1, polarity))
-    return [run for run in runs if run[1] - run[0] >= 1]
+    return runs
 
 
-def _expand_ramp(track: List[Dict[str, Any]], start: int, end: int) -> Tuple[int, int]:
-    """Extend a black/white run across the monotonic luma ramp beside it."""
-    brightening = end + 1 < len(track) and track[end + 1]["luma"] > track[end]["luma"] + 1
-    if brightening:
-        while (end + 1 < len(track)
-               and track[end + 1]["luma"] > track[end]["luma"] + 1
-               and track[end + 1]["luma"] < 250):
-            end += 1
-        return start, end
-    while (start - 1 >= 0
-           and track[start - 1]["luma"] < track[start]["luma"] - 1
-           and track[start - 1]["luma"] > 5):
-        start -= 1
-    return start, end
+def _expand_ramp(track: List[Dict[str, Any]], edge: int, *, polarity: str,
+                 direction: int) -> Optional[Tuple[int, int]]:
+    """Follow one monotonic ramp away from its black/white endpoint.
+
+    Each side of a polarity hold is independent. The incoming ramp fades out
+    and the outgoing ramp fades in, so a black bridge can own both events.
+    Static holds and one-step black/white cuts have no sustained ramp.
+    """
+    sign = 1 if polarity == "black" else -1
+    outer = edge
+    neighbour = outer + direction
+    while (0 <= neighbour < len(track)
+           and sign * (track[neighbour]["luma"] - track[outer]["luma"]) > 1):
+        outer = neighbour
+        neighbour += direction
+    if abs(outer - edge) < MIN_GRADUAL_FRAMES:
+        return None
+    return min(edge, outer), max(edge, outer)
 
 
 def detect_shot_boundaries(samples: Sequence[Dict[str, Any]], *,
-                           neighbour_radius: int = NEIGHBOUR_RADIUS) -> Dict[str, Any]:
+                           neighbour_radius: int = NEIGHBOUR_RADIUS,
+                           gradual_low: float = GRADUAL_LOW) -> Dict[str, Any]:
     """Detect boundary events from sampled frames.
 
     Each sample needs frame_index, and optionally seconds/source_pts/proxy_pts
     taken from the workspace frame table, plus either a decoded `frame` array or
     pre-computed `gray`/`luma`/`hist` features. Returns events, the measured
     track and the parameters so a reviewer can re-run the same decision.
+
+    Missing admitted frame indices split the measurement track. In particular,
+    three sparse samples cannot establish a single-frame flash between them.
     """
+    events: List[Dict[str, Any]] = []
+    if not isinstance(gradual_low, (int, float)) or isinstance(gradual_low, bool) or not 0 < gradual_low < CUT_THRESHOLD:
+        raise ValueError("gradual proposal threshold must be positive and below the cut threshold")
+    public_track: List[Dict[str, Any]] = []
+    start = 0
+    previous = None
+    for index, sample in enumerate(samples):
+        current = int(sample["frame_index"])
+        if previous is not None:
+            if current <= previous:
+                raise ValueError("sample frame indices must be strictly increasing")
+            if current != previous + 1:
+                result = _detect_contiguous_samples(samples[start:index], neighbour_radius, gradual_low)
+                events.extend(result["events"])
+                public_track.extend(result["track"])
+                start = index
+        previous = current
+    result = _detect_contiguous_samples(samples[start:], neighbour_radius, gradual_low)
+    events.extend(result["events"])
+    public_track.extend(result["track"])
+    return {"events": events, "track": public_track, "params": _params(neighbour_radius, gradual_low)}
+
+
+def _detect_contiguous_samples(samples: Sequence[Dict[str, Any]],
+                               neighbour_radius: int, gradual_low: float) -> Dict[str, Any]:
     if not samples:
-        return {"events": [], "track": [], "params": _params(neighbour_radius)}
+        return {"events": [], "track": [], "params": _params(neighbour_radius, gradual_low)}
     track = build_track(samples)
     events: List[Dict[str, Any]] = []
     consumed: set[int] = set()
+    fade_ramps = []
+    fade_intervals = set()
+    fade_frames: set[int] = set()
+    for first, last, polarity in _polarity_runs(track):
+        for edge, direction, kind in ((first, -1, "fade_out"), (last, 1, "fade_in")):
+            ramp = _expand_ramp(track, edge, polarity=polarity, direction=direction)
+            if ramp is not None and ramp not in fade_intervals:
+                fade_ramps.append((*ramp, kind, polarity))
+                fade_intervals.add(ramp)
+                fade_frames.update(range(ramp[0], ramp[1] + 1))
 
     # 1) Flash: one frame spikes and the frame after it returns to the old scene.
     for index in range(1, len(track) - 1):
+        if index in fade_frames:
+            continue
         step = track[index]["step"]["score"]
         if step <= CUT_THRESHOLD:
             continue
@@ -249,15 +316,11 @@ def detect_shot_boundaries(samples: Sequence[Dict[str, Any]], *,
             consumed.add(index)
             consumed.add(index + 1)
 
-    # 2) Fades: a black/white run plus the monotonic ramp beside it.
-    for start, end, polarity in _polarity_runs(track):
-        start, end = _expand_ramp(track, start, end)
-        before = track[start - 1]["luma"] if start else None
-        after = track[end + 1]["luma"] if end + 1 < len(track) else None
-        if polarity == "black":
-            kind = "fade_in" if (after or 0) >= (before or 0) else "fade_out"
-        else:
-            kind = "fade_out" if (before or 0) >= (after or 0) else "fade_in"
+    # 2) Fades: actual incoming/outgoing ramps, excluding their static holds.
+    flash_consumed = set(consumed)
+    for start, end, kind, polarity in fade_ramps:
+        if set(range(start, end + 1)) & flash_consumed:
+            continue
         events.append(_event(kind, track, start, end, track[end]["frame_index"],
                              confidence=0.9,
                              uncertainty="端点帧可能落在转场内部",
@@ -268,7 +331,7 @@ def detect_shot_boundaries(samples: Sequence[Dict[str, Any]], *,
         consumed.update(range(start, end + 1))
 
     # 3) Dissolve / unknown: sustained moderate change that is not a spike.
-    for start, end in _gradual_candidates(track):
+    for start, end in _gradual_candidates(track, gradual_low):
         indexes = set(range(start, end + 1))
         if indexes & consumed:
             continue
@@ -304,23 +367,28 @@ def detect_shot_boundaries(samples: Sequence[Dict[str, Any]], *,
     events.sort(key=lambda item: int(item["anchor_frame"]))
     _fill_split_points(events)
     return {"events": events, "track": _public_track(track),
-            "params": _params(neighbour_radius)}
+            "params": _params(neighbour_radius, gradual_low)}
 
 
 def _public_track(track: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The measurable part of the track (arrays stay out of JSON)."""
     return [{"frame_index": entry["frame_index"], "seconds": entry["seconds"],
+             "source_pts": entry["source_pts"], "proxy_pts": entry["proxy_pts"],
              "luma": round(entry["luma"], 2),
              "step": {key: round(value, 4) for key, value in entry["step"].items()}
              if "step" in entry else None}
             for entry in track]
 
 
-def _params(neighbour_radius: int = NEIGHBOUR_RADIUS) -> Dict[str, Any]:
+def _params(neighbour_radius: int = NEIGHBOUR_RADIUS, gradual_low: float = GRADUAL_LOW) -> Dict[str, Any]:
     return {"analysis_width": ANALYSIS_WIDTH, "hist_bins": HIST_BINS,
-            "cut_threshold": CUT_THRESHOLD, "strong_cut": STRONG_CUT,
+            "cut_threshold": CUT_THRESHOLD, "strong_cut": STRONG_CUT, "gradual_low": gradual_low,
             "flash_ratio": FLASH_RATIO, "min_gradual_frames": MIN_GRADUAL_FRAMES,
             "dissolve_residual": DISSOLVE_RESIDUAL, "dissolve_far": DISSOLVE_FAR,
+            "dissolve_relative_residual": DISSOLVE_RELATIVE_RESIDUAL,
+            "dissolve_min_interior": DISSOLVE_MIN_INTERIOR,
+            "dissolve_alpha_margin": DISSOLVE_ALPHA_MARGIN,
+            "dissolve_reversal_tolerance": DISSOLVE_REVERSAL_TOLERANCE,
             "neighbour_radius": neighbour_radius}
 
 

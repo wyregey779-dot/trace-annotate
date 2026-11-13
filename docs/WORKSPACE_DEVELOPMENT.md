@@ -198,6 +198,25 @@ verifies sample identities and bounded decoding. Neither replaces a new full-vid
 pipeline run or semantic/reference-label evaluation. Historical full-video runs
 with failed boundary sampling remain failed for those modules.
 
+Boundary analysis also scans every decoded frame in the selected playback range
+at 96 x 64 grayscale resolution. It retains at most 128 MiB of raw measurements,
+uses 256-frame windows with 64-frame overlap, and has a 180-second time limit.
+Byte-budget truncation is explicit. `coverage.complete` describes the decoded
+range; it does not certify transition recall. Long, weak or moving dissolves can
+remain unclassified. In particular, quantized slow changes can split the proposal
+track, and an interval longer than a feature window may lack enough endpoint
+contrast. Unknown sustained motion is counted without asserting a dissolve.
+
+Retained fade, dissolve and flash proposals include actual frame-map identities
+and exact rational half-open time windows. Their full-size before/anchor/end
+images are retained separately; flash evidence includes the recovery frame.
+Clipped or merged intervals remain uncertain. Fit metrics identify the component
+interval they measure, rather than claiming a fit over a merged interval. At most
+64 global proposals and four projections per scene are retained, subject to the
+existing 32-claim semantic limit. Omitted projections and their budgets are
+recorded; raw proposals remain available. Saving still requires an explicit
+action and produces unreviewed model candidates, preserving manual annotations.
+
 After initializing a new workspace, run:
 
 ```powershell

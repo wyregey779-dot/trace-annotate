@@ -37,13 +37,14 @@ from ..extractors.ocr import OCRExtractor
 from ..extractors.scene import SceneDetector, SceneDetectionError
 from ..extractors.shot_attributes import classify_framing
 from ..extractors.shot_boundaries import (classify_scene_cut, detect_shot_boundaries, frame_features,
-                                          TRANSITION_KINDS)
+                                          TRANSITION_KINDS, _params as boundary_parameters)
 from ..extractors.vlm import CAPTION_TASK, VLMExtractor
 from ..temporal.media import stream_sha256
 from . import professional_schema as PS
 from . import schema as S
 from . import semantic_schema as SS
 from . import vision_sampling as VS
+from . import transition_discovery as TD
 from .semantic_schema import SEMANTIC_VERSION
 from .errors import Conflict, SchemaInvalid, WorkspaceError, revision_conflict
 from .http_media import resolve_media_object
@@ -119,7 +120,8 @@ def _content_clip(start: Any, end: Any, duration: Any) -> Tuple[Any, Any]:
 def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE_CONTRACT,
                   optional_providers: Optional[Dict[str, Any]] = None,
                   include_optional: bool = True, model_resources: Optional[Dict[str, Any]] = None,
-                  include_model_resources: bool = True) -> Dict[str, Any]:
+                  include_model_resources: bool = True,
+                  include_transition_discovery: bool = True) -> Dict[str, Any]:
     thresholds = MetricThresholds()
     config = {
         "scene_threshold": thresholds.scene_threshold,
@@ -146,6 +148,8 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
     if include_model_resources:
         config["model_resources"] = MW.validate_configuration(
             model_resources if model_resources is not None else MW.configuration())
+    if include_transition_discovery:
+        config["transition_discovery"] = TD.configuration()
     return {"pipeline": "vision-assist-v1", "processor_version": VERSION,
             "config_sha256": S.sha256_text(config), "config": config,
             "model_identity": "declared_at_run_not_at_config_query",
@@ -156,7 +160,8 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
                 subject_annotation_id: Optional[str] = None, *,
                 optional_providers: Optional[Dict[str, Any]] = None,
                 model_resources: Optional[Dict[str, Any]] = None,
-                include_model_resources: bool = True) -> Dict[str, Any]:
+                include_model_resources: bool = True,
+                include_transition_discovery: bool = True) -> Dict[str, Any]:
     if subject_annotation_id is not None:
         S.require_id(subject_annotation_id)
         if window is None:
@@ -169,7 +174,8 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
     return json.loads(S.canonical_json({"window": window, "subject_annotation_id": subject_annotation_id,
                                         "time_domain": DOMAIN, "job_identity": _job_identity(
                                             optional_providers=optional_providers, model_resources=model_resources,
-                                            include_model_resources=include_model_resources)}))
+                                            include_model_resources=include_model_resources,
+                                            include_transition_discovery=include_transition_discovery)}))
 
 
 def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -189,7 +195,8 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
         MW.validate_configuration(resources)
     if optional is not None:
         OV.validate_config(optional)
-    resource_options = {"model_resources": resources, "include_model_resources": resources is not None}
+    resource_options = {"model_resources": resources, "include_model_resources": resources is not None,
+                        "include_transition_discovery": "transition_discovery" in identity["config"]}
     current = _parameters(parameters["window"], parameters["subject_annotation_id"],
                           optional_providers=optional, **resource_options)
     # Immutable completed candidates remain readable after optional deployment
@@ -496,6 +503,75 @@ def _boundary_sample(item: Dict[str, Any], seconds: float) -> Dict[str, Any]:
             **frame_features(_load_frame(Path(item["path"])))}
 
 
+def _attach_global_transitions(store, media_id, work, keyframes, scenes,
+                               boundary_frames, window, ffmpeg, cancelled):
+    """Project retained full-range proposals into existing scene candidates."""
+    result = TD.scan_transitions(store, media_id, work / "transitions-global",
+                                 window=window, ffmpeg=ffmpeg, cancelled=cancelled)
+    result["measurement_relative_path"] = Path(result.pop("measurement_path")).relative_to(store.root).as_posix()
+    selected, omitted, per_scene = [], [], {}
+    existing = {str(frame["frame_index"]): frame for frame in boundary_frames}
+    first_frames = {}
+    for frame in keyframes:
+        first_frames.setdefault(frame["scene_index"], frame)
+    for event in result["events"]:
+        anchor = store._frame_service.row(media_id, int(event["anchor_frame"]))
+        seconds = float(S.rational_value(anchor["seconds"]))
+        scene_index = next((i for i, scene in enumerate(scenes) if scene["start"] <= seconds < scene["end"]), None)
+        if scene_index not in first_frames:
+            omitted.append({"anchor_frame": event["anchor_frame"], "reason": "no_scene_keyframe"})
+            continue
+        first = first_frames[scene_index]
+        interval = event.get("interval") or {}
+        left = int(interval.get("start_frame", event["anchor_frame"]))
+        right = int(interval.get("end_frame", event["anchor_frame"]))
+        duplicate = any(old.get("kind") == event["kind"]
+            and int((old.get("interval") or {}).get("start_frame", old["anchor_frame"])) <= right
+            and int((old.get("interval") or {}).get("end_frame", old["anchor_frame"])) >= left
+            for old in first.get("boundary_events", []))
+        if duplicate:
+            continue
+        if per_scene.get(scene_index, 0) >= 4:
+            omitted.append({"anchor_frame": event["anchor_frame"], "reason": "scene_claim_projection_budget"})
+            continue
+        indices = {int(event["anchor_frame"]), left, right}
+        if event.get("previous_frame") is not None:
+            indices.add(int(event["previous_frame"]))
+        if event.get("recovery_frame") is not None:
+            indices.add(int(event["recovery_frame"]))
+        if len(boundary_frames) + sum(len(item[2]) for item in selected) + len(indices) > BOUNDARY_MAX_FRAMES:
+            omitted.append({"anchor_frame": event["anchor_frame"], "reason": "boundary_evidence_budget"})
+            continue
+        selected.append((scene_index, event, indices))
+        per_scene[scene_index] = per_scene.get(scene_index, 0) + 1
+    wanted = sorted({index for _, _, indices in selected for index in indices if str(index) not in existing})
+    decoded = {}
+    if wanted:
+        plan = VS.plan_samples(store, media_id, window=window, uniform=0, include_edges=False,
+            boundary_frames=wanted, budget=VS.SamplingBudget(max_frames=BOUNDARY_MAX_FRAMES, boundary_radius=0))
+        images = VS.decode_samples(store, media_id, plan, work / "transitions-evidence",
+                                   cancelled=cancelled, ffmpeg=ffmpeg)
+        decoded = {item["frame_index"]: item for item in images["decoded"]}
+    attached = {(frame["scene_index"], str(frame["frame_index"])) for frame in boundary_frames}
+    for scene_index, event, indices in selected:
+        for index in sorted(indices):
+            identity = str(index)
+            if (scene_index, identity) in attached:
+                continue
+            image = existing.get(identity)
+            if image is None:
+                sample = decoded[identity]
+                image = {"frame_index": identity, "seconds": float(S.rational_value(sample["seconds"])),
+                         "evidence_sha256": sample["sha256"]}
+            boundary_frames.append({"scene_index": scene_index, "scene_indices": [scene_index],
+                "frame_index": identity, "seconds": image["seconds"], "evidence_sha256": image["evidence_sha256"]})
+            attached.add((scene_index, identity))
+        first_frames[scene_index].setdefault("boundary_events", []).append(event)
+    result.update(projected_events=len(selected), projection_omitted=omitted,
+                  projection_limit_per_scene=4)
+    return result
+
+
 def _run_ocr(frame: Any, ocr_extractor: Optional[OCRExtractor]) -> Dict[str, Any]:
     if ocr_extractor is None:
         return {"status": "not_run", "reason": "ocr_runtime_unavailable"}
@@ -507,6 +583,29 @@ def _run_ocr(frame: Any, ocr_extractor: Optional[OCRExtractor]) -> Dict[str, Any
     if result["status"] == "not_run":
         result.setdefault("reason", "ocr_runtime_unavailable")
     return result
+
+
+def _limit_global_claims(candidate):
+    """Retain prior scene claims and fit new proposals to the semantic contract."""
+    discovery = (candidate.get("boundary_sampling") or {}).get("global_discovery")
+    if not discovery or discovery.get("status") != "success":
+        return
+    for index, scene in enumerate(candidate["scenes"]):
+        frame = next((f for f in candidate["keyframes"] if f["scene_index"] == index), None)
+        if frame is None:
+            continue
+        events = frame.get("boundary_events", [])
+        global_events = [e for e in events if e.get("metrics", {}).get("analysis_scope") == "full_range"]
+        while global_events:
+            claims = _candidate_claims(candidate, index, scene, _seconds_ratio(scene["start"]),
+                                       _seconds_ratio(scene["end"]), frame)["claims"]
+            if len(claims) <= SS.MAX_CLAIMS:
+                break
+            removed = global_events.pop()
+            events.remove(removed)
+            discovery["projected_events"] -= 1
+            discovery["projection_omitted"].append({"anchor_frame": removed["anchor_frame"],
+                                                   "reason": "semantic_claim_budget"})
 
 
 def _run_clip(frame: Any, clip_extractor: Optional[CLIPExtractor]) -> Dict[str, Any]:
@@ -1046,6 +1145,8 @@ class VisionJobs:
                 boundary_sampling: Dict[str, Any] = {
                     "status": "not_run",
                     "reason": "no_scene_boundary_in_window",
+                    "global_discovery": {"status": "not_run", "reason": "scene_detection_unavailable_or_empty",
+                                         "coverage": {"complete": False}},
                 }
                 if scene_result["status"] == "success" and len(scenes) > 1:
                     try:
@@ -1124,7 +1225,10 @@ class VisionJobs:
                             if confirmation is None:
                                 final_events[scene_index] = events
                                 continue
-                            final_events[scene_index] = [confirmation]
+                            if any(event.get("kind") != "cut" for event in events):
+                                confirmation.update(needs_review=True,
+                                    uncertainty="结构边界与转场候选重叠，请逐帧核对")
+                            final_events[scene_index] = events + [confirmation]
                         for scene_index, events in final_events.items():
                             first = next((frame for frame in keyframes
                                           if frame["scene_index"] == scene_index), None)
@@ -1144,6 +1248,26 @@ class VisionJobs:
                                              "error": type(exc).__name__,
                                              "message": str(exc)[:240]}
                         boundary_frames = []
+                if scene_result["status"] == "success" and scenes:
+                    try:
+                        discovery = _attach_global_transitions(
+                            self.store, job["media_snapshot"]["id"], work, keyframes,
+                            scenes, boundary_frames, window, ffmpeg, cancelled)
+                        boundary_sampling["global_discovery"] = discovery
+                        if boundary_sampling["status"] == "not_run":
+                            boundary_sampling.update(status="success", reason=None)
+                    except WorkspaceError as exc:
+                        if exc.code in {"CANCELLED", "LEASE_LOST"}:
+                            raise
+                        boundary_sampling["global_discovery"] = {"status": "failed", "error": exc.code,
+                            "message": str(exc)[:240], "coverage": {"complete": False}}
+                        boundary_sampling.update(local_status=boundary_sampling["status"], status="failed",
+                                                 error=exc.code, message=str(exc)[:240])
+                    except Exception as exc:
+                        boundary_sampling["global_discovery"] = {"status": "failed", "error": type(exc).__name__,
+                            "message": str(exc)[:240], "coverage": {"complete": False}}
+                        boundary_sampling.update(local_status=boundary_sampling["status"], status="failed",
+                                                 error=type(exc).__name__, message=str(exc)[:240])
                 extractor_status = {
                     "scene": scene_result["status"],
                     "face": _aggregate_status(keyframes, "face"),
@@ -1160,7 +1284,8 @@ class VisionJobs:
                     "boundary": boundary_sampling.get("status", "not_run"),
                     "framing": _aggregate_status(keyframes, "framing"),
                     "motion": motion_status,
-                    "transition": ("success" if any(frame.get("boundary_events") for frame in keyframes)
+                    "transition": ("failed" if boundary_sampling.get("global_discovery", {}).get("status") == "failed"
+                                   else "success" if any(frame.get("boundary_events") for frame in keyframes)
                                    else boundary_sampling.get("status", "not_run")),
                     "actions": actions_sampling.get("status", "not_run"),
                     "content": content_sampling.get("status", "not_run"),
@@ -1176,11 +1301,6 @@ class VisionJobs:
                 module_status["acoustics_reason"] = acoustics_sampling.get("reason")
                 if self._extractor_error is not None:
                     extractor_status["extractor_error"] = self._extractor_error
-                model_runs = _build_model_runs(
-                    job, extractors, keyframes, scene_result,
-                    boundary_sampling, boundary_frames, module_status,
-                    digest, window, actions_sampling, acoustics_sampling,
-                    content_sampling, content_frames)
                 evidence = []
                 for path in sorted(work.rglob("*")):
                     if cancelled():
@@ -1206,10 +1326,22 @@ class VisionJobs:
                     "actions_sampling": _jsonable(actions_sampling),
                     "acoustics_sampling": _jsonable(acoustics_sampling),
                     "extractor_status": extractor_status, "module_status": module_status,
-                    "model_runs": model_runs,
+                    "model_runs": [],
                     "job_identity": parameters["job_identity"], "evidence": evidence,
                     "semantic_listening": "not_performed", "source_unchanged": True,
                     "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
+                _limit_global_claims(candidate)
+                scene_counts = {str(index): len(frame.get("boundary_events", []))
+                    for index in range(len(scenes))
+                    for frame in keyframes if frame["scene_index"] == index and frame.get("boundary_events")}
+                boundary_sampling.update(scene_events=scene_counts,
+                    scenes_with_events=sorted(int(index) for index in scene_counts),
+                    event_count=sum(scene_counts.values()))
+                candidate["model_runs"] = _build_model_runs(
+                    job, extractors, keyframes, scene_result,
+                    boundary_sampling, boundary_frames, module_status,
+                    digest, window, actions_sampling, acoustics_sampling,
+                    content_sampling, content_frames)
                 self._validate_candidate(candidate, job)
                 context.raise_if_cancelled()
                 return candidate
@@ -1433,6 +1565,17 @@ class VisionJobs:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence path or identity is invalid")
             paths.add(path)
         evidence_hashes = {item["sha256"] for item in value["evidence"]}
+        discovery = (value.get("boundary_sampling") or {}).get("global_discovery")
+        if "transition_discovery" in parameters["job_identity"]["config"]:
+            if not isinstance(discovery, dict) or discovery.get("status") not in {"success", "failed", "not_run"}:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Current vision contract requires a full-range scan status")
+            if discovery["status"] == "not_run" and value["extractor_status"].get("scene") == "success" and value["scenes"]:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Full-range scan was omitted despite available scenes")
+            if discovery["status"] == "success" and (
+                    discovery.get("contract") != TD.CONTRACT
+                    or discovery.get("configuration") != parameters["job_identity"]["config"]["transition_discovery"]
+                    or discovery.get("measurement_sha256") not in evidence_hashes):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Full-range transition evidence identity is inconsistent")
         if any(frame["evidence_sha256"] not in evidence_hashes for frame in content_frames):
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision content frame has no registered sample")
         return value
@@ -1996,15 +2139,11 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
     runs.append(_model_run_record(
         job_id, "boundary", provider="trace-annotate", model_name="shot-boundaries-v1",
         model_version="1", weights_sha256=None, license="Project source",
-        preprocessing={"input": "boundary-radius sampled frames",
+        preprocessing={"input": "boundary-radius samples and optional full-range grayscale scan",
                        "analysis_width": 96, "hist_bins": 32},
-        parameters={"boundary_radius": BOUNDARY_RADIUS,
-                    "cut_threshold": 0.30, "gradual_low": 0.05,
-                    "strong_cut": 0.60, "flash_ratio": 0.5,
-                    "min_gradual_frames": 3, "dissolve_residual": 0.20,
-                    "dissolve_far": 0.15, "black_level": 10,
-                    "white_level": 248, "neighbour_radius": 6},
-        input_value={"boundary_frames": [
+        parameters={**boundary_parameters(), "boundary_radius": BOUNDARY_RADIUS,
+                    "black_level": 10, "white_level": 248},
+        input_value={"global_discovery": (boundary_sampling or {}).get("global_discovery"), "boundary_frames": [
             {"frame_index": frame["frame_index"],
              "seconds": frame["seconds"],
              "evidence_sha256": frame["evidence_sha256"]}
@@ -2018,7 +2157,7 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
                         or (boundary_sampling or {}).get("error")
                         or ("fewer than two scenes; no boundary sample"
                             if module_status.get("boundary") == "not_run" else None)),
-        code_version=f"vision_jobs={VERSION}; shot_boundaries=1",
+        code_version=f"vision_jobs={VERSION}; shot_boundaries=1; full_range={TD.CONTRACT}",
         score_kind="rule_score"))
     return runs
 
@@ -2095,7 +2234,7 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
             for claim in annotation["attributes"]["semantic"]["claims"]:
                 if claim["method"]["id"] != "shot-boundaries-v1":
                     continue
-                for key in ("previous_frame", "interval_start_frame", "anchor_frame"):
+                for key in ("previous_frame", "interval_start_frame", "interval_end_frame", "anchor_frame", "recovery_frame"):
                     wanted = str(claim["method"]["parameters"].get(key))
                     match = next((frame for frame in transition_frames
                                   if str(frame.get("frame_index")) == wanted), None)
@@ -2175,7 +2314,7 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                     claim["evidence_ids"] = ids
             elif claim["method"]["id"] == "shot-boundaries-v1":
                 ids = []
-                for key in ("previous_frame", "interval_start_frame", "anchor_frame"):
+                for key in ("previous_frame", "interval_start_frame", "interval_end_frame", "anchor_frame", "recovery_frame"):
                     value = claim["method"]["parameters"].get(key)
                     if value is None:
                         continue
@@ -2237,6 +2376,15 @@ def _event_time_window(candidate: Dict[str, Any], event: Dict[str, Any],
     one-frame bracket. Only when no frame time exists does the claim fall back
     to the scene context window, and the caller records that in uncertainty.
     """
+    exact = event.get("time_window")
+    if exact is not None:
+        try:
+            start = exact["start"]["seconds"]
+            end = exact["end"]["seconds"]
+            if S.rational(start) == start and S.rational(end) == end and S.rational_value(start) < S.rational_value(end):
+                return exact, True
+        except (KeyError, TypeError, ValueError, WorkspaceError):
+            pass
     interval = event.get("interval") or {}
     try:
         interval_start = float(interval["start_seconds"])
@@ -2503,13 +2651,16 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                           "flash": "出现单帧闪光，未切断镜头",
                           "unknown_transition": "存在未建模的持续转场"}
             interval = event.get("interval") or {}
+            analysis_description = ("全域低分辨率扫描候选，需逐帧复核"
+                if event.get("metrics", {}).get("analysis_scope") == "full_range"
+                else "边界前后抽样帧，需逐帧复核")
             if interval.get("start_frame") is not None and interval.get("end_frame") is not None:
                 statement = (f"镜头边界检测判定 #{interval.get('start_frame')}–"
                              f"#{interval.get('end_frame')} 帧区间内{statements[kind]}"
-                             f"（代表帧 #{event.get('anchor_frame')}，仅边界前后抽样帧，需人工复核）。")
+                             f"（代表帧 #{event.get('anchor_frame')}，{analysis_description}）。")
             else:
                 statement = (f"镜头边界检测在 #{event.get('anchor_frame')} 帧判定"
-                             f"{statements[kind]}（仅边界前后抽样帧，需人工复核）。")
+                             f"{statements[kind]}（{analysis_description}）。")
             metrics = {}
             for key, item in (event.get("metrics") or {}).items():
                 if isinstance(item, bool):
@@ -2532,6 +2683,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                            "parameters": {"kind": kind,
                                           "anchor_frame": event.get("anchor_frame"),
                                           "previous_frame": event.get("previous_frame"),
+                                          "recovery_frame": event.get("recovery_frame"),
                                           "representative_frame": event.get("representative_frame"),
                                           "split_point": event.get("split_point"),
                                           "interval_start_frame": interval.get("start_frame"),
