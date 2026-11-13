@@ -324,3 +324,34 @@ def test_server_close_cancels_preparation_before_store_is_closed(tmp_path, http_
             serving.join(timeout=5)
         server.server_close()
         store.close()
+
+
+
+@pytest.mark.parametrize("mode,index", [("floor", "3"), ("ceil", "4")])
+def test_frame_time_http_uses_rational_pts_and_api_authorization(api, mode, index):
+    server, store = api
+    path = PREFIX + f"/media/{media_id(store)}/frames?time_n=35&time_d=100&mode={mode}"
+    status, _, value = request(server, "GET", path)
+    assert status == 200 and value["frame_index"] == index
+    assert value["frame"]["frame_index"] == index and value["requested_time"] == {"n": "7", "d": "20"}
+    assert value["mode"] == mode and value["within_video"] and value["frame_map_sha256"]
+    assert_error(request(server, "GET", path, authorized=False, headers=cookie(server)), 403, "INVALID_TOKEN")
+    assert_error(request(server, "GET", path, headers={"Origin": "https://attacker.invalid"}), 403, "FORBIDDEN_ORIGIN")
+
+
+@pytest.mark.parametrize("query", ["time_n=1", "time_n=1&time_d=0&mode=floor", "time_n=01&time_d=1&mode=floor",
+    "time_n=-0&time_d=1&mode=floor", "time_n=1.2&time_d=1&mode=floor", "time_n=1&time_d=1&mode=nearest",
+    "time_n=1&time_d=1&mode=floor&offset=0", "time_n=1&time_d=1&mode=floor&limit=1",
+    "time_n=1&time_n=2&time_d=1&mode=floor", "time_n=1&time_d=1&mode=floor&unknown=1",
+    "time_n=" + "1" * 41 + "&time_d=1&mode=floor", "time_n=1&time_d=" + "1" * 41 + "&mode=floor"])
+def test_frame_time_http_rejects_mixed_duplicate_and_unbounded_queries(api, query):
+    server, store = api
+    assert_error(request(server, "GET", PREFIX + f"/media/{media_id(store)}/frames?{query}"), 400, "INVALID_QUERY")
+
+
+def test_frame_time_http_ceil_endpoint_is_empty_count_sentinel(api):
+    server, store = api
+    path = PREFIX + f"/media/{media_id(store)}/frames?time_n=2&time_d=1&mode=ceil"
+    status, _, value = request(server, "GET", path)
+    assert status == 200 and value["frame_index"] == value["total"] == "20"
+    assert value["frame"] is None and value["within_video"] is False

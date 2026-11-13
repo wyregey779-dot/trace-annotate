@@ -380,7 +380,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if re.search(r"%(?![0-9a-fA-F]{2})", parsed.query):
                     raise ValueError("Malformed percent escape")
                 self._query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True, errors="strict")
-                allowed = {"offset", "limit"} if frame_query else {"format", "track", "track_id", "evidence"}
+                allowed = {"offset", "limit", "time_n", "time_d", "mode"} if frame_query else {"format", "track", "track_id", "evidence"}
                 if imports_async:
                     allowed = {"async"}
                 if set(self._query) - allowed or any(len(value) != 1 for value in self._query.values()):
@@ -400,6 +400,15 @@ class _Handler(BaseHTTPRequestHandler):
             except (ValueError, UnicodeError) as exc:
                 raise BadRequest("INVALID_QUERY", "Invalid query parameters") from exc
         return parsed.path
+
+    def _frame_time_query(self):
+        if set(self._query) != {"time_n", "time_d", "mode"}:
+            raise BadRequest("INVALID_QUERY", "Frame time and pagination cannot be combined")
+        numerator, denominator, mode = (self._query[key][0] for key in ("time_n", "time_d", "mode"))
+        if (re.fullmatch(r"-?(0|[1-9][0-9]{0,39})", numerator) is None or len(numerator) > 40 or numerator == "-0"
+                or re.fullmatch(r"[1-9][0-9]{0,39}", denominator) is None or mode not in {"floor", "ceil"}):
+            raise BadRequest("INVALID_QUERY", "Frame time requires bounded integer strings and floor or ceil")
+        return {"n": numerator, "d": denominator}, mode
 
     def _pagination(self):
         values = {"offset": "0", "limit": "100"}
@@ -686,8 +695,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 3 and parts[0] == "media" and parts[2] == "frames":
                 _require_id(parts[1], "media_id")
-                offset, limit = self._pagination()
-                self._send_json(200, self.server.image_service.page(parts[1], offset, limit))
+                if set(self._query) & {"time_n", "time_d", "mode"}:
+                    target, mode = self._frame_time_query()
+                    self._send_json(200, self.server.image_service.lookup(parts[1], target, mode))
+                else:
+                    offset, limit = self._pagination()
+                    self._send_json(200, self.server.image_service.page(parts[1], offset, limit))
                 return
             with store.transaction():
                 if parts == ["snapshot"]:

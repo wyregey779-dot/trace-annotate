@@ -7,6 +7,7 @@ are checked against the immutable map before accepting an annotation revision.
 """
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 import hashlib
 import json
@@ -64,6 +65,7 @@ class _Index:
     def __init__(self, path, digest, media):
         self.path, self.digest = path, digest
         self.offsets = []
+        self.times = []
         self.count = 0
         checksum = hashlib.sha256()
         previous = None
@@ -98,6 +100,7 @@ class _Index:
                     raise SchemaInvalid("INVALID_FRAME_MAP", "Frame map does not preserve its admitted timeline") from exc
                 if self.count % STRIDE == 0:
                     self.offsets.append(offset)
+                    self.times.append(seconds)
                 self.count += 1
                 previous = seconds, source_pts
         if checksum.hexdigest() != digest or str(self.count) != media["frame_count"] or self.count == 0:
@@ -114,6 +117,20 @@ class _Index:
             return [json.loads(stream.readline(MAX_LINE + 1)) for _ in range(min(limit, self.count - offset))]
 
 
+    def at_time(self, target, mode):
+        # One sparse block plus its successor is enough for either insertion
+        # side. Frame-map validation has already established strictly rising PTS.
+        block = max(0, bisect_right(self.times, target) - 1)
+        offset = block * STRIDE
+        rows = self.rows(offset, STRIDE + 1)
+        times = [S.rational_value(row["seconds"]) for row in rows]
+        position = bisect_right(times, target) - 1 if mode == "floor" else bisect_left(times, target)
+        if position < 0:
+            return None, None
+        index = offset + position
+        return index, rows[position] if position < len(rows) else None
+
+
 class FrameService:
     def __init__(self, store):
         self.store = store
@@ -122,15 +139,10 @@ class FrameService:
         self._indices = OrderedDict()
         self._images = OrderedDict()
 
-    def page(self, media_id, offset=0, limit=100):
-        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 1000:
-            raise SchemaInvalid("SCHEMA_INVALID", "Invalid frame page")
-        # Acquire DB metadata before the cache lock. Store validation may call
-        # this service while holding its transaction; the inverse order deadlocks.
+    def _index(self, media_id):
+        # Resolve metadata before the cache lock, preserving store/cache order.
         media, path, digest = _binding(self.store, media_id, "frame_map_path")
         with self._lock:
-            # Hash on every read, including cache hits: an external same-size
-            # edit must not turn a previously verified index into false evidence.
             if stream_sha256(path) != digest:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Frame map bytes changed")
             key = (media_id, digest, S.sha256_text(media))
@@ -141,13 +153,35 @@ class FrameService:
             self._indices.move_to_end(key)
             while len(self._indices) > 8:
                 self._indices.popitem(last=False)
-            if offset > index.count:
-                raise NotFound("FRAME_NOT_FOUND", "Frame offset is beyond the media")
-            rows = index.rows(offset, limit)
-            if stream_sha256(path) != digest:
-                raise WorkspaceError("RECOVERY_REQUIRED", "Frame map changed during lookup")
-            return {"media_id": media_id, "offset": str(offset), "total": str(index.count),
-                    "frame_map_sha256": digest, "frames": rows}
+        return media, index
+
+    @staticmethod
+    def _unchanged(index):
+        if stream_sha256(index.path) != index.digest:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Frame map changed during lookup")
+
+    def page(self, media_id, offset=0, limit=100):
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 1000:
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid frame page")
+        _, index = self._index(media_id)
+        if offset > index.count:
+            raise NotFound("FRAME_NOT_FOUND", "Frame offset is beyond the media")
+        rows = index.rows(offset, limit)
+        self._unchanged(index)
+        return {"media_id": media_id, "offset": str(offset), "total": str(index.count),
+                "frame_map_sha256": index.digest, "frames": rows}
+
+    def lookup(self, media_id, target, mode):
+        if not isinstance(mode, str) or mode not in {"floor", "ceil"}:
+            raise SchemaInvalid("SCHEMA_INVALID", "Frame lookup mode must be floor or ceil")
+        target = S.rational(target)
+        time = S.rational_value(target)
+        media, index = self._index(media_id)
+        number, row = index.at_time(time, mode)
+        self._unchanged(index)
+        return {"media_id": media_id, "frame_map_sha256": index.digest, "total": str(index.count),
+                "mode": mode, "requested_time": target, "frame_index": None if number is None else str(number),
+                "frame": row, "within_video": S.rational_value(media["video_start"]) <= time < S.rational_value(media["video_end"])}
 
     def row(self, media_id, index):
         rows = self.page(media_id, index, 1)["frames"]

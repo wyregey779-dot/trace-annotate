@@ -285,3 +285,99 @@ def test_cancellation_callback_reaches_actual_preparation_before_admission(encod
         assert source.read_bytes() == original
     finally:
         store.close()
+
+
+
+def synthetic_time_service(tmp_path, monkeypatch, times, *, origin=7, tail=1):
+    """A valid admitted map without decoding a video or loading model runtimes."""
+    from fractions import Fraction
+    from trace_annotate.workspace import frames
+
+    times = [Fraction(time) for time in times]
+    base = Fraction(1, 10 ** 18)
+    media = {"id": "med-" + "a" * 64, "frame_count": str(len(times)),
+        "proxy_time_base": S.rational(base), "source_time_base": S.rational(base),
+        "common_origin": S.rational(origin), "video_start": S.rational(times[0] if times else 0),
+        "video_end": S.rational(times[-1] + tail if times else 1), "duration": S.rational(3000)}
+    path = tmp_path / "time-map.jsonl"
+    rows = [{"frame_index": str(index), "source_pts": str(int((time + origin) / base)),
+             "proxy_pts": str(int(time / base)), "seconds": S.rational(time)} for index, time in enumerate(times)]
+    path.write_bytes(b"".join(S.canonical_json(row) + b"\n" for row in rows))
+    digest = S.sha256_bytes(path.read_bytes())
+    monkeypatch.setattr(frames, "_binding", lambda *args: (media, path, digest))
+    return frames.FrameService(None), media, path, rows
+
+
+def test_time_lookup_uses_global_vfr_pts_and_preserves_nonzero_origin(tmp_path, monkeypatch):
+    from fractions import Fraction
+
+    times = [1 + Fraction(index, 1000) for index in range(512)] + [30 + index for index in range(88)]
+    service, media, _, rows = synthetic_time_service(tmp_path, monkeypatch, times)
+    target = S.rational("1.4505")
+    before = service.lookup(media["id"], target, "floor")
+    after = service.lookup(media["id"], target, "ceil")
+    assert before["frame"] == rows[450] and after["frame"] == rows[451]
+    assert before["within_video"] and before["requested_time"] == target
+    assert before["frame"]["source_pts"] != before["frame"]["proxy_pts"]
+    for index in (0, 255, 256, 511, 512, 599):
+        for mode in ("floor", "ceil"):
+            assert service.lookup(media["id"], rows[index]["seconds"], mode)["frame"] == rows[index]
+
+
+def test_time_lookup_leading_audio_tail_and_half_open_endpoint(tmp_path, monkeypatch):
+    service, media, _, rows = synthetic_time_service(tmp_path, monkeypatch, [1, 2, 4])
+    before = service.lookup(media["id"], S.rational("0.5"), "floor")
+    assert before["frame_index"] is None and before["frame"] is None and not before["within_video"]
+    assert service.lookup(media["id"], S.rational("0.5"), "ceil")["frame"] == rows[0]
+    between = service.lookup(media["id"], S.rational("4.5"), "ceil")
+    assert between["frame_index"] == "3" and between["frame"] is None and between["within_video"]
+    for time in (5, 20):
+        floor = service.lookup(media["id"], S.rational(time), "floor")
+        ceil = service.lookup(media["id"], S.rational(time), "ceil")
+        assert floor["frame"] == rows[-1] and not floor["within_video"]
+        assert ceil["frame_index"] == "3" and ceil["frame"] is None
+
+
+def test_time_lookup_one_frame_and_large_denominator(tmp_path, monkeypatch):
+    from fractions import Fraction
+
+    times = [Fraction(1) + Fraction(index, 10 ** 18) for index in range(3)]
+    service, media, _, rows = synthetic_time_service(tmp_path, monkeypatch, times)
+    assert service.lookup(media["id"], S.rational(times[1]), "ceil")["frame"] == rows[1]
+    assert service.lookup(media["id"], S.rational(times[1]), "floor")["frame"] == rows[1]
+    service, media, _, rows = synthetic_time_service(tmp_path, monkeypatch, [2])
+    assert service.lookup(media["id"], S.rational(2), "floor")["frame"] == rows[0]
+    assert service.lookup(media["id"], S.rational(3), "ceil")["frame_index"] == "1"
+
+
+@pytest.mark.parametrize("times", [[], [1, 1], [2, 1]])
+def test_time_lookup_rejects_empty_or_nonmonotone_admitted_maps(tmp_path, monkeypatch, times):
+    service, media, _, _ = synthetic_time_service(tmp_path, monkeypatch, times)
+    with pytest.raises(WorkspaceError):
+        service.lookup(media["id"], S.rational(1), "floor")
+
+
+def test_time_lookup_checks_bytes_before_and_after_one_sparse_block(tmp_path, monkeypatch):
+    from trace_annotate.workspace import frames
+
+    service, media, path, _ = synthetic_time_service(tmp_path, monkeypatch, range(600))
+    service.lookup(media["id"], S.rational(300), "floor")
+    original_hash = frames.stream_sha256
+    hashes = []
+    monkeypatch.setattr(frames, "stream_sha256", lambda path: (hashes.append(path), original_hash(path))[1])
+    index = next(iter(service._indices.values()))
+    original_rows = index.rows
+    reads = []
+    monkeypatch.setattr(index, "rows", lambda offset, limit: (reads.append((offset, limit)), original_rows(offset, limit))[1])
+    assert service.lookup(media["id"], S.rational("300.5"), "floor")["frame_index"] == "300"
+    assert len(hashes) == 2 and reads == [(256, frames.STRIDE + 1)]
+    original_lookup = index.at_time
+    def changed_during_read(*args):
+        result = original_lookup(*args)
+        data = path.read_bytes()
+        path.write_bytes(data[:-1] + b" ")
+        return result
+    monkeypatch.setattr(index, "at_time", changed_during_read)
+    with pytest.raises(WorkspaceError) as error:
+        service.lookup(media["id"], S.rational(300), "floor")
+    assert error.value.code == "RECOVERY_REQUIRED"

@@ -235,9 +235,73 @@ function clearCompareSlots(){for(const url of state.compareBlobs){try{URL.revoke
 function releaseCompare(){state.compareToken++;if(compareTimer!==null){clearTimeout(compareTimer);compareTimer=null;}clearCompareSlots();}
 function scheduleCompare(){if(compareTimer!==null)clearTimeout(compareTimer);compareTimer=setTimeout(()=>{compareTimer=null;loadCompare().catch(()=>{});},260);}
 function compareSet(slot,row,url,label){const meta=compareSlots[slot],cell=$('boundary-compare').querySelector('[data-slot="'+slot+'"]'),img=$(meta.img);img.src=url;img.hidden=false;img.alt=meta.label+' #'+row.frame_index;cell.dataset.available='true';cell.querySelector('.compare-placeholder').hidden=true;cell.querySelector('.compare-label').innerHTML='';const strong=document.createElement('b');strong.textContent=meta.label+' #'+row.frame_index;const detail=document.createElement('div');detail.textContent='PTS '+row.source_pts+' · '+showTime(row.seconds)+' s';cell.querySelector('.compare-label').append(strong,detail);if(label)cell.querySelector('.compare-label').append(label);}
-async function verifiedFramePng(index){const parsed=BigInt(index);if(parsed<0n||parsed>=BigInt(state.media.frame_count))return null;const rows=await json('/media/'+state.media.id+'/frames?offset='+parsed+'&limit=1');if(rows.frames?.[0]?.frame_index!==parsed.toString())throw new Error('Frame identity mismatch');const row=rows.frames[0];let response;for(let attempt=0;attempt<4;attempt++){try{response=await request('/media/'+state.media.id+'/frames/'+parsed+'/image');break;}catch(error){if(attempt===3||(error.status!==503&&error.code!=='FRAME_SERVICE_BUSY'))throw error;await new Promise(resolve=>setTimeout(resolve,150));}}if(response.headers.get('Content-Type')?.split(';')[0]!=='image/png')throw new Error('Frame is not an image');for(const [header,value]of [['X-TraceAnnotate-Frame-Index',row.frame_index],['X-TraceAnnotate-Source-PTS',row.source_pts],['X-TraceAnnotate-Proxy-PTS',row.proxy_pts],['X-TraceAnnotate-Media-SHA256',state.media.playback.sha256]]){if(response.headers.get(header)!==value)throw new Error('Frame identity mismatch');}const bytes=await response.arrayBuffer(),digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),byte=>byte.toString(16).padStart(2,'0')).join('');if(digest!==response.headers.get('X-TraceAnnotate-Image-SHA256'))throw new Error('Frame image hash mismatch');const url=URL.createObjectURL(new Blob([bytes],{type:'image/png'}));return {row,url};}
-async function nearestFrameIndex(target){const rough=Math.max(0,Math.min(Number(state.media.frame_count)-1,Math.round(seconds(target)/seconds(state.media.duration)*(Number(state.media.frame_count)-1))));const start=Math.max(0,rough-60),limit=Math.min(121,Number(state.media.frame_count)-start);const rows=await json('/media/'+state.media.id+'/frames?offset='+start+'&limit='+limit);if(!rows.frames?.length)throw new Error('No frames returned for boundary lookup');const ordered=rows.frames.slice().sort((a,b)=>{const cmp=compareTime(a.seconds,b.seconds);return cmp||Number(BigInt(a.frame_index)-BigInt(b.frame_index));});const after=ordered.find(row=>compareTime(row.seconds,target)>=0);return (after||ordered[after===undefined?ordered.length-1:0]).frame_index;}
-async function loadCompare(){const annotation=selectedSegment();if(!state.task||!state.media||!annotation){releaseCompare();$('compare-status').textContent='选择片段后可取起点前后帧与终点前后帧；确定帧锚点优先，否则按时间定位最近帧。';return;}clearCompareSlots();const token=++state.compareToken;$('compare-status').textContent='正在定位边界相邻帧并校验帧身份…';try{const startIndex=annotation.start.anchor?.frame_index??await nearestFrameIndex(annotation.start.seconds);const endIndex=annotation.end.anchor?.frame_index??await nearestFrameIndex(annotation.end.seconds);const started=BigInt(startIndex),ended=BigInt(endIndex),slots=[['start-before',started-1n,'起点前 1 帧'],['start-after',started,'起点帧（含）'],['end-before',ended-1n,'终点前 1 帧'],['end-after',ended,'终点后首帧（不含）']],rows={};for(const [slot,index,label]of slots){if(index<0n||index>=BigInt(state.media.frame_count))continue;const image=await verifiedFramePng(index.toString());if(token!==state.compareToken){if(image?.url)URL.revokeObjectURL(image.url);return;}state.compareBlobs.push(image.url);rows[slot]=image.row;compareSet(slot,image.row,image.url,label);}if(token!==state.compareToken)return;const startRow=rows['start-after'],endRow=rows['end-after'];$('compare-status').textContent='起点帧 #'+startIndex+'（'+showTime(startRow.seconds)+' s） · 终点帧 #'+endIndex+'（'+showTime(endRow.seconds)+' s）；四格图像均已核对帧 PTS 与 SHA256。'+(annotation.start.anchor?' 起点使用确定帧锚点。':' 起点按时间定位最近帧。')+(annotation.end.anchor?' 终点使用确定帧锚点。':' 终点按时间定位最近帧。');}catch(error){if(token!==state.compareToken)return;clearCompareSlots();$('compare-status').textContent='边界对照失败：'+error.message;notice('边界对照未完成：'+error.message,'error');}}
+async function verifiedFramePng(index,media=state.media){
+ const parsed=BigInt(index);
+ if(parsed<0n||parsed>=BigInt(media.frame_count))return null;
+ const rows=await json('/media/'+media.id+'/frames?offset='+parsed+'&limit=1');
+ if(rows.frames?.[0]?.frame_index!==parsed.toString())throw new Error('Frame identity mismatch');
+ const row=rows.frames[0];
+ let response;
+ for(let attempt=0;attempt<4;attempt++){
+  try{response=await request('/media/'+media.id+'/frames/'+parsed+'/image');break;}
+  catch(error){
+   if(attempt===3||(error.status!==503&&error.code!=='FRAME_SERVICE_BUSY'))throw error;
+   await new Promise(resolve=>setTimeout(resolve,150));
+  }
+ }
+ if(response.headers.get('Content-Type')?.split(';')[0]!=='image/png')throw new Error('Frame is not an image');
+ const identityHeaders=[['X-TraceAnnotate-Frame-Index',row.frame_index],['X-TraceAnnotate-Source-PTS',row.source_pts],['X-TraceAnnotate-Proxy-PTS',row.proxy_pts],['X-TraceAnnotate-Media-SHA256',media.playback.sha256]];
+ for(const [header,expected]of identityHeaders){
+  if(response.headers.get(header)!==expected)throw new Error('Frame identity mismatch');
+ }
+ const bytes=await response.arrayBuffer();
+ const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),byte=>byte.toString(16).padStart(2,'0')).join('');
+ if(digest!==response.headers.get('X-TraceAnnotate-Image-SHA256'))throw new Error('Frame image hash mismatch');
+ const url=URL.createObjectURL(new Blob([bytes],{type:'image/png'}));
+ return {row,url};
+}
+
+async function frameAtTime(target,mode,media){
+ const result=await json('/media/'+encodeURIComponent(media.id)+'/frames?time_n='+target.n+'&time_d='+target.d+'&mode='+mode);
+ if(result.media_id!==media.id||result.mode!==mode||compareTime(result.requested_time,target)!==0||result.total!==media.frame_count||!/^[0-9a-f]{64}$/.test(result.frame_map_sha256))throw new Error('Frame lookup identity mismatch');
+ if(result.frame&&result.frame.frame_index!==result.frame_index)throw new Error('Frame lookup row mismatch');
+ return result;
+}
+async function nearestFrameIndex(target,media=state.media){return (await frameAtTime(target,'ceil',media)).frame_index;}
+function playbackTimeRational(value){
+ if(!Number.isFinite(value)||value<0)throw new Error('Invalid playback time');
+ const [mantissa,power='0']=value.toString().toLowerCase().split('e'),[whole,decimal='']=mantissa.split('.');
+ const exponent=Number(power)-decimal.length,digits=BigInt(whole+decimal);
+ return exponent>=0?rat(digits*10n**BigInt(exponent),1n):rat(digits,10n**BigInt(-exponent));
+}
+function frameRequestIsCurrent(sequence,taskId,mediaId){return sequence===state.frameSequence&&taskId===state.task?.id&&mediaId===state.media?.id&&$('frame-mode').checked&&!state.loadingTask;}
+
+async function loadCompare(){
+ const annotation=selectedSegment();
+ if(!state.task||!state.media||!annotation){releaseCompare();$('compare-status').textContent='选择片段后可取边界相邻帧；确定帧锚点优先，其余按时间取不早于边界的首帧。';return;}
+ clearCompareSlots();const media=state.media,taskId=state.task.id,token=++state.compareToken;
+ const current=()=>token===state.compareToken&&taskId===state.task?.id&&media.id===state.media?.id&&!state.loadingTask;
+ $('compare-status').textContent='正在定位边界相邻帧并校验帧身份…';
+ try{
+  const startIndex=annotation.start.anchor?.frame_index??await nearestFrameIndex(annotation.start.seconds,media);
+  if(!current())return;
+  const endIndex=annotation.end.anchor?.frame_index??await nearestFrameIndex(annotation.end.seconds,media);
+  if(!current())return;
+  const started=BigInt(startIndex),ended=BigInt(endIndex),slots=[['start-before',started-1n,'起点前 1 帧'],['start-after',started,'起点帧（含）'],['end-before',ended-1n,'终点前 1 帧'],['end-after',ended,'终点后首帧（不含）']],rows={};
+  for(const [slot,index,label]of slots){
+   if(index<0n||index>=BigInt(media.frame_count))continue;
+   const image=await verifiedFramePng(index.toString(),media);
+   if(!current()){if(image?.url)URL.revokeObjectURL(image.url);return;}
+   if(!image)continue;
+   state.compareBlobs.push(image.url);rows[slot]=image.row;compareSet(slot,image.row,image.url,label);
+  }
+  if(!current())return;
+  const describe=(point,index,row)=>row?(point.anchor?'确定帧锚点 #':'不早于边界的首帧 #')+index+'（'+showTime(row.seconds)+' s）':'无后继视频帧（画面终点 '+showTime(media.video_end)+' s）';
+  const missing=Object.keys(compareSlots).filter(slot=>!rows[slot]).map(slot=>compareSlots[slot].label);
+  $('compare-status').textContent='起点边界 '+showTime(annotation.start.seconds)+' s · '+describe(annotation.start,startIndex,rows['start-after'])+'；终点边界 '+showTime(annotation.end.seconds)+' s · '+describe(annotation.end,endIndex,rows['end-after'])+'。已核对 '+Object.keys(rows).length+' 幅可用图像的帧 PTS 与 SHA256。'+(missing.length?'视频帧范围外无图：'+missing.join('、')+'。':'');
+ }catch(error){if(!current())return;clearCompareSlots();$('compare-status').textContent='边界对照失败：'+error.message;notice('边界对照未完成：'+error.message,'error');}
+}
+
 async function switchTask(id,{force=false}={}){if(!force&&id===state.task?.id)return;if(!force&&!await mayLeave())return;const sequence=++state.sequence;resetVision();releaseCompare();state.loadingTask=true;renderSaveState();pausePlayback({clearSegment:true});releaseFrame();notice('正在加载任务…');try{const task=await json('/tasks/'+encodeURIComponent(id));if(sequence!==state.sequence)return;const media=state.snapshot.media.find(m=>m.id===task.media_id);if(!media)throw new Error('Missing media');state.task=task;state.media=media;state.playError=null;state.playWaiting=false;$('loop-selection').checked=false;$('editor').hidden=false;$('empty-workspace').hidden=true;$('frame-mode').checked=false;$('seek').disabled=false;$('player').hidden=false;$('frame-controls').hidden=true;$('frame-identity').hidden=true;$('preview-mode').textContent='连续播放';$('player').src=API+'/media/'+encodeURIComponent(media.id)+'/playback';$('player').load();$('player').playbackRate=Number($('playback-rate').value);$('seek').max=String(seconds(media.duration));$('seek').value='0';$('duration-label').textContent=showTime(media.duration)+' s';$('frame-index').value='0';$('frame-total').textContent='/ '+media.frame_count+' 帧';$('media-name').textContent=taskName(task);$('media-meta').textContent='任务 '+task.id.slice(-8)+' · '+media.source_width+' × '+media.source_height+' · '+media.frame_count+' 帧 · 画面 '+showTime(media.video_start)+'–'+showTime(media.video_end)+' s';updateUndoRedoButtons();fillForm();renderTasks();updatePlaybackTime();notice('');listRecoverableDrafts();loadVisionOptions();restoreTaskVision();refreshVisionStatus();return true;}catch(error){if(sequence===state.sequence)notice(describeError(error),'error');return false;}finally{if(sequence===state.sequence){state.loadingTask=false;renderSaveState();}}}
 // Pixel layout is presentation-only; stored rational boundaries are never changed.
 function layoutTimelineTargets(segments,duration,width){
@@ -580,9 +644,89 @@ async function playSelected(){if(!playbackAllowed())return;const annotation=sele
 function handlePlaybackError(){if(!state.task||state.loadingTask||!$('player').error)return;pausePlayback({clearSegment:true});state.playError='视频播放失败（媒体错误 '+$('player').error.code+'）。草稿已保留；可重试播放或使用确定帧查看。';renderPlayback();}
 function keyboardTargetIsInteractive(target){return Boolean(target instanceof Element&&target.closest('input,textarea,select,button,a,video,audio,[contenteditable],[role="textbox"],[role="slider"]'));}
 function updatePlaybackTime(){if(!state.media)return;if($('frame-mode').checked&&!state.frame){$('time-readout').textContent='尚无确定帧';return;}const time=$('frame-mode').checked&&state.frame?seconds(state.frame.seconds):$('player').currentTime;$('time-readout').textContent=(Number.isFinite(time)?time.toFixed(3):'0.000')+' s / '+showTime(state.media.duration)+' s';$('seek').value=String(time||0);const curPct=100*(time||0)/seconds(state.media.duration)+'%';$('timeline-cursor').style.setProperty('--cursor',curPct);document.querySelectorAll('.track-cursor-line').forEach(el=>{el.style.left=curPct;});}
-async function showFrame(index){if(!state.task||!$('frame-mode').checked)return;let parsed;try{if(!/^\d{1,40}$/.test(String(index)))throw new Error();parsed=BigInt(index);if(parsed<0n||parsed>=BigInt(state.media.frame_count))throw new Error();}catch(_){releaseFrame();$('frame-placeholder').textContent='帧序号无效，请输入范围内的序号。';$('frame-placeholder').hidden=false;$('frame-identity').textContent='未选择有效帧，不能用于精确边界';updatePlaybackTime();notice('帧序号超出范围。','error');return;}const seq=++state.frameSequence,taskId=state.task.id;state.frame=null;state.loadingFrame=true;renderPlayback();delete $('frame-image').dataset.frameIndex;delete $('frame-image').dataset.mediaId;$('frame-image').hidden=true;$('frame-placeholder').textContent='正在解码确定帧…';$('frame-placeholder').hidden=false;$('frame-identity').textContent='尚未完成取帧，不能用于精确边界';$('frame-index').value=parsed.toString();try{const rows=await json('/media/'+state.media.id+'/frames?offset='+parsed+'&limit=1');if(seq!==state.frameSequence||taskId!==state.task?.id)return;const row=rows.frames?.[0];if(!row||row.frame_index!==parsed.toString())throw new Error('Frame identity mismatch');const response=await request('/media/'+state.media.id+'/frames/'+parsed+'/image');const bytes=await response.arrayBuffer();if(seq!==state.frameSequence||taskId!==state.task?.id)return;if(response.headers.get('Content-Type')?.split(';')[0]!=='image/png')throw new Error('Frame is not an image');for(const [header,value]of [['X-TraceAnnotate-Frame-Index',row.frame_index],['X-TraceAnnotate-Source-PTS',row.source_pts],['X-TraceAnnotate-Proxy-PTS',row.proxy_pts],['X-TraceAnnotate-Media-SHA256',state.media.playback.sha256]]){if(response.headers.get(header)!==value)throw new Error('Frame identity mismatch');}const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),byte=>byte.toString(16).padStart(2,'0')).join('');if(digest!==response.headers.get('X-TraceAnnotate-Image-SHA256'))throw new Error('Frame image hash mismatch');if(seq!==state.frameSequence||taskId!==state.task?.id)return;const blob=new Blob([bytes],{type:'image/png'});const url=URL.createObjectURL(blob);const probe=new Image();probe.src=url;try{await probe.decode();}catch(error){URL.revokeObjectURL(url);throw error;}if(seq!==state.frameSequence||taskId!==state.task?.id){URL.revokeObjectURL(url);return;}if(state.frameBlob)URL.revokeObjectURL(state.frameBlob);state.frameBlob=url;state.frame=row;state.loadingFrame=false;const sourceRatio=state.media.source_width*seconds(state.media.pixel_aspect_ratio)/state.media.source_height;const displayRatio=[90,270].includes(state.media.rotation_degrees)?1/sourceRatio:sourceRatio;const ratio=displayRatio/(16/9);$('frame-image').style.setProperty('--frame-width',Math.min(1,ratio)*100+'%');$('frame-image').style.setProperty('--frame-height',Math.min(1,1/ratio)*100+'%');$('frame-image').dataset.frameIndex=row.frame_index;$('frame-image').dataset.mediaId=state.media.id;$('frame-image').src=url;$('frame-image').alt='确定帧 '+row.frame_index+'，时间 '+showTime(row.seconds)+' 秒';$('frame-image').hidden=false;$('frame-placeholder').hidden=true;$('frame-identity').textContent='帧 #'+row.frame_index+' · 源 PTS '+row.source_pts+' · 代理 PTS '+row.proxy_pts+' · '+showTime(row.seconds)+' s';updatePlaybackTime();renderPlayback();}catch(error){if(seq!==state.frameSequence)return;state.loadingFrame=false;state.frame=null;renderPlayback();$('frame-placeholder').textContent='取帧失败，请重试或返回秒级播放。';notice(error.code?describeError(error):'帧图或身份校验未完成，未启用精确边界。','error');}}
+async function showFrame(index){
+ if(!state.task||state.loadingTask||!$('frame-mode').checked)return;
+ const media=state.media;
+ let parsed;
+ try{
+  if(!/^\d{1,40}$/.test(String(index)))throw new Error();
+  parsed=BigInt(index);
+  if(parsed<0n||parsed>=BigInt(media.frame_count))throw new Error();
+ }catch(_){
+  releaseFrame();$('frame-placeholder').textContent='帧序号无效，请输入范围内的序号。';$('frame-placeholder').hidden=false;
+  $('frame-identity').textContent='未选择有效帧，不能用于精确边界';updatePlaybackTime();notice('帧序号超出范围。','error');return;
+ }
+ const seq=++state.frameSequence,taskId=state.task.id;
+ state.frame=null;state.loadingFrame=true;renderPlayback();
+ delete $('frame-image').dataset.frameIndex;delete $('frame-image').dataset.mediaId;
+ $('frame-image').hidden=true;$('frame-placeholder').textContent='正在解码确定帧…';$('frame-placeholder').hidden=false;
+ $('frame-identity').textContent='尚未完成取帧，不能用于精确边界';$('frame-index').value=parsed.toString();
+ try{
+  const rows=await json('/media/'+media.id+'/frames?offset='+parsed+'&limit=1');
+  if(!frameRequestIsCurrent(seq,taskId,media.id))return;
+  const row=rows.frames?.[0];
+  if(!row||row.frame_index!==parsed.toString())throw new Error('Frame identity mismatch');
+  const response=await request('/media/'+media.id+'/frames/'+parsed+'/image');
+  const bytes=await response.arrayBuffer();
+  if(!frameRequestIsCurrent(seq,taskId,media.id))return;
+  if(response.headers.get('Content-Type')?.split(';')[0]!=='image/png')throw new Error('Frame is not an image');
+  const identityHeaders=[['X-TraceAnnotate-Frame-Index',row.frame_index],['X-TraceAnnotate-Source-PTS',row.source_pts],['X-TraceAnnotate-Proxy-PTS',row.proxy_pts],['X-TraceAnnotate-Media-SHA256',media.playback.sha256]];
+  for(const [header,expected]of identityHeaders){
+   if(response.headers.get(header)!==expected)throw new Error('Frame identity mismatch');
+  }
+  const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),byte=>byte.toString(16).padStart(2,'0')).join('');
+  if(digest!==response.headers.get('X-TraceAnnotate-Image-SHA256'))throw new Error('Frame image hash mismatch');
+  if(!frameRequestIsCurrent(seq,taskId,media.id))return;
+  const url=URL.createObjectURL(new Blob([bytes],{type:'image/png'})),probe=new Image();
+  probe.src=url;
+  try{await probe.decode();}catch(error){URL.revokeObjectURL(url);throw error;}
+  if(!frameRequestIsCurrent(seq,taskId,media.id)){URL.revokeObjectURL(url);return;}
+  if(state.frameBlob)URL.revokeObjectURL(state.frameBlob);
+  state.frameBlob=url;state.frame=row;state.loadingFrame=false;
+  const sourceRatio=media.source_width*seconds(media.pixel_aspect_ratio)/media.source_height;
+  const displayRatio=[90,270].includes(media.rotation_degrees)?1/sourceRatio:sourceRatio,ratio=displayRatio/(16/9);
+  $('frame-image').style.setProperty('--frame-width',Math.min(1,ratio)*100+'%');
+  $('frame-image').style.setProperty('--frame-height',Math.min(1,1/ratio)*100+'%');
+  $('frame-image').dataset.frameIndex=row.frame_index;$('frame-image').dataset.mediaId=media.id;
+  $('frame-image').src=url;$('frame-image').alt='确定帧 '+row.frame_index+'，时间 '+showTime(row.seconds)+' 秒';
+  $('frame-image').hidden=false;$('frame-placeholder').hidden=true;
+  $('frame-identity').textContent='帧 #'+row.frame_index+' · 源 PTS '+row.source_pts+' · 代理 PTS '+row.proxy_pts+' · '+showTime(row.seconds)+' s';
+  updatePlaybackTime();renderPlayback();
+ }catch(error){
+  if(!frameRequestIsCurrent(seq,taskId,media.id))return;
+  state.loadingFrame=false;state.frame=null;renderPlayback();$('frame-placeholder').textContent='取帧失败，请重试或返回秒级播放。';
+  notice(error.code?describeError(error):'帧图或身份校验未完成，未启用精确边界。','error');
+ }
+}
+
 function captureTime(which){if(!state.task||state.busy||state.pending||state.loadingTask)return;let value;if($('frame-mode').checked){if(!state.frame||state.loadingFrame){notice('请等待确定帧完成解码后再取边界。','warning');return;}value={seconds:clone(state.frame.seconds),anchor:{frame_index:state.frame.frame_index,source_pts:state.frame.source_pts,proxy_pts:state.frame.proxy_pts}};}else{const time=$('player').currentTime;if($('player').readyState<2||!Number.isFinite(time)){notice('播放器尚未准备好。','warning');return;}value={seconds:parseTime(time.toFixed(6))};}state.anchors[which]=value;$('segment-'+which).value=showTime(value.seconds);updateAnchorLabels();clearReviewIntent();updateDirty();}
-async function toggleFrameMode(){if(state.loadingTask){$('frame-mode').checked=false;renderPlayback();return;}const enabled=$('frame-mode').checked;const frameTime=state.frame?seconds(state.frame.seconds):null;pausePlayback({clearSegment:true});releaseFrame();$('player').hidden=enabled;$('frame-controls').hidden=!enabled;$('frame-identity').hidden=!enabled;$('seek').disabled=enabled;renderPlayback();if(enabled)await showFrame($('frame-index').value);else{if(frameTime!==null)seekPlayback(frameTime);updatePlaybackTime();}}
+async function toggleFrameMode(){
+ if(state.loadingTask||!state.task){$('frame-mode').checked=false;renderPlayback();return;}
+ const enabled=$('frame-mode').checked,player=$('player'),media=state.media,taskId=state.task.id;
+ const frameTime=state.frame?seconds(state.frame.seconds):null;
+ let target;
+ if(enabled){
+  if(player.readyState<1){$('frame-mode').checked=false;renderPlayback();notice('视频时间信息尚未就绪，请等待加载后再取帧。','warning');return;}
+  try{target=playbackTimeRational(player.currentTime);}catch(_){$('frame-mode').checked=false;renderPlayback();notice('播放器时间不可用，请重新定位后再取帧。','warning');return;}
+ }
+ pausePlayback({clearSegment:true});releaseFrame();
+ const sequence=state.frameSequence;
+ player.hidden=enabled;$('frame-controls').hidden=!enabled;$('frame-identity').hidden=!enabled;$('seek').disabled=enabled;
+ if(!enabled){if(frameTime!==null)seekPlayback(frameTime);updatePlaybackTime();renderPlayback();return;}
+ state.loadingFrame=true;renderPlayback();$('frame-placeholder').textContent='正在定位当前位置的确定帧…';$('frame-placeholder').hidden=false;
+ try{
+  const result=await frameAtTime(target,'floor',media);
+  if(!frameRequestIsCurrent(sequence,taskId,media.id))return;
+  // Leading/trailing audio has no video frame at the player cursor. Navigate
+  // to the nearest video endpoint explicitly and label the displayed frame.
+  if(!result.within_video)notice('当前位置在视频画面范围外，已定位到'+(result.frame_index===null?'首帧':'末帧')+'。','warning');
+  await showFrame(result.frame_index??'0');
+ }catch(error){
+  if(!frameRequestIsCurrent(sequence,taskId,media.id))return;
+  state.loadingFrame=false;state.frame=null;$('frame-placeholder').textContent='当前位置取帧失败，请重试或返回连续播放。';renderPlayback();notice(error.code?describeError(error):'当前位置尚未完成确定帧定位。','error');
+ }
+}
+
 
 async function refreshWorkspace(){if(!await mayLeave())return;state.loadingTask=true;renderSaveState();try{const id=state.task?.id;await loadSnapshot();let loaded=true;if(id)loaded=await switchTask(id,{force:true});else if(state.snapshot.tasks.length)loaded=await switchTask(state.snapshot.tasks[0].id,{force:true});if(loaded)notice('已重新读取服务器保存的数据。','success');}catch(error){notice(describeError(error),'error');}finally{state.loadingTask=false;renderSaveState();}}
 async function exportWorkspace(){if(state.busy||state.pending){notice('请先确认保存结果，再导出。','warning');return;}if(state.dirty&&!await confirmAction('当前草稿尚未保存。导出仅包含服务器已保存修订，草稿会继续保留在此页面。',{title:'导出已保存内容？',accept:'导出已保存内容',cancel:'返回编辑'}))return;$('export-workspace').disabled=true;try{const response=await request('/export');const blob=await response.blob();const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='TraceAnnotate-'+state.snapshot.project_id+'-'+Date.now()+'.json';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);notice('已下载已保存快照；该文件不含媒体，暂不支持作为便携项目包回导。','success');}catch(error){notice(describeError(error),'error');}finally{$('export-workspace').disabled=false;}}
