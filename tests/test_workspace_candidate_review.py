@@ -69,6 +69,23 @@ def _candidate(annotation_id, claims, evidence_id, job_id="job-semantic-1"):
                                actor_id="scene-stat", job_id=job_id)
 
 
+def test_public_candidate_builders_require_and_propagate_declared_model_runs():
+    with pytest.raises(SchemaInvalid, match="not declared"):
+        VS.claim(claim_type="observable", statement="模型观察", method_id="detector",
+                 method_version="1", evidence_ids=["art-e1"], model_run_id="run-one",
+                 score=0.8, score_kind="rule_score")
+    claim = VS.claim(claim_type="observable", statement="模型观察", method_id="detector",
+                     method_version="1", evidence_ids=["art-e1"], model_run_id="run-one",
+                     model_run_ids={"run-one"}, score=0.8, score_kind="rule_score")
+    annotation = VS.build_annotation(
+        annotation_id="ann-with-run", kind="whole_clip", label="模型观察", text="",
+        track="vision", claims=[claim], evidence_ids=["art-e1"], job_id="job-one",
+        model_run_ids={"run-one"})
+    assert VS.validate_candidate(annotation, model_run_ids={"run-one"}) == annotation
+    with pytest.raises(SchemaInvalid, match="not declared"):
+        VS.validate_candidate(annotation)
+
+
 def test_model_candidate_stores_observable_with_registered_evidence(store):
     artifact = store._put_artifact(b"frame-bytes-evidence")
     annotation = _candidate("ann-candidate-1", [_observable(artifact["id"])], artifact["id"])
@@ -97,6 +114,20 @@ def test_model_candidate_may_not_store_an_interpretation(store):
                             evidence_ids=[artifact["id"]], start={"n": "0", "d": "1"},
                             end={"n": "1", "d": "1"}, job_id="job-semantic-2")
     assert exc.value.code == "INTERPRETATION_REQUIRES_HUMAN"
+
+
+def test_reviewed_status_without_review_binding_is_rejected(store):
+    artifact = store._put_artifact(b"frame-bytes-forged-review")
+    annotation = _candidate(
+        "ann-forged-review", [_observable(artifact["id"])], artifact["id"])
+    annotation["provenance"] = {
+        "origin": "manual", "actor_id": "local-user", "job_id": None}
+    annotation["review_status"] = "reviewed"
+    annotation.pop("review_binding", None)
+    with pytest.raises(WorkspaceError) as exc:
+        _command(store, "add_annotation", {"annotation": annotation},
+                 "cmd-forged-review")
+    assert exc.value.code == "SCHEMA_INVALID"
 
 
 def test_unregistered_evidence_is_refused(store):
@@ -134,3 +165,35 @@ def test_human_annotation_carries_interpretation_and_review_binds_it(store):
     edited = [a for a in _current(store)["annotations"] if a["id"] == "ann-human-1"][0]
     assert edited["review_status"] == "unreviewed"
     assert "review_binding" not in edited
+
+
+def test_v3_object_and_recipient_edits_invalidate_review_binding(store):
+    artifact = store._put_artifact(b"frame-bytes-evidence-v3-refs")
+    claim = dict(_observable(artifact["id"]), object_ref="object-1",
+                 recipient_ref="recipient-1")
+    annotation = _candidate("ann-v3-refs", [claim], artifact["id"])
+    _command(store, "add_annotation", {"annotation": annotation}, "cmd-v3-add")
+    _command(store, "update_annotation", {"annotation_id": "ann-v3-refs", "changes": {
+        "provenance": {"origin": "manual", "actor_id": "local-user", "job_id": None}}},
+        "cmd-v3-author")
+    _command(store, "review_annotation", {"annotation_id": "ann-v3-refs", "reviewed": True},
+             "cmd-v3-review")
+    reviewed = next(a for a in _current(store)["annotations"] if a["id"] == "ann-v3-refs")
+    before = reviewed["review_binding"]["content_sha256"]
+    changed = dict(reviewed["attributes"]["semantic"])
+    changed["claims"] = [dict(reviewed["attributes"]["semantic"]["claims"][0],
+                              recipient_ref="recipient-2")]
+    _command(store, "update_annotation", {"annotation_id": "ann-v3-refs",
+             "changes": {"attributes": {"semantic": changed}}}, "cmd-v3-edit-ref")
+    edited = next(a for a in _current(store)["annotations"] if a["id"] == "ann-v3-refs")
+    assert edited["review_status"] == "unreviewed" and "review_binding" not in edited
+    assert store.annotation_review_digest(edited, _current(store)) != before
+
+
+def test_rejecting_unreviewed_candidate_deletes_only_that_candidate(store):
+    artifact = store._put_artifact(b"frame-bytes-evidence-v3-reject")
+    annotation = _candidate("ann-v3-reject", [_observable(artifact["id"])], artifact["id"])
+    _command(store, "add_annotation", {"annotation": annotation}, "cmd-v3-reject-add")
+    _command(store, "delete_annotation", {"annotation_id": "ann-v3-reject"},
+             "cmd-v3-reject-delete")
+    assert all(a["id"] != "ann-v3-reject" for a in _current(store)["annotations"])

@@ -60,7 +60,7 @@ def validate_assets(dist: Path, expected_tag: str | None = None) -> list[Path]:
         source_files = {
             file.relative_to(root).as_posix(): file.read_bytes()
             for file in (root / "trace_annotate").rglob("*")
-            if file.is_file() and file.suffix in {".py", ".json", ".xml", ".html", ".js", ".txt", ".otf", ".md"}
+            if file.is_file() and file.suffix in {".py", ".json", ".xml", ".html", ".js", ".txt", ".otf", ".md", ".onnx"}
         }
         wheel_files = {name for name in archive.namelist() if name.startswith("trace_annotate/")}
         if wheel_files != source_files.keys():

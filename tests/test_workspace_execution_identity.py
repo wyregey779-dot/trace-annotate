@@ -29,7 +29,7 @@ def test_implementation_manifest_detects_same_size_replacement_with_restored_mti
 
 @pytest.mark.parametrize("relative", ("temporal/preparation.py", "core/hasher.py",
                                        "workspace/slots.py", "config.py",
-                                       "extractors/base.py"))
+                                       "extractors/base.py", "extractors/hands_worker.py"))
 def test_default_execution_manifest_binds_transitive_runtime_dependencies(tmp_path, relative):
     """A helper used below vision_jobs must change the frozen job identity."""
     assert relative in V.EXECUTION_SOURCE_FILES

@@ -9,10 +9,13 @@ remains an explicit revision/CAS command with model_candidate provenance.
 from __future__ import annotations
 
 import json
+import hashlib
+import io
 import math
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -25,11 +28,31 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..config import MetricThresholds
-from ..extractors.actions import (ACTION_VOCAB, detect_translation_candidates,
+from ..extractors.base import safe_failure_reason
+from ..extractors.actions import (ACTION_REQUIREMENTS, ACTION_VOCAB,
+                                  action_class_results, detect_translation_candidates,
                                   merge_candidates, provider_coverage)
 from ..extractors.camera_motion import analyse_motion
 from ..extractors.expressive_cues import acoustic_claim, measure_acoustic_window, face_cue_candidates, cues_to_claims
 from ..extractors.persons import PersonExtractor, OFFICIAL_WEIGHTS_SHA256 as PERSON_WEIGHTS_SHA256
+from ..extractors.objects import (ObjectExtractor, PROVIDER as OBJECT_PROVIDER,
+                                  SCORE_THRESHOLD as OBJECT_SCORE_THRESHOLD,
+                                  MAX_OBJECTS as OBJECT_DETECTOR_MAX_OBJECTS)
+from ..extractors.object_tracks import (RELATION_CONTRACT, TRACK_CONTRACT,
+                                        build_object_tracks, relation_evidence)
+from ..extractors.hands import (CODE_VERSION as HAND_CODE_VERSION,
+                                CANCELLATION_BOUNDARY as HAND_CANCELLATION_BOUNDARY,
+                                HandLandmarkExtractor,
+                                LANDMARK_NAMES as HAND_LANDMARK_NAMES,
+                                MODEL_LICENSE as HAND_MODEL_LICENSE,
+                                MODEL_LICENSE_SOURCE as HAND_LICENSE_SOURCE,
+                                OFFICIAL_MODEL_CARD as HAND_MODEL_CARD,
+                                OFFICIAL_MODEL_SIZE as HAND_MODEL_SIZE,
+                                OFFICIAL_MODEL_URL as HAND_MODEL_URL,
+                                OFFICIAL_WEIGHTS_SHA256 as HAND_WEIGHTS_SHA256,
+                                PROVIDER as HAND_PROVIDER,
+                                RUNTIME_LICENSE_SOURCE as HAND_RUNTIME_LICENSE_SOURCE)
+from ..extractors import action_video as AV
 from . import optional_vision as OV
 from . import model_worker as MW
 from ..extractors.scene_change import detect_content_changes, minimum_samples
@@ -60,6 +83,11 @@ RESULT_KIND = "traceannotate.vision-candidate"
 DOMAIN = "playback_seconds"
 MAX_SCENES = 512
 MAX_KEYFRAMES = 512
+MAX_OBJECTS_PER_KEYFRAME = 32
+MAX_OBJECT_OBSERVATIONS = MAX_KEYFRAMES * MAX_OBJECTS_PER_KEYFRAME
+MAX_HAND_KEYFRAMES = 16
+HAND_PHASE_TIMEOUT_SECONDS = 120.0
+HAND_SAMPLING_POLICY = "uniform_decoded_keyframes_v1"
 BOUNDARY_MAX_FRAMES = MAX_KEYFRAMES * 4
 CONTENT_MIN_SAMPLES = minimum_samples()
 CONTENT_UNIFORM = 24
@@ -68,7 +96,42 @@ CONTENT_TARGET_GAP = 32
 CONTENT_MAX_FRAMES = CONTENT_UNIFORM_LONG + 2
 MAX_CONTENT_FRAMES = MAX_SCENES * CONTENT_MAX_FRAMES
 CONTENT_EVIDENCE_CONTRACT = "decoded-content-adaptive-v2"
+OBJECT_EVIDENCE_CONTRACT = "sparse-object-relations-v1"
+HAND_EVIDENCE_CONTRACT = "hand-landmark-observation-v1"
+ACTION_VIDEO_EVIDENCE_CONTRACT = "videomae-window-sampling-v1"
+ACTION_VIDEO_HINT_CONTRACT = "videomae-window-hint-v1"
+ACTION_VIDEO_TOP_K = 5
+HAND_UNSUPPORTED_ASSERTIONS = (
+    "touch", "grasp", "held_by", "pick_up", "put_down", "open", "close", "hand_over")
 MAX_FRAME_BYTES = 16 * 1024 * 1024
+MAX_EVIDENCE_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_EVIDENCE_PREPARATION_INPUT_BYTES = 128 * 1024 * 1024
+MAX_EVIDENCE_PUBLICATION_BYTES = 64 * 1024 * 1024
+# The professional task/document limits are substantially smaller than a full
+# vision result.  These limits deliberately preserve a reviewable, evidenced
+# cross-section while the complete result remains in the durable job artifact
+# and project backup.
+PORTABLE_VISUAL_PROJECTION_BYTES = 128 * 1024
+PORTABLE_VISUAL_EVIDENCE_FRAMES = 12
+PORTABLE_OBJECT_EVIDENCE_FRAMES = 4
+PORTABLE_RELATION_EVIDENCE_FRAMES = 4
+PORTABLE_HAND_EVIDENCE_FRAMES = 4
+PORTABLE_OBJECT_OBSERVATIONS = 24
+PORTABLE_OBJECT_TRACKS = 12
+PORTABLE_RELATION_CANDIDATES = 12
+PORTABLE_HAND_OBSERVATIONS = 4
+PORTABLE_PROJECTION_METHODS = frozenset({
+    "object-observation-projection-v1",
+    "object-relation-candidate-projection-v1",
+    "hand-landmark-observation-projection-v1",
+})
+SAFE_RELATION_NAMES = {
+    "near": "near",
+    "contact_candidate": "contact_candidate",
+    "co_moving": "co_moving_candidate",
+    "held_by": "held_candidate",
+    "control_transfer": "control_transfer_candidate",
+}
 FRAME_QUALITY = 3
 CANDIDATE_LABEL_PREFIX = "镜头候选"
 CANDIDATE_TRACK = "镜头"
@@ -136,6 +199,12 @@ EXECUTION_SOURCE_FILES = (
     "extractors/faces.py",
     "extractors/ocr.py",
     "extractors/persons.py",
+    "extractors/objects.py",
+    "extractors/object_tracks.py",
+    "extractors/hands.py",
+    "extractors/hands_worker.py",
+    "extractors/action_video.py",
+    "extractors/action_video_worker.py",
     "extractors/face_landmarks.py",
     "extractors/clip_engine.py",
     "extractors/vlm.py",
@@ -173,6 +242,214 @@ def _file_descriptor(path: Optional[str], *, literal: Optional[str] = None) -> D
         return {"status": "unavailable", "name": candidate.name,
                 "path_identity_sha256": _path_identity(candidate),
                 "reason": type(exc).__name__}
+
+
+def _hand_configuration(model_path: Optional[str]) -> Dict[str, Any]:
+    """Freeze the exact optional Hand Landmarker bundle without loading it."""
+    return {
+        "contract": HAND_EVIDENCE_CONTRACT,
+        "provider": HAND_PROVIDER,
+        "model": _file_descriptor(model_path, literal="TRACE_ANNOTATE_HAND_MODEL"),
+        "expected_size_bytes": str(HAND_MODEL_SIZE),
+        "expected_sha256": HAND_WEIGHTS_SHA256,
+        "runtime_version": _package_version_or_unavailable("mediapipe"),
+        "offline": True,
+        "authority": "hand_keypoint_observations_only",
+        "cancellation_boundary": HAND_CANCELLATION_BOUNDARY,
+        "sampling_policy": HAND_SAMPLING_POLICY,
+        "max_frames_per_job": MAX_HAND_KEYFRAMES,
+        "phase_timeout_seconds": HAND_PHASE_TIMEOUT_SECONDS,
+    }
+
+
+def _action_video_configuration(model_path: Optional[str]) -> Dict[str, Any]:
+    """Freeze the exact optional VideoMAE directory without loading a runtime.
+
+    The path itself never leaves the local job identity.  Its identity hash and
+    the three immutable files are enough to detect path replacement, model
+    replacement and config/label-table replacement before a worker is started.
+    """
+    root = Path(model_path).resolve(strict=False) if model_path else None
+    files = []
+    for role, name in (("weights", AV.WEIGHTS_FILE), ("config", "config.json"),
+                       ("preprocessor", "preprocessor_config.json")):
+        descriptor = (_file_descriptor(str(root / name)) if root is not None
+                      else {"status": "unavailable", "literal":
+                            "TRACE_ANNOTATE_ACTION_VIDEO_MODEL"})
+        files.append({"role": role, **descriptor})
+    implementation = _implementation_manifest(relative_files=(
+        "extractors/action_video.py", "extractors/action_video_worker.py"))
+    expected = {
+        "weights": {"name": AV.WEIGHTS_FILE, "size_bytes": str(AV.WEIGHTS_SIZE),
+                    "sha256": AV.WEIGHTS_SHA256},
+        "config": {"name": "config.json", "sha256": AV.CONFIG_SHA256},
+        "preprocessor": {"name": "preprocessor_config.json",
+                         "sha256": AV.PROCESSOR_SHA256},
+    }
+    exact = root is not None and all(item.get("status") == "available" for item in files)
+    if exact:
+        by_role = {item["role"]: item for item in files}
+        exact = (
+            by_role["weights"].get("size_bytes") == str(AV.WEIGHTS_SIZE)
+            and by_role["weights"].get("sha256") == AV.WEIGHTS_SHA256
+            and by_role["config"].get("sha256") == AV.CONFIG_SHA256
+            and by_role["preprocessor"].get("sha256") == AV.PROCESSOR_SHA256)
+    missing = (root is None or all(
+        item.get("status") == "unavailable"
+        and item.get("reason") == "FileNotFoundError" for item in files))
+    status = "available" if exact else ("unavailable" if missing else "invalid")
+    reason = (None if exact else "video_action_weights_unavailable" if missing
+              else "unverified_video_action_model_identity")
+    return {
+        "contract": ACTION_VIDEO_EVIDENCE_CONTRACT,
+        "provider": AV.PROVIDER,
+        "status": status,
+        "reason": reason,
+        "model_root_identity_sha256": _path_identity(root) if root is not None else None,
+        "files": files,
+        "expected": expected,
+        "upstream_model": AV.UPSTREAM_MODEL,
+        "upstream_revision": AV.UPSTREAM_REVISION,
+        "weights_license": AV.WEIGHTS_LICENSE,
+        "weights_license_source": AV.WEIGHTS_LICENSE_SOURCE,
+        "runtime_versions": {"transformers": _package_version_or_unavailable("transformers"),
+                             "torch": _package_version_or_unavailable("torch")},
+        "implementation": implementation,
+        "isolated_contract": AV.ISOLATED_CONTRACT,
+        "local_files_only": True,
+        "num_frames": AV.NUM_FRAMES,
+        "top_k": ACTION_VIDEO_TOP_K,
+        "window_policy": "per_scene_uniform_decoded_content_samples_v1",
+        "authority": "auxiliary_window_semantics_only",
+        "review_status": "unreviewed",
+        "score_kind": "softmax_score_uncalibrated",
+        "supported_hints": ["close", "open", "pick_up", "put_down_surface"],
+        "unsupported_actions": list(AV.UNSUPPORTED_ACTIONS),
+    }
+
+
+def _validate_action_video_configuration(value: Any) -> Dict[str, Any]:
+    expected_fields = {
+        "contract", "provider", "status", "reason", "model_root_identity_sha256",
+        "files", "expected", "upstream_model", "upstream_revision", "weights_license",
+        "weights_license_source", "runtime_versions", "implementation",
+        "isolated_contract", "local_files_only", "num_frames", "top_k",
+        "window_policy", "authority", "review_status", "score_kind",
+        "supported_hints", "unsupported_actions",
+    }
+    if (not isinstance(value, dict) or set(value) != expected_fields
+            or value["contract"] != ACTION_VIDEO_EVIDENCE_CONTRACT
+            or value["provider"] != AV.PROVIDER
+            or value["status"] not in {"available", "unavailable", "invalid"}
+            or value["reason"] not in {None, "video_action_weights_unavailable",
+                                        "unverified_video_action_model_identity"}
+            or value["local_files_only"] is not True
+            or value["num_frames"] != AV.NUM_FRAMES
+            or value["top_k"] != ACTION_VIDEO_TOP_K
+            or value["window_policy"] != "per_scene_uniform_decoded_content_samples_v1"
+            or value["authority"] != "auxiliary_window_semantics_only"
+            or value["review_status"] != "unreviewed"
+            or value["score_kind"] != "softmax_score_uncalibrated"
+            or value["supported_hints"] != ["close", "open", "pick_up", "put_down_surface"]
+            or value["unsupported_actions"] != list(AV.UNSUPPORTED_ACTIONS)
+            or value["upstream_model"] != AV.UPSTREAM_MODEL
+            or value["upstream_revision"] != AV.UPSTREAM_REVISION
+            or value["weights_license"] != AV.WEIGHTS_LICENSE
+            or value["weights_license_source"] != AV.WEIGHTS_LICENSE_SOURCE
+            or value["isolated_contract"] != AV.ISOLATED_CONTRACT
+            or not isinstance(value["runtime_versions"], dict)
+            or set(value["runtime_versions"]) != {"transformers", "torch"}
+            or any(not isinstance(item, str) for item in value["runtime_versions"].values())
+            or not isinstance(value["implementation"], dict)
+            or set(value["implementation"]) != {"files", "sha256"}
+            or value["implementation"].get("sha256")
+            != S.sha256_text(value["implementation"].get("files"))):
+        raise SchemaInvalid("SCHEMA_INVALID", "Invalid auxiliary video-action deployment")
+    if value["expected"] != {
+            "weights": {"name": AV.WEIGHTS_FILE, "size_bytes": str(AV.WEIGHTS_SIZE),
+                        "sha256": AV.WEIGHTS_SHA256},
+            "config": {"name": "config.json", "sha256": AV.CONFIG_SHA256},
+            "preprocessor": {"name": "preprocessor_config.json",
+                             "sha256": AV.PROCESSOR_SHA256}}:
+        raise SchemaInvalid("SCHEMA_INVALID", "Invalid auxiliary video-action expected identity")
+    if (not isinstance(value["files"], list) or len(value["files"]) != 3
+            or [item.get("role") for item in value["files"]]
+            != ["weights", "config", "preprocessor"]):
+        raise SchemaInvalid("SCHEMA_INVALID", "Invalid auxiliary video-action file identity")
+    for item in value["files"]:
+        if not isinstance(item, dict) or item.get("status") not in {"available", "unavailable"}:
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid auxiliary video-action file descriptor")
+        descriptor = {key: entry for key, entry in item.items() if key != "role"}
+        if descriptor["status"] == "available":
+            if (set(descriptor) != {"status", "name", "path_identity_sha256", "sha256", "size_bytes"}
+                    or S.HASH_RE.fullmatch(str(descriptor.get("path_identity_sha256"))) is None
+                    or S.HASH_RE.fullmatch(str(descriptor.get("sha256"))) is None
+                    or not str(descriptor.get("size_bytes", "")).isdigit()):
+                raise SchemaInvalid("SCHEMA_INVALID", "Invalid available video-action file descriptor")
+        elif set(descriptor) not in ({"status", "literal"},
+                                     {"status", "name", "path_identity_sha256", "reason"}):
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid unavailable video-action file descriptor")
+    available = all(item["status"] == "available" for item in value["files"])
+    by_role = {item["role"]: item for item in value["files"]}
+    exact = available and (
+        by_role["weights"].get("size_bytes") == str(AV.WEIGHTS_SIZE)
+        and by_role["weights"].get("sha256") == AV.WEIGHTS_SHA256
+        and by_role["config"].get("sha256") == AV.CONFIG_SHA256
+        and by_role["preprocessor"].get("sha256") == AV.PROCESSOR_SHA256)
+    root_identity = value["model_root_identity_sha256"]
+    if ((value["status"] == "available") != exact
+            or (value["status"] == "available") != (value["reason"] is None)
+            or root_identity is not None
+            and S.HASH_RE.fullmatch(str(root_identity)) is None
+            or value["status"] in {"available", "invalid"} and root_identity is None):
+        raise SchemaInvalid("SCHEMA_INVALID", "Inconsistent auxiliary video-action deployment identity")
+    return json.loads(S.canonical_json(value))
+
+
+def _validate_hand_configuration(value: Any) -> Dict[str, Any]:
+    expected = {"contract", "provider", "model", "expected_size_bytes",
+                "expected_sha256", "runtime_version", "offline", "authority",
+                "cancellation_boundary", "sampling_policy", "max_frames_per_job",
+                "phase_timeout_seconds"}
+    if (not isinstance(value, dict) or set(value) != expected
+            or value["contract"] != HAND_EVIDENCE_CONTRACT
+            or value["provider"] != HAND_PROVIDER
+            or value["expected_size_bytes"] != str(HAND_MODEL_SIZE)
+            or value["expected_sha256"] != HAND_WEIGHTS_SHA256
+            or not isinstance(value["runtime_version"], str)
+            or value["offline"] is not True
+            or value["authority"] != "hand_keypoint_observations_only"
+            or value["cancellation_boundary"] != HAND_CANCELLATION_BOUNDARY
+            or value["sampling_policy"] != HAND_SAMPLING_POLICY
+            or value["max_frames_per_job"] != MAX_HAND_KEYFRAMES
+            or value["phase_timeout_seconds"] != HAND_PHASE_TIMEOUT_SECONDS
+            or not isinstance(value["model"], dict)
+            or value["model"].get("status") not in {"available", "unavailable"}):
+        raise SchemaInvalid("SCHEMA_INVALID", "Invalid hand landmark deployment")
+    model = value["model"]
+    if model["status"] == "available":
+        if (set(model) != {"status", "name", "path_identity_sha256", "sha256", "size_bytes"}
+                or not isinstance(model["name"], str)
+                or not isinstance(model["path_identity_sha256"], str)
+                or S.HASH_RE.fullmatch(model["path_identity_sha256"]) is None
+                or not isinstance(model["sha256"], str)
+                or S.HASH_RE.fullmatch(model["sha256"]) is None
+                or not isinstance(model["size_bytes"], str) or not model["size_bytes"].isdigit()):
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid hand landmark model identity")
+    else:
+        allowed = (
+            {"status", "literal"},
+            {"status", "name", "path_identity_sha256", "reason"},
+        )
+        if (set(model) not in allowed
+                or "literal" in model and model["literal"] != "TRACE_ANNOTATE_HAND_MODEL"
+                or "name" in model and not isinstance(model["name"], str)
+                or "path_identity_sha256" in model
+                and (not isinstance(model["path_identity_sha256"], str)
+                     or S.HASH_RE.fullmatch(model["path_identity_sha256"]) is None)
+                or "reason" in model and not isinstance(model["reason"], str)):
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid unavailable hand landmark identity")
+    return json.loads(S.canonical_json(value))
 
 
 def _tool_descriptor(name: str, explicit_path: Optional[str] = None) -> Dict[str, Any]:
@@ -326,6 +603,11 @@ def _content_clip(start: Any, end: Any, duration: Any) -> Tuple[Any, Any]:
 
 
 def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE_CONTRACT,
+                  object_evidence_contract: Optional[str] = OBJECT_EVIDENCE_CONTRACT,
+                  hand_configuration: Optional[Dict[str, Any]] = None,
+                  include_hand_configuration: bool = True,
+                  action_video_configuration: Optional[Dict[str, Any]] = None,
+                  include_action_video_configuration: bool = True,
                   optional_providers: Optional[Dict[str, Any]] = None,
                   include_optional: bool = True, model_resources: Optional[Dict[str, Any]] = None,
                   include_model_resources: bool = True,
@@ -354,6 +636,23 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
     }
     if content_evidence_contract is not None:
         config["content_sampling"]["evidence_contract"] = content_evidence_contract
+    if object_evidence_contract is not None:
+        config["object_sampling"] = {
+            "evidence_contract": object_evidence_contract,
+            "provider": OBJECT_PROVIDER,
+            "max_objects_per_keyframe": MAX_OBJECTS_PER_KEYFRAME,
+            "max_observations": MAX_OBJECT_OBSERVATIONS,
+            "max_gap_seconds": 5.0,
+            "continuous_frame_tracking": False,
+        }
+    if include_hand_configuration:
+        config["hand_landmarks"] = _validate_hand_configuration(
+            hand_configuration if hand_configuration is not None
+            else _hand_configuration(os.getenv("TRACE_ANNOTATE_HAND_MODEL")))
+    if include_action_video_configuration:
+        config["action_video"] = _validate_action_video_configuration(
+            action_video_configuration if action_video_configuration is not None
+            else _action_video_configuration(os.getenv("TRACE_ANNOTATE_ACTION_VIDEO_MODEL")))
     if include_optional:
         config["optional_providers"] = OV.validate_config(optional_providers if optional_providers is not None else OV.provider_config())
     if include_model_resources:
@@ -377,6 +676,10 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
 
 def _parameters(window: Optional[Dict[str, Any]] = None,
                 subject_annotation_id: Optional[str] = None, *,
+                hand_configuration: Optional[Dict[str, Any]] = None,
+                include_hand_configuration: bool = True,
+                action_video_configuration: Optional[Dict[str, Any]] = None,
+                include_action_video_configuration: bool = True,
                 optional_providers: Optional[Dict[str, Any]] = None,
                 model_resources: Optional[Dict[str, Any]] = None,
                  execution_deployment: Optional[Dict[str, Any]] = None,
@@ -395,6 +698,10 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
             raise SchemaInvalid("SCHEMA_INVALID", "window must be a reduced rational half-open interval")
     return json.loads(S.canonical_json({"window": window, "subject_annotation_id": subject_annotation_id,
                                         "time_domain": DOMAIN, "job_identity": _job_identity(
+                                            hand_configuration=hand_configuration,
+                                            include_hand_configuration=include_hand_configuration,
+                                            action_video_configuration=action_video_configuration,
+                                            include_action_video_configuration=include_action_video_configuration,
                                             optional_providers=optional_providers, model_resources=model_resources,
                                             execution_deployment=execution_deployment,
                                             include_execution_deployment=include_execution_deployment,
@@ -417,11 +724,21 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     optional = identity["config"].get("optional_providers")
     resources = identity["config"].get("model_resources")
     deployment = identity["config"].get("execution_deployment")
+    hand = identity["config"].get("hand_landmarks")
+    action_video = identity["config"].get("action_video")
     if resources is not None:
         MW.validate_configuration(resources)
     if optional is not None:
         OV.validate_config(optional)
+    if hand is not None:
+        _validate_hand_configuration(hand)
+    if action_video is not None:
+        _validate_action_video_configuration(action_video)
     resource_options = {"model_resources": resources, "include_model_resources": resources is not None,
+                        "hand_configuration": hand,
+                        "include_hand_configuration": hand is not None,
+                        "action_video_configuration": action_video,
+                        "include_action_video_configuration": action_video is not None,
                         "execution_deployment": deployment,
                         "include_execution_deployment": deployment is not None,
                         "include_transition_discovery": "transition_discovery" in identity["config"],
@@ -431,29 +748,25 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     # Immutable completed candidates remain readable after optional deployment
     # or implementation changes. Execution separately requires the current
     # descriptor, so historical queued work cannot silently use new models.
-    identities = [_job_identity(optional_providers=optional, **resource_options),
-                  _job_identity(optional_providers=optional, content_evidence_contract=None, **resource_options)]
+    def identity_variants(**options: Any) -> List[Dict[str, Any]]:
+        return [_job_identity(content_evidence_contract=content_contract,
+                              object_evidence_contract=object_contract, **options)
+                for content_contract in (CONTENT_EVIDENCE_CONTRACT, None)
+                for object_contract in (OBJECT_EVIDENCE_CONTRACT, None)]
+
+    identities = identity_variants(optional_providers=optional, **resource_options)
     if optional is None:
-        identities.extend([_job_identity(include_optional=False, **resource_options),
-                           _job_identity(include_optional=False, content_evidence_contract=None, **resource_options)])
+        identities.extend(identity_variants(include_optional=False, **resource_options))
     # Completed candidates from before execution-deployment freezing remain
     # readable/applyable.  The processor's strict current comparison below
     # rejects such queued work and requires an explicit resubmission.
     legacy_options = {key: value for key, value in resource_options.items()
                       if key not in {"execution_deployment", "include_execution_deployment"}}
-    identities.extend([
-        _job_identity(optional_providers=optional, include_execution_deployment=False,
-                      **legacy_options),
-        _job_identity(optional_providers=optional, content_evidence_contract=None,
-                      include_execution_deployment=False, **legacy_options),
-    ])
+    identities.extend(identity_variants(
+        optional_providers=optional, include_execution_deployment=False, **legacy_options))
     if optional is None:
-        identities.extend([
-            _job_identity(include_optional=False, include_execution_deployment=False,
-                          **legacy_options),
-            _job_identity(include_optional=False, content_evidence_contract=None,
-                          include_execution_deployment=False, **legacy_options),
-        ])
+        identities.extend(identity_variants(
+            include_optional=False, include_execution_deployment=False, **legacy_options))
     if not any(parameters == dict(current, job_identity=item) for item in identities):
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
     media, task = job["media_snapshot"], job["task_snapshot"]
@@ -510,7 +823,9 @@ def _run_scenes(scene_detector: SceneDetector, video_path: Path,
     try:
         segments = scene_detector.detect_scenes_ffmpeg(str(video_path))
     except (SceneDetectionError, ValueError, OSError) as exc:
-        return {"status": "failed", "error": str(exc), "scenes": []}
+        return {"status": "failed",
+                "error": safe_failure_reason(exc, "scene_detection_failed"),
+                "scenes": []}
     if len(segments) > MAX_SCENES:
         return {"status": "failed", "error": f"scene count exceeds {MAX_SCENES}", "scenes": []}
     return {"status": "success", "scenes": segments, "error": None}
@@ -522,7 +837,8 @@ def _run_face(frame: Any, face_extractor: Optional[FaceExtractor]) -> Dict[str, 
     try:
         result = face_extractor.detect_faces(frame)
     except Exception as exc:  # A vision helper must never crash the whole job.
-        return {"status": "failed", "error": str(exc)}
+        return {"status": "failed",
+                "error": safe_failure_reason(exc, "face_inference_failed")}
     return result
 
 
@@ -614,6 +930,7 @@ def _subject_tracks(keyframes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 association = {"method": "iou", "score": round(float(overlap), 6)}
             track["points"].append({"box": [round(value, 2) for value in box],
                                     "frame_index": keyframe["frame_index"], "seconds": seconds,
+                                    "pts": keyframe["timestamp"],
                                     "evidence_sha256": keyframe.get("evidence_sha256"),
                                     "detection_confidence": detections[box_index].get("confidence"),
                                     "association": association})
@@ -633,7 +950,8 @@ def _box_iou(first: Sequence[float], second: Sequence[float]) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _action_candidates(keyframes: List[Dict[str, Any]],
+                       job_id: str = "job-action-sampling") -> Dict[str, Any]:
     """Measure walk/run from measured subject-box tracks; leave other classes not_run."""
     coverage = provider_coverage("subject-translation-v1")
     tracks = _subject_tracks(keyframes)
@@ -645,7 +963,9 @@ def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
             result = {"status": "not_applicable", "candidates": [],
                       "reason": "face_box_is_not_a_body_motion_track"}
         else:
-            result = detect_translation_candidates(points, subject_id=track["subject_id"], min_samples=3)
+            result = detect_translation_candidates(
+                points, subject_ref=track["subject_id"],
+                model_run_id=_module_run_id(job_id, "actions"), min_samples=3)
         track_results.append({"subject_id": track["subject_id"],
                               "scene_index": track["scene_index"],
                               "kind": track["kind"], "samples": len(points),
@@ -655,7 +975,6 @@ def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
                               "termination_reason": track.get("termination_reason"),
                               "candidate_count": len(result.get("candidates") or [])})
         for item in result.get("candidates") or []:
-            item["provider"] = "subject-translation-v1"
             item["scene_index"] = track["scene_index"]
             candidates.append(item)
     for track in tracks:
@@ -671,11 +990,14 @@ def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
         status, reason = "not_run", "fewer_than_three_box_samples_per_subject"
     else:
         status, reason = "success", None
+    class_results = action_class_results(
+        "subject-translation-v1", status=status, candidates=merged, reason=reason)
     return {
         "status": status, "provider": "subject-translation-v1",
         "supported": list(coverage.get("supported") or []),
         "unsupported": list(coverage.get("unsupported") or []),
         "reason": reason,
+        "class_results": class_results,
         "tracks": track_results,
         "candidates": merged,
         "measurement_basis": "主体框中心位移/主体高度/时间；仅走、跑两类；拿起/放下/打开/关闭/递交无本地 provider",
@@ -683,13 +1005,553 @@ def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _validate_action_sampling(value: Any, *, job_id: str,
+                              model_runs: Sequence[Dict[str, Any]],
+                              evidence_hashes: set[str]) -> None:
+    """Fail closed on action provenance while preserving unsupported outcomes."""
+    def invalid(message: str) -> None:
+        raise WorkspaceError("RECOVERY_REQUIRED", message)
+
+    fields = {"status", "provider", "supported", "unsupported", "reason", "class_results",
+              "tracks", "candidates", "measurement_basis", "uncertainty"}
+    if not isinstance(value, dict) or set(value) != fields:
+        invalid("Vision action sampling descriptor is inconsistent")
+    provider = "subject-translation-v1"
+    coverage = provider_coverage(provider)
+    if (value["provider"] != provider
+            or value["supported"] != list(coverage["supported"])
+            or value["unsupported"] != list(coverage["unsupported"])):
+        invalid("Vision action provider coverage is inconsistent")
+    if value["status"] not in {"success", "not_run"}:
+        invalid("Vision action execution status is invalid")
+    class_results = value["class_results"]
+    if not isinstance(class_results, dict) or set(class_results) != set(ACTION_VOCAB):
+        invalid("Vision action class outcomes are incomplete")
+    candidates = value["candidates"]
+    if not isinstance(candidates, list) or len(candidates) > 4096:
+        invalid("Vision action candidate list is invalid")
+    action_run_id = _module_run_id(job_id, "actions")
+    action_run = next((run for run in model_runs if run.get("id") == action_run_id), None)
+    if (action_run is None or action_run.get("provider") != provider
+            or action_run.get("model_name") != provider
+            or action_run.get("status") != value["status"]):
+        invalid("Vision action candidates are not bound to their provider run")
+    counts = {name: 0 for name in ACTION_VOCAB}
+    for candidate in candidates:
+        required = {"kind", "contract_version", "action", "subject_ref", "object_ref",
+                    "recipient_ref", "start_frame", "end_frame", "window_seconds", "window_pts",
+                    "metrics", "sample_frames", "method", "provider", "model_run_id", "score",
+                    "score_kind", "uncertainty", "scene_index"}
+        if (not isinstance(candidate, dict) or not required <= set(candidate)
+                or set(candidate) - required - {"merged_windows"}):
+            invalid("Vision action candidate shape is invalid")
+        if candidate["kind"] != "action_candidate" or candidate["contract_version"] != "action-candidate-v3":
+            invalid("Vision action candidate version is invalid")
+        action = candidate["action"]
+        if action not in ACTION_VOCAB or action not in coverage["supported"]:
+            invalid("Vision action candidate uses an unsupported class")
+        try:
+            subject = S.require_id(candidate["subject_ref"], "subject_ref")
+            if candidate["object_ref"] is not None:
+                S.require_id(candidate["object_ref"], "object_ref")
+            if candidate["recipient_ref"] is not None:
+                S.require_id(candidate["recipient_ref"], "recipient_ref")
+        except SchemaInvalid as exc:
+            invalid("Vision action candidate references are invalid")
+        if ("object_ref" in ACTION_REQUIREMENTS[action] and candidate["object_ref"] is None
+                or "recipient_ref" in ACTION_REQUIREMENTS[action] and candidate["recipient_ref"] is None
+                or action == "递交" and candidate["recipient_ref"] == subject):
+            invalid("Vision action candidate is missing a required distinct participant")
+        if (candidate["provider"] != provider or candidate["method"] != provider
+                or candidate["model_run_id"] != action_run_id
+                or candidate["score_kind"] != "rule_score"):
+            invalid("Vision action candidate provenance is inconsistent")
+        try:
+            start_frame, end_frame = int(candidate["start_frame"]), int(candidate["end_frame"])
+        except (TypeError, ValueError):
+            invalid("Vision action frame range is invalid")
+        if (not isinstance(candidate["start_frame"], str)
+                or not isinstance(candidate["end_frame"], str)
+                or not candidate["start_frame"].isdigit()
+                or not candidate["end_frame"].isdigit()
+                or start_frame > end_frame or type(candidate["scene_index"]) is not int
+                or candidate["scene_index"] < 0):
+            invalid("Vision action frame range is invalid")
+        pts = candidate["window_pts"]
+        seconds = candidate["window_seconds"]
+        try:
+            if (not isinstance(pts, dict) or set(pts) != {"start", "end"}
+                    or any(S.rational(pts[key]) != pts[key] for key in ("start", "end"))
+                    or S.rational_value(pts["start"]) >= S.rational_value(pts["end"])
+                    or not isinstance(seconds, dict) or set(seconds) != {"start", "end"}
+                    or any(isinstance(seconds[key], bool) or not isinstance(seconds[key], (int, float))
+                           or not math.isfinite(float(seconds[key])) for key in ("start", "end"))
+                    or float(seconds["start"]) >= float(seconds["end"])
+                    or abs(float(S.rational_value(pts["start"])) - float(seconds["start"])) > 1e-9
+                    or abs(float(S.rational_value(pts["end"])) - float(seconds["end"])) > 1e-9):
+                invalid("Vision action PTS range is invalid")
+        except (TypeError, ValueError, SchemaInvalid):
+            invalid("Vision action PTS range is invalid")
+        score = candidate["score"]
+        if (isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(float(score)) or not 0 <= float(score) <= 1
+                or not isinstance(candidate["uncertainty"], str)
+                or not candidate["uncertainty"].strip()):
+            invalid("Vision action score or uncertainty is invalid")
+        samples = candidate["sample_frames"]
+        if not isinstance(samples, list) or len(samples) < 3:
+            invalid("Vision action candidate lacks sufficient decoded evidence")
+        prior_frame = prior_pts = None
+        for sample in samples:
+            sample_fields = {"frame_index", "seconds", "pts", "evidence_sha256",
+                             "detection_confidence", "association"}
+            if not isinstance(sample, dict) or set(sample) != sample_fields:
+                invalid("Vision action sample shape is invalid")
+            try:
+                frame = int(sample["frame_index"])
+                sample_pts = S.rational(sample["pts"])
+                sample_seconds = float(sample["seconds"])
+            except (TypeError, ValueError, SchemaInvalid):
+                invalid("Vision action sample timing is invalid")
+            if (not isinstance(sample["frame_index"], str) or not sample["frame_index"].isdigit()
+                    or sample_pts != sample["pts"] or not math.isfinite(sample_seconds)
+                    or abs(float(S.rational_value(sample_pts)) - sample_seconds) > 1e-9
+                    or sample["evidence_sha256"] not in evidence_hashes
+                    or prior_frame is not None and (frame <= prior_frame
+                        or S.rational_value(sample_pts) <= prior_pts)):
+                invalid("Vision action sample timing or evidence is invalid")
+            prior_frame, prior_pts = frame, S.rational_value(sample_pts)
+        if (samples[0]["frame_index"] != candidate["start_frame"]
+                or samples[-1]["frame_index"] != candidate["end_frame"]
+                or samples[0]["pts"] != pts["start"] or samples[-1]["pts"] != pts["end"]):
+            invalid("Vision action candidate range is not bound to its evidence endpoints")
+        counts[action] += 1
+    expected_results = action_class_results(
+        provider, status=value["status"], candidates=candidates, reason=value["reason"])
+    if class_results != expected_results:
+        invalid("Vision action class outcomes do not match executed candidates")
+
+
+def _select_action_video_frames(samples: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Select the one canonical sixteen-frame window for a decoded scene.
+
+    Content sampling is already bound to the admitted playback and frame map.
+    We uniformly select from those decoded samples instead of seeking the source
+    again, so action evidence and the candidate's registered frame evidence are
+    byte-identical and independently verifiable.
+    """
+    ordered = sorted(samples, key=lambda item: int(item["frame_index"]))
+    if len(ordered) < AV.NUM_FRAMES:
+        return []
+    positions = [(index * (len(ordered) - 1)) // (AV.NUM_FRAMES - 1)
+                 for index in range(AV.NUM_FRAMES)]
+    selected = [ordered[index] for index in positions]
+    if len({item["frame_index"] for item in selected}) != AV.NUM_FRAMES:
+        return []
+    return selected
+
+
+def _action_video_input(selected: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    frames = []
+    for item in selected:
+        raw_pts = item.get("pts", item.get("seconds"))
+        if raw_pts is None:
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Video-action sample has no canonical PTS")
+        frames.append({"frame_index": str(item["frame_index"]),
+                       "pts": S.rational(raw_pts),
+                       "evidence_sha256": item["evidence_sha256"]})
+    return {"start_frame": frames[0]["frame_index"],
+            "end_frame": frames[-1]["frame_index"],
+            "window_pts": {"start": frames[0]["pts"], "end": frames[-1]["pts"]},
+            "frames": frames}
+
+
+def _action_video_execution(value: Any) -> Optional[Dict[str, Any]]:
+    """Project the owned-process receipt without leaking argv or local paths."""
+    if not isinstance(value, dict):
+        return None
+    return {
+        "contract": value.get("contract"),
+        "status": value.get("status"),
+        "request_sha256": value.get("request_sha256"),
+        "parent_pid": value.get("parent_pid"),
+        "wrapper_pid": value.get("wrapper_pid"),
+        "actual_pid": value.get("actual_pid"),
+        "actual_parent_pid": value.get("actual_parent_pid"),
+        "peak_working_set_bytes": value.get("peak_working_set_bytes"),
+        "actual_exit_code": value.get("actual_exit_code"),
+        "elapsed_seconds": value.get("elapsed_seconds"),
+        "error_code": value.get("error_code"),
+    }
+
+
+def _action_video_result(value: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize every worker outcome to one bounded, exact candidate shape."""
+    status = value.get("status")
+    return {
+        "status": status,
+        "reason": value.get("reason"),
+        "decision": value.get("decision"),
+        "semantic_hints": list(value.get("semantic_hints") or []),
+        "ranked": _jsonable(value.get("ranked") or []),
+        "score_kind": value.get("score_kind"),
+        "review_status": value.get("review_status"),
+        "authority": value.get("authority"),
+        "unsupported_actions": list(value.get("unsupported_actions") or []),
+        "provider": value.get("provider"),
+        "model_identity": _jsonable(value.get("model_identity")),
+        "window": _jsonable(value.get("window")),
+        "subject_ref": value.get("subject_ref"),
+        "object_ref": value.get("object_ref"),
+        "recipient_ref": value.get("recipient_ref"),
+        "uncertainty": value.get("uncertainty"),
+        "execution": _action_video_execution(value.get("execution")),
+    }
+
+
+def _run_action_video_sampling(configuration: Dict[str, Any], model_path: Optional[str],
+                               scene_samples: Dict[int, List[Dict[str, Any]]],
+                               work: Path, *, cancelled) -> Dict[str, Any]:
+    """Run one owned worker for every scene with a canonical 16-frame window."""
+    config = _validate_action_video_configuration(configuration)
+    planned: List[Tuple[int, List[Dict[str, Any]]]] = []
+    ineligible = []
+    for scene_index in sorted(scene_samples):
+        selected = _select_action_video_frames(scene_samples[scene_index])
+        if selected:
+            planned.append((scene_index, selected))
+        else:
+            ineligible.append(scene_index)
+    windows: List[Dict[str, Any]] = []
+    frozen_sha = S.sha256_text(config)
+    unavailable = config["status"] != "available"
+    if unavailable:
+        status = "not_run" if config["status"] == "unavailable" else "failed"
+        for scene_index, selected in planned:
+            windows.append({"scene_index": scene_index,
+                            "input": _action_video_input(selected),
+                            "status": status, "reason": config["reason"], "result": None})
+        return {
+            "contract": ACTION_VIDEO_EVIDENCE_CONTRACT,
+            "status": status,
+            "reason": config["reason"],
+            "provider": AV.PROVIDER,
+            "authority": "auxiliary_window_semantics_only",
+            "review_status": "unreviewed",
+            "score_kind": "softmax_score_uncalibrated",
+            "num_frames": AV.NUM_FRAMES,
+            "top_k": ACTION_VIDEO_TOP_K,
+            "window_policy": "per_scene_uniform_decoded_content_samples_v1",
+            "configuration_sha256": frozen_sha,
+            "eligible_scenes": len(planned), "processed_scenes": 0,
+            "ineligible_scenes": ineligible,
+            "supported_hints": list(config["supported_hints"]),
+            "unsupported_actions": list(config["unsupported_actions"]),
+            "windows": windows,
+        }
+    if not planned:
+        return {
+            "contract": ACTION_VIDEO_EVIDENCE_CONTRACT,
+            "status": "not_run", "reason": "no_scene_has_16_decoded_content_samples",
+            "provider": AV.PROVIDER,
+            "authority": "auxiliary_window_semantics_only", "review_status": "unreviewed",
+            "score_kind": "softmax_score_uncalibrated", "num_frames": AV.NUM_FRAMES,
+            "top_k": ACTION_VIDEO_TOP_K,
+            "window_policy": "per_scene_uniform_decoded_content_samples_v1",
+            "configuration_sha256": frozen_sha,
+            "eligible_scenes": 0, "processed_scenes": 0,
+            "ineligible_scenes": ineligible,
+            "supported_hints": list(config["supported_hints"]),
+            "unsupported_actions": list(config["unsupported_actions"]), "windows": []}
+    if not model_path:
+        raise WorkspaceError("RECOVERY_REQUIRED",
+                             "Available video-action identity has no local execution path")
+    for scene_index, selected in planned:
+        input_descriptor = _action_video_input(selected)
+        try:
+            if cancelled():
+                raise WorkspaceError("CANCELLED", "Video action analysis was cancelled")
+            worker_samples = [{"scene_index": scene_index,
+                               "frame_index": item["frame_index"],
+                               "pts": item["pts"],
+                               "evidence_sha256": item["evidence_sha256"],
+                               "image": _load_frame(Path(item["path"]))}
+                              for item in selected]
+            raw = AV.analyze_window_isolated(
+                str(Path(model_path).resolve(strict=False)), worker_samples,
+                (work / f"scene-{scene_index}").resolve(),
+                top_k=ACTION_VIDEO_TOP_K, cancelled=cancelled)
+            result = _action_video_result(raw)
+            status = result["status"]
+            reason = result["reason"]
+        except InterruptedError as exc:
+            raise WorkspaceError("CANCELLED", "Video action analysis was cancelled") from exc
+        except WorkspaceError as exc:
+            if exc.code in {"CANCELLED", "LEASE_LOST"}:
+                raise
+            status, reason, result = "failed", exc.code, None
+        except Exception as exc:  # malformed local model/runtime is a failed module, not a job claim
+            status, reason, result = "failed", type(exc).__name__, None
+        windows.append({"scene_index": scene_index, "input": input_descriptor,
+                        "status": status, "reason": str(reason)[:240] if reason else None,
+                        "result": result})
+    statuses = {item["status"] for item in windows}
+    if statuses == {"success"}:
+        status, reason = "success", None
+    elif statuses == {"not_run"}:
+        status = "not_run"
+        reason = next((item["reason"] for item in windows if item["reason"]),
+                      "video_action_runtime_unavailable")
+    else:
+        status = "failed"
+        reason = next((item["reason"] for item in windows if item["status"] == "failed"
+                       and item["reason"]), "inconsistent_window_execution_status")
+    return {
+        "contract": ACTION_VIDEO_EVIDENCE_CONTRACT, "status": status,
+        "reason": reason, "provider": AV.PROVIDER,
+        "authority": "auxiliary_window_semantics_only", "review_status": "unreviewed",
+        "score_kind": "softmax_score_uncalibrated", "num_frames": AV.NUM_FRAMES,
+        "top_k": ACTION_VIDEO_TOP_K,
+        "window_policy": "per_scene_uniform_decoded_content_samples_v1",
+        "configuration_sha256": frozen_sha,
+        "eligible_scenes": len(planned),
+        "processed_scenes": sum(item["result"] is not None for item in windows),
+        "ineligible_scenes": ineligible,
+        "supported_hints": list(config["supported_hints"]),
+        "unsupported_actions": list(config["unsupported_actions"]),
+        "windows": windows,
+    }
+
+
+def _action_video_model_input(digest: str, window: Optional[Dict[str, Any]],
+                              sampling: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "basis": "registered_playback_decoded_content_windows",
+        "file_sha256": digest,
+        "window": window,
+        "time_domain": DOMAIN,
+        "configuration_sha256": sampling["configuration_sha256"],
+        "windows": [{"scene_index": item["scene_index"], "input": item["input"]}
+                    for item in sampling["windows"]],
+    }
+
+
+def _action_video_model_run(job_id: str, digest: str,
+                            window: Optional[Dict[str, Any]],
+                            sampling: Dict[str, Any],
+                            configuration: Dict[str, Any]) -> Dict[str, Any]:
+    exact = configuration["status"] == "available"
+    weights = next((item.get("sha256") for item in configuration["files"]
+                    if item["role"] == "weights"), None) if exact else None
+    execution_receipts = [
+        S.sha256_text(item["result"]["execution"])
+        for item in sampling["windows"]
+        if item.get("result") is not None and item["result"].get("execution") is not None]
+    return _model_run_record(
+        job_id, "action_video", provider=AV.PROVIDER,
+        model_name=AV.UPSTREAM_MODEL if exact else "unverified_local_model",
+        model_version=AV.UPSTREAM_REVISION if exact else "unavailable",
+        weights_sha256=weights,
+        license=AV.WEIGHTS_LICENSE if exact else "not declared",
+        preprocessing={"input": "exactly 16 uniformly selected decoded BGR content samples per scene",
+                       "time_domain": DOMAIN,
+                       "window_policy": sampling["window_policy"],
+                       "num_frames": AV.NUM_FRAMES,
+                       "isolated_contract": AV.ISOLATED_CONTRACT,
+                       "local_files_only": True},
+        parameters={"contract": ACTION_VIDEO_EVIDENCE_CONTRACT,
+                    "hint_contract": ACTION_VIDEO_HINT_CONTRACT,
+                    "configuration_sha256": sampling["configuration_sha256"],
+                    "implementation_sha256": configuration["implementation"]["sha256"],
+                    "top_k": ACTION_VIDEO_TOP_K,
+                    "authority": "auxiliary_window_semantics_only",
+                    "supported_hints": list(configuration["supported_hints"]),
+                    "unsupported_actions": list(configuration["unsupported_actions"]),
+                    "execution_receipt_sha256": execution_receipts},
+        input_value=_action_video_model_input(digest, window, sampling),
+        output_value={"module": "action_video", "sampling": sampling},
+        status=sampling["status"], failure_reason=sampling["reason"],
+        code_version=f"vision_jobs={VERSION}; action_video={AV.ISOLATED_CONTRACT}",
+        score_kind="softmax")
+
+
+def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any],
+                                    scenes: Sequence[Dict[str, Any]],
+                                    content_frames: Sequence[Dict[str, Any]],
+                                    evidence_hashes: set[str], model_runs: Sequence[Dict[str, Any]],
+                                    job_id: str, digest: str,
+                                    window: Optional[Dict[str, Any]]) -> None:
+    """Reject a forged worker success or a result detached from decoded frames."""
+    def invalid(message: str) -> None:
+        raise WorkspaceError("RECOVERY_REQUIRED", message)
+
+    config = _validate_action_video_configuration(configuration)
+    fields = {"contract", "status", "reason", "provider", "authority", "review_status",
+              "score_kind", "num_frames", "top_k", "window_policy",
+              "configuration_sha256", "eligible_scenes", "processed_scenes",
+              "ineligible_scenes", "supported_hints", "unsupported_actions", "windows"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or value["contract"] != ACTION_VIDEO_EVIDENCE_CONTRACT
+            or value["status"] not in {"success", "failed", "not_run"}
+            or value["provider"] != AV.PROVIDER
+            or value["authority"] != "auxiliary_window_semantics_only"
+            or value["review_status"] != "unreviewed"
+            or value["score_kind"] != "softmax_score_uncalibrated"
+            or value["num_frames"] != AV.NUM_FRAMES
+            or value["top_k"] != ACTION_VIDEO_TOP_K
+            or value["window_policy"] != "per_scene_uniform_decoded_content_samples_v1"
+            or value["configuration_sha256"] != S.sha256_text(config)
+            or value["supported_hints"] != config["supported_hints"]
+            or value["unsupported_actions"] != config["unsupported_actions"]
+            or type(value["eligible_scenes"]) is not int or value["eligible_scenes"] < 0
+            or type(value["processed_scenes"]) is not int or value["processed_scenes"] < 0
+            or not isinstance(value["ineligible_scenes"], list)
+            or not isinstance(value["windows"], list)):
+        invalid("Auxiliary video-action sampling descriptor is inconsistent")
+    grouped: Dict[int, List[Dict[str, Any]]] = {index: [] for index in range(len(scenes))}
+    for frame in content_frames:
+        grouped.setdefault(frame["scene_index"], []).append(frame)
+    selected_by_scene = {index: _select_action_video_frames(items)
+                         for index, items in grouped.items()}
+    eligible = [index for index in sorted(selected_by_scene) if selected_by_scene[index]]
+    ineligible = [index for index in sorted(selected_by_scene) if not selected_by_scene[index]]
+    if (value["eligible_scenes"] != len(eligible)
+            or value["ineligible_scenes"] != ineligible
+            or len(value["windows"]) != len(eligible)
+            or [item.get("scene_index") for item in value["windows"]] != eligible):
+        invalid("Auxiliary video-action scene coverage is inconsistent")
+    result_count = 0
+    for item, scene_index in zip(value["windows"], eligible):
+        if (not isinstance(item, dict)
+                or set(item) != {"scene_index", "input", "status", "reason", "result"}
+                or item["status"] not in {"success", "failed", "not_run"}
+                or item["scene_index"] != scene_index
+                or item["input"] != _action_video_input(selected_by_scene[scene_index])):
+            invalid("Auxiliary video-action window input is inconsistent")
+        frame_descriptors = item["input"]["frames"]
+        if any(frame["evidence_sha256"] not in evidence_hashes for frame in frame_descriptors):
+            invalid("Auxiliary video-action window has no registered decoded evidence")
+        result = item["result"]
+        if result is None:
+            if item["status"] != "failed" and config["status"] == "available":
+                invalid("A runnable video-action window omitted its worker result")
+            continue
+        result_count += 1
+        result_fields = {"status", "reason", "decision", "semantic_hints", "ranked",
+                         "score_kind", "review_status", "authority", "unsupported_actions",
+                         "provider", "model_identity", "window", "subject_ref", "object_ref",
+                         "recipient_ref", "uncertainty", "execution"}
+        if (not isinstance(result, dict) or set(result) != result_fields
+                or result["status"] != item["status"]
+                or result["review_status"] != "unreviewed"
+                or result["authority"] != "auxiliary_window_semantics_only"
+                or any(result[name] is not None for name in
+                       ("subject_ref", "object_ref", "recipient_ref"))):
+            invalid("Auxiliary video-action worker result is inconsistent")
+        execution = result["execution"]
+        execution_fields = {"contract", "status", "request_sha256", "parent_pid",
+                            "wrapper_pid", "actual_pid", "actual_parent_pid",
+                            "peak_working_set_bytes", "actual_exit_code", "elapsed_seconds",
+                            "error_code"}
+        if (not isinstance(execution, dict) or set(execution) != execution_fields
+                or execution["contract"] != AV.ISOLATED_CONTRACT
+                or execution["status"] != "completed"
+                or S.HASH_RE.fullmatch(str(execution["request_sha256"])) is None
+                or any(type(execution[name]) is not int or execution[name] <= 0
+                       for name in ("parent_pid", "wrapper_pid", "actual_pid", "actual_parent_pid"))
+                or (execution["peak_working_set_bytes"] is not None
+                    and (type(execution["peak_working_set_bytes"]) is not int
+                         or execution["peak_working_set_bytes"] < 0))
+                or execution["actual_exit_code"] != 0
+                or isinstance(execution["elapsed_seconds"], bool)
+                or not isinstance(execution["elapsed_seconds"], (int, float))
+                or not math.isfinite(float(execution["elapsed_seconds"]))
+                or float(execution["elapsed_seconds"]) < 0
+                or execution["error_code"] is not None):
+            invalid("Auxiliary video-action owned-process receipt is inconsistent")
+        if result["status"] != "success":
+            if (result["decision"] != "not_run" or result["semantic_hints"] != []
+                    or result["ranked"] != [] or result["score_kind"] is not None
+                    or result["provider"] is not None or result["model_identity"] is not None
+                    or result["window"] is not None or result["uncertainty"] is not None
+                    or result["unsupported_actions"] != []):
+                invalid("Unavailable video-action execution emitted semantic output")
+            continue
+        identity = result["model_identity"]
+        actual = result["window"]
+        if (result["provider"] != AV.PROVIDER
+                or not isinstance(identity, dict) or set(identity) != AV.MODEL_IDENTITY_FIELDS
+                or identity.get("model_name") != AV.PROVIDER
+                or identity.get("upstream_model") != AV.UPSTREAM_MODEL
+                or identity.get("upstream_revision") != AV.UPSTREAM_REVISION
+                or identity.get("weights_sha256") != AV.WEIGHTS_SHA256
+                or identity.get("config_sha256") != AV.CONFIG_SHA256
+                or identity.get("preprocessor_config_sha256") != AV.PROCESSOR_SHA256
+                or identity.get("weights_license") != AV.WEIGHTS_LICENSE
+                or identity.get("weights_license_source") != AV.WEIGHTS_LICENSE_SOURCE
+                or identity.get("local_files_only") is not True
+                or identity.get("authority") != "auxiliary_window_semantics_only"
+                or identity.get("num_frames") != AV.NUM_FRAMES
+                or identity.get("supported_hints") != config["supported_hints"]
+                or identity.get("unsupported_actions") != config["unsupported_actions"]
+                or result["unsupported_actions"] != config["unsupported_actions"]
+                or result["decision"] not in {"auxiliary_candidate", "reject", "unknown"}
+                or not set(result["semantic_hints"]) <= set(config["supported_hints"])
+                or result["score_kind"] != "softmax_score_uncalibrated"
+                or not isinstance(result["uncertainty"], str) or not result["uncertainty"].strip()
+                or not isinstance(actual, dict)):
+            invalid("Auxiliary video-action success used an unverified model identity")
+        try:
+            AV._validate_ranked_result(result, top_k=ACTION_VIDEO_TOP_K)
+        except (TypeError, ValueError) as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED",
+                                 "Auxiliary video-action ranking is inconsistent") from exc
+        expected_input = item["input"]
+        if ({key: actual.get(key) for key in ("start_frame", "end_frame", "window_pts",
+                                               "scene_index")}
+                != {"start_frame": expected_input["start_frame"],
+                    "end_frame": expected_input["end_frame"],
+                    "window_pts": expected_input["window_pts"], "scene_index": scene_index}
+                or not isinstance(actual.get("total_input_bytes"), int)
+                or actual["total_input_bytes"] <= 0
+                or not isinstance(actual.get("frames"), list)
+                or len(actual["frames"]) != AV.NUM_FRAMES):
+            invalid("Auxiliary video-action result window is inconsistent")
+        for returned, expected_frame in zip(actual["frames"], expected_input["frames"]):
+            if (not isinstance(returned, dict)
+                    or set(returned) != {"frame_index", "pts", "scene_index",
+                                         "evidence_sha256", "pixel_sha256", "shape"}
+                    or {key: returned[key] for key in ("frame_index", "pts", "evidence_sha256")}
+                    != expected_frame
+                    or returned["scene_index"] != scene_index
+                    or S.HASH_RE.fullmatch(str(returned["pixel_sha256"])) is None
+                    or not isinstance(returned["shape"], list) or len(returned["shape"]) != 3
+                    or any(type(size) is not int or size <= 0 for size in returned["shape"])):
+                invalid("Auxiliary video-action result frame identity is inconsistent")
+    if value["processed_scenes"] != result_count:
+        invalid("Auxiliary video-action processed count is inconsistent")
+    statuses = {item["status"] for item in value["windows"]}
+    expected_status = ("failed" if config["status"] == "invalid"
+                       else "not_run" if not value["windows"]
+                       else "success" if statuses == {"success"}
+                       else "not_run" if statuses == {"not_run"} else "failed")
+    if value["status"] != expected_status:
+        invalid("Auxiliary video-action aggregate status is inconsistent")
+    run = next((item for item in model_runs
+                if item.get("id") == _module_run_id(job_id, "action_video")), None)
+    expected_run = _action_video_model_run(job_id, digest, window, value, config)
+    if run != expected_run:
+        invalid("Auxiliary video-action sampling is not bound to its model run")
+
+
 def _audio_window(window: Optional[Dict[str, Any]], media_duration: Any) -> Tuple[float, float]:
     """Return a finite bounded half-open audio window in playback seconds."""
     if window is None:
-        start, end = 0.0, S.rational_value(media_duration)
+        start, end = 0.0, float(S.rational_value(media_duration))
     else:
-        start = S.rational_value(window["start"])
-        end = S.rational_value(window["end"])
+        start = float(S.rational_value(window["start"]))
+        end = float(S.rational_value(window["end"]))
     if (not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start):
         raise ValueError("invalid_audio_window")
     return start, end - start
@@ -917,7 +1779,520 @@ def _run_person(frame: Any, extractor: Optional[PersonExtractor]) -> Dict[str, A
     try:
         return extractor.detect_people(frame)
     except Exception as exc:
-        return {"status": "failed", "reason": str(exc)[:300], "persons_detected": []}
+        return {"status": "failed",
+                "reason": safe_failure_reason(exc, "person_inference_failed"),
+                "persons_detected": []}
+
+
+def _run_object(frame: Any, extractor: Optional[ObjectExtractor]) -> Dict[str, Any]:
+    """Run the bounded COCO observation provider without asserting actions."""
+    if extractor is None:
+        return {"status": "not_run", "reason": "object_weights_unavailable",
+                "object_count": None, "objects_detected": [], "provider": OBJECT_PROVIDER,
+                "excluded_class_ids": [0]}
+    try:
+        result = dict(extractor.detect_objects(frame))
+    except Exception as exc:
+        return {"status": "failed",
+                "reason": safe_failure_reason(exc, "object_inference_failed"),
+                "object_count": None, "objects_detected": [], "provider": OBJECT_PROVIDER,
+                "excluded_class_ids": [0]}
+    detections = list(result.get("objects_detected") or [])
+    total = len(detections)
+    if total > MAX_OBJECTS_PER_KEYFRAME:
+        result["objects_detected"] = detections[:MAX_OBJECTS_PER_KEYFRAME]
+        result["object_count"] = MAX_OBJECTS_PER_KEYFRAME
+        result["detector_object_count"] = total
+        result["pipeline_limit"] = MAX_OBJECTS_PER_KEYFRAME
+        result["truncated"] = True
+    else:
+        result["objects_detected"] = detections
+        if result.get("status") == "success":
+            result["object_count"] = total
+        result["detector_object_count"] = total if result.get("status") == "success" else None
+        result["pipeline_limit"] = MAX_OBJECTS_PER_KEYFRAME
+        result["truncated"] = False
+    return result
+
+
+def _hand_public_identity(identity: Any, configuration: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove a local path while retaining the frozen path/byte identity."""
+    if not isinstance(identity, dict):
+        raise ValueError("hand_landmark_model_identity_invalid")
+    public = _jsonable(dict(identity))
+    public.pop("weights_path", None)
+    descriptor = configuration["model"]
+    if descriptor.get("path_identity_sha256") is not None:
+        public["path_identity_sha256"] = descriptor["path_identity_sha256"]
+    return public
+
+
+def _empty_hand_result(status: str, reason: str, configuration: Dict[str, Any], *,
+                       identity: Optional[Dict[str, Any]] = None,
+                       error: Optional[str] = None) -> Dict[str, Any]:
+    descriptor = configuration["model"]
+    if identity is None:
+        identity = {
+            "provider": "unavailable", "model_name": HAND_PROVIDER,
+            "model_version": "unavailable", "model_source": None,
+            "model_card": HAND_MODEL_CARD, "weights_size": None,
+            "weights_sha256": None, "license": "unverified",
+            "license_source": None,
+            "runtime_license_source": HAND_RUNTIME_LICENSE_SOURCE,
+            "runtime_version": configuration["runtime_version"],
+            "code_version": HAND_CODE_VERSION, "running_mode": "IMAGE",
+            "max_hands": 4, "offline": True, "downloads_allowed": False,
+            "authority": "hand_keypoint_observations_only",
+        }
+        if descriptor.get("path_identity_sha256") is not None:
+            identity["path_identity_sha256"] = descriptor["path_identity_sha256"]
+    result = {
+        "status": status, "hands": [], "provider": "hand_landmarks",
+        "model_identity": identity, "fingerprint": S.sha256_text(identity),
+        "review_status": "unreviewed",
+        "authority": "hand_keypoint_observations_only",
+        "unsupported_assertions": list(HAND_UNSUPPORTED_ASSERTIONS),
+        "cancellation_boundary": HAND_CANCELLATION_BOUNDARY,
+        "reason": reason,
+    }
+    if error:
+        result["error"] = str(error)[:500]
+    return result
+
+
+def _run_hands(frame: Any, extractor: Optional[HandLandmarkExtractor], *,
+               scene_index: int, frame_index: str, pts: Dict[str, str],
+               evidence_sha256: str, model_run_id: str,
+               configuration: Dict[str, Any], cancelled: Any) -> Dict[str, Any]:
+    """Run observation-only hand keypoints with honest synchronous cancellation."""
+    if extractor is None:
+        return _empty_hand_result(
+            "not_run", "hand_landmark_provider_unavailable", configuration)
+    try:
+        result = extractor.analyze_frame(
+            frame, scene_index=scene_index, frame_index=frame_index, pts=pts,
+            evidence_sha256=evidence_sha256, model_run_id=model_run_id,
+            cancelled=cancelled)
+        if not isinstance(result, dict):
+            raise ValueError("hand_landmark_result_invalid")
+        result = _jsonable(result)
+        identity = _hand_public_identity(result.get("model_identity"), configuration)
+        result["model_identity"] = identity
+        result["fingerprint"] = S.sha256_text(identity)
+        return result
+    except (InterruptedError, WorkspaceError):
+        raise
+    except Exception as exc:
+        try:
+            identity = _hand_public_identity(extractor.code_identity, configuration)
+        except Exception:
+            identity = None
+        return _empty_hand_result(
+            "failed", "hand_landmark_provider_failed", configuration,
+            identity=identity,
+            error=safe_failure_reason(exc, "hand_landmark_provider_failed"))
+
+
+def _uniform_hand_sample_keys(decoded: Sequence[Dict[str, Any]]) -> set[Tuple[str, str]]:
+    """Select a deterministic, whole-job hand sample instead of the first frames.
+
+    The owned hand worker loads a native runtime and the exact model for every
+    admitted frame.  Keeping this selection global and uniform bounds both the
+    native-process count and repeated model I/O while retaining coverage across
+    the full requested interval.
+    """
+    ordered = sorted(decoded, key=lambda item: int(item["frame_index"]))
+    count = min(len(ordered), MAX_HAND_KEYFRAMES)
+    if count == 0:
+        return set()
+    positions = ([0] if count == 1 else
+                 [(index * (len(ordered) - 1)) // (count - 1)
+                  for index in range(count)])
+    return {(str(ordered[position]["frame_index"]), ordered[position]["sha256"])
+            for position in positions}
+
+
+def _skipped_hand_result(extractor: Optional[HandLandmarkExtractor],
+                         configuration: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    identity = None
+    if extractor is not None:
+        try:
+            identity = _hand_public_identity(extractor.code_identity, configuration)
+        except Exception:
+            identity = None
+    return _empty_hand_result(
+        "not_run", reason, configuration, identity=identity)
+
+
+def _relation_subject_tracks(keyframes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Project unambiguous person-box tracks into the relation contract."""
+    projected = []
+    for track in _subject_tracks(keyframes):
+        if (track.get("kind") != "person"
+                or track.get("termination_reason") == "ambiguous_association"):
+            continue
+        observations = [{
+            "frame_index": point["frame_index"],
+            "pts": point["pts"],
+            "box_xyxy": point["box"],
+            "evidence_sha256": point["evidence_sha256"],
+        } for point in track.get("points") or [] if point.get("evidence_sha256")]
+        if observations:
+            projected.append({"subject_ref": track["subject_id"],
+                              "scene_index": track["scene_index"],
+                              "observations": observations})
+    return projected
+
+
+def _sparse_object_track_parameters(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Allow actual sampler strides while retaining a strict five-second bound."""
+    per_scene: Dict[int, List[int]] = {}
+    for frame in keyframes:
+        per_scene.setdefault(int(frame["scene_index"]), []).append(int(frame["frame_index"]))
+    missing = [right - left - 1 for values in per_scene.values()
+               for left, right in zip(sorted(set(values)), sorted(set(values))[1:])]
+    return {"max_gap_frames": max([2] + missing), "max_gap_seconds": 5.0,
+            "min_iou": 0.10, "max_centre_distance": 1.25,
+            "ambiguity_margin": 0.05}
+
+
+def _object_analysis(keyframes: List[Dict[str, Any]], job_id: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Bind sampled object observations to tracks and relation-only evidence."""
+    observations: List[Dict[str, Any]] = []
+    object_run_id = _module_run_id(job_id, "object")
+    for keyframe in sorted(keyframes, key=lambda item: (
+            item["scene_index"], int(item["frame_index"]))):
+        result = keyframe.get("object") or {}
+        if result.get("status") != "success":
+            continue
+        for detected in result.get("objects_detected") or []:
+            if len(observations) >= MAX_OBJECT_OBSERVATIONS:
+                raise WorkspaceError("ANALYSIS_LIMIT_EXCEEDED",
+                                     "Object observation budget was exceeded")
+            observations.append({
+                "scene_index": keyframe["scene_index"],
+                "frame_index": keyframe["frame_index"],
+                "pts": keyframe["timestamp"],
+                "class_id": detected["class_id"],
+                "class_label": detected["class_label"],
+                "box_xyxy": detected["box"],
+                "score": detected["score"],
+                "score_kind": detected.get("score_kind", "model_score_uncalibrated"),
+                "evidence_sha256": keyframe["evidence_sha256"],
+                "model_run_id": object_run_id,
+            })
+    detector_status = _aggregate_status(keyframes, "object")
+    if detector_status == "skipped":
+        detector_status = "not_run"
+    reason = _first_module_reason(keyframes, "object")
+    tracking_parameters = _sparse_object_track_parameters(keyframes)
+    if observations or detector_status in {"success", "partial"}:
+        tracking = build_object_tracks(observations, **tracking_parameters)
+        subjects = _relation_subject_tracks(keyframes)
+        relations = relation_evidence(tracking["tracks"], subjects)
+    else:
+        tracking = {"contract": TRACK_CONTRACT, "status": "not_run",
+                    "reason": reason or "object_observations_unavailable",
+                    "tracks": [], "observations": 0, "ambiguous_tracks": 0,
+                    "parameters": tracking_parameters,
+                    "scope": "sparse_observation_single_scene_same_class_geometric_association_only"}
+        relations = {"contract": RELATION_CONTRACT, "status": "not_run",
+                     "reason": reason or "object_observations_unavailable",
+                     "relations": [],
+                     "scope": "geometric_relation_candidates_not_action_recognition",
+                     "unsupported_action_assertions": [
+                         "pick_up", "put_down", "open", "close", "hand_over"]}
+    sampling = {
+        "contract": "object-observations-v1",
+        "status": detector_status,
+        "provider": OBJECT_PROVIDER,
+        "reason": reason,
+        "observations": observations,
+        "tracking": tracking,
+        "limits": {"per_keyframe": MAX_OBJECTS_PER_KEYFRAME,
+                   "global": MAX_OBJECT_OBSERVATIONS,
+                   "detector_max_per_keyframe": OBJECT_DETECTOR_MAX_OBJECTS},
+        "measurement_basis": "COCO-80 sampled-frame boxes plus same-scene geometric association",
+        "uncertainty": ("Objects, tracks and relations are unreviewed candidates; they do not establish "
+                        "identity, hand contact, support, state change, intent or action."),
+    }
+    return sampling, relations
+
+
+def _validate_object_analysis(sampling: Any, relations: Any, *,
+                              keyframes: List[Dict[str, Any]], job_id: str,
+                              model_runs: Sequence[Dict[str, Any]],
+                              evidence_hashes: set[str]) -> None:
+    """Recompute the deterministic sparse-object layer and verify provenance."""
+    try:
+        expected_sampling, expected_relations = _object_analysis(keyframes, job_id)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkspaceError("RECOVERY_REQUIRED",
+                             "Vision object analysis input is invalid") from exc
+    if sampling != _jsonable(expected_sampling) or relations != _jsonable(expected_relations):
+        raise WorkspaceError("RECOVERY_REQUIRED",
+                             "Vision object observations, tracks or relations are inconsistent")
+    object_run_id = _module_run_id(job_id, "object")
+    object_run = next((run for run in model_runs if run.get("id") == object_run_id), None)
+    allowed_object_identity = (
+        object_run is not None
+        and ((object_run.get("status") == "not_run"
+              and object_run.get("provider") == "unavailable"
+              and object_run.get("model_name") == OBJECT_PROVIDER)
+             or (object_run.get("provider") == "onnxruntime"
+                 and object_run.get("model_name") in {
+                     OBJECT_PROVIDER, "unverified_local_onnx"})))
+    if (object_run is None or not allowed_object_identity
+            or object_run.get("status") != _run_status(sampling["status"])
+            or object_run.get("input_sha256") != S.sha256_text(_keyframe_input(keyframes))):
+        raise WorkspaceError("RECOVERY_REQUIRED",
+                             "Vision object observations are not bound to their provider run")
+    expected_object_output = None
+    if object_run["status"] != "not_run":
+        expected_object_output = S.sha256_text(_frame_output(keyframes, "object"))
+    if object_run.get("output_sha256") != expected_object_output:
+        raise WorkspaceError("RECOVERY_REQUIRED",
+                             "Vision object provider output fingerprint is inconsistent")
+    for observation in sampling["observations"]:
+        if (observation.get("model_run_id") != object_run_id
+                or observation.get("evidence_sha256") not in evidence_hashes):
+            raise WorkspaceError("RECOVERY_REQUIRED",
+                                 "Vision object observation evidence is not registered")
+    for relation in relations.get("relations") or []:
+        if any(item not in evidence_hashes for item in relation.get("evidence_ids") or []):
+            raise WorkspaceError("RECOVERY_REQUIRED",
+                                 "Vision object relation evidence is not registered")
+        if "action" in relation:
+            raise WorkspaceError("RECOVERY_REQUIRED",
+                                 "Vision object relations must not assert action labels")
+    relation_run = next((run for run in model_runs
+                         if run.get("id") == _module_run_id(job_id, "object_relations")), None)
+    expected_relation_status = ("not_run" if relations["status"] == "not_run" else "success")
+    relation_input = {"basis": "sparse_sampled_object_and_subject_tracks",
+                      "object_tracking": sampling.get("tracking"),
+                      "subject_tracks": _relation_subject_tracks(keyframes)}
+    if (relation_run is None or relation_run.get("provider") != "trace-annotate"
+            or relation_run.get("model_name") != RELATION_CONTRACT
+            or relation_run.get("status") != expected_relation_status
+            or relation_run.get("input_sha256") != S.sha256_text(relation_input)):
+        raise WorkspaceError("RECOVERY_REQUIRED",
+                             "Vision object relations are not bound to their rule run")
+
+
+def _hand_coverage(keyframes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    results = [frame.get("hands") or {} for frame in keyframes]
+    omitted = sum(result.get("reason") == "hand_landmark_sampling_budget_exhausted"
+                  for result in results)
+    timed_out = sum(result.get("reason") == "hand_landmark_phase_timeout"
+                    for result in results)
+    return {
+        "sampling_policy": HAND_SAMPLING_POLICY,
+        "total_keyframes": len(results),
+        "admitted_keyframes": len(results) - omitted,
+        "successful_keyframes": sum(result.get("status") == "success"
+                                     for result in results),
+        "omitted_by_frame_budget": omitted,
+        "omitted_by_phase_timeout": timed_out,
+        "complete": omitted == 0 and timed_out == 0,
+    }
+
+
+def _validate_hand_analysis(keyframes: List[Dict[str, Any]], *, job_id: str,
+                            model_runs: Sequence[Dict[str, Any]],
+                            evidence_hashes: set[str], configuration: Dict[str, Any]) -> None:
+    """Validate observation-only hand evidence and its exact provider receipt."""
+    def invalid(message: str) -> None:
+        raise WorkspaceError("RECOVERY_REQUIRED", message)
+
+    configuration = _validate_hand_configuration(configuration)
+    run_id = _module_run_id(job_id, "hands")
+    run = next((item for item in model_runs if item.get("id") == run_id), None)
+    if run is None:
+        invalid("Current hand landmark contract requires a model-run receipt")
+    descriptor = configuration["model"]
+    available = descriptor["status"] == "available"
+    official = (available and descriptor.get("sha256") == HAND_WEIGHTS_SHA256
+                and descriptor.get("size_bytes") == str(HAND_MODEL_SIZE))
+    expected_status = _run_status(_aggregate_status(keyframes, "hands"))
+    expected_output = (None if expected_status == "not_run"
+                       else S.sha256_text(_frame_output(keyframes, "hands")))
+    if (run.get("provider") != ("mediapipe-tasks-cpu" if available else "unavailable")
+            or run.get("model_name") != (HAND_PROVIDER if official else "unverified_local_task")
+            or run.get("model_version") != ("float16/1" if official
+                                              else configuration["runtime_version"])
+            or run.get("weights_sha256") != (descriptor.get("sha256") if available else None)
+            or run.get("license") != (HAND_MODEL_LICENSE if official
+                                       else "unverified local weights")
+            or run.get("status") != expected_status
+            or run.get("input_sha256") != S.sha256_text(_keyframe_input(keyframes))
+            or run.get("output_sha256") != expected_output
+            or run.get("code_version") != f"vision_jobs={VERSION}; hands={HAND_CODE_VERSION}"
+            or run.get("score_kind") != "none"):
+        invalid("Hand landmark observations are not bound to their frozen provider run")
+    parameters = run.get("parameters") or {}
+    if (parameters.get("max_hands") != 4 or parameters.get("offline") is not True
+            or parameters.get("downloads_allowed") is not False
+            or parameters.get("authority") != "hand_keypoint_observations_only"
+            or parameters.get("cancellation_boundary") != HAND_CANCELLATION_BOUNDARY
+            or parameters.get("sampling_policy") != HAND_SAMPLING_POLICY
+            or parameters.get("max_frames_per_job") != MAX_HAND_KEYFRAMES
+            or parameters.get("phase_timeout_seconds") != HAND_PHASE_TIMEOUT_SECONDS
+            or parameters.get("coverage") != _hand_coverage(keyframes)
+            or parameters.get("unsupported_assertions") != list(HAND_UNSUPPORTED_ASSERTIONS)):
+        invalid("Hand landmark provider parameters are inconsistent")
+
+    result_fields = {
+        "status", "hands", "provider", "model_identity", "fingerprint",
+        "review_status", "authority", "unsupported_assertions", "cancellation_boundary"}
+    observation_fields = {
+        "contract", "observation_id", "scene_index", "frame_index", "pts",
+        "evidence_sha256", "pixel_sha256", "model_run_id", "hand_index",
+        "subject_ref", "landmark_names", "landmarks_normalized", "landmarks_pixel",
+        "world_landmarks_m", "box_xyxy", "outside_frame", "handedness_raw",
+        "handedness_score", "handedness_category_index", "handedness_score_kind",
+        "handedness_mirrored_input_assumption_verified", "review_status", "uncertainty"}
+    identity_fields = {
+        "provider", "model_name", "model_version", "model_source", "model_card",
+        "weights_size", "weights_sha256", "license", "license_source",
+        "runtime_license_source", "runtime_version", "code_version", "running_mode",
+        "max_hands", "offline", "downloads_allowed", "authority"}
+    if descriptor.get("path_identity_sha256") is not None:
+        identity_fields.add("path_identity_sha256")
+    observations_seen: set[str] = set()
+    model_fingerprints: set[str] = set()
+
+    def finite_triplets(points: Any) -> bool:
+        return (isinstance(points, list) and len(points) == 21
+                and all(isinstance(point, list) and len(point) == 3
+                        and all(not isinstance(value, bool)
+                                and isinstance(value, (int, float))
+                                and math.isfinite(float(value)) for value in point)
+                        for point in points))
+
+    for frame in keyframes:
+        result = frame.get("hands")
+        if not isinstance(result, dict):
+            invalid("Current hand landmark contract requires a result for every keyframe")
+        allowed_result_fields = result_fields | {"frame_identity", "reason", "error"}
+        if (not result_fields <= set(result) or set(result) - allowed_result_fields
+                or result["status"] not in {"success", "failed", "not_run"}
+                or result["provider"] != "hand_landmarks"
+                or result["review_status"] != "unreviewed"
+                or result["authority"] != "hand_keypoint_observations_only"
+                or result["unsupported_assertions"] != list(HAND_UNSUPPORTED_ASSERTIONS)
+                or result["cancellation_boundary"] != HAND_CANCELLATION_BOUNDARY
+                or not isinstance(result["hands"], list) or len(result["hands"]) > 4):
+            invalid("Hand landmark frame result is inconsistent")
+        if result["status"] == "success":
+            if "frame_identity" not in result or "reason" in result or "error" in result:
+                invalid("Successful hand landmark output has an invalid execution shape")
+        elif (result["hands"] or "frame_identity" in result
+              or not isinstance(result.get("reason"), str) or not result["reason"]):
+            invalid("Non-successful hand landmark output must be empty and explained")
+        identity = result["model_identity"]
+        if (not isinstance(identity, dict) or set(identity) != identity_fields
+                or "weights_path" in identity
+                or identity.get("runtime_version") != configuration["runtime_version"]
+                or identity.get("code_version") != HAND_CODE_VERSION
+                or identity.get("running_mode") != "IMAGE"
+                or identity.get("max_hands") != 4
+                or identity.get("offline") is not True
+                or identity.get("downloads_allowed") is not False
+                or identity.get("authority") != "hand_keypoint_observations_only"
+                or identity.get("path_identity_sha256")
+                != descriptor.get("path_identity_sha256")
+                or result["fingerprint"] != S.sha256_text(identity)):
+            invalid("Hand landmark result model identity is inconsistent")
+        identity_official = identity.get("weights_sha256") == HAND_WEIGHTS_SHA256
+        if identity_official and (not official
+                or identity.get("model_name") != HAND_PROVIDER
+                or identity.get("model_version") != "float16/1"
+                or identity.get("weights_size") != HAND_MODEL_SIZE
+                or identity.get("license") != HAND_MODEL_LICENSE
+                or identity.get("model_source") != HAND_MODEL_URL
+                or identity.get("model_card") != HAND_MODEL_CARD
+                or identity.get("license_source") != HAND_LICENSE_SOURCE):
+            invalid("Hand landmark result falsely declares the official model")
+        if result["status"] == "success" and not identity_official:
+            invalid("Successful hand landmarks require the exact frozen official model")
+        model_fingerprints.add(result["fingerprint"])
+        frame_identity = result.get("frame_identity")
+        if frame_identity is not None:
+            if (not isinstance(frame_identity, dict)
+                    or set(frame_identity) != {"scene_index", "frame_index", "pts",
+                                               "evidence_sha256", "pixel_sha256",
+                                               "model_run_id", "shape"}
+                    or frame_identity["scene_index"] != frame.get("scene_index")
+                    or frame_identity["frame_index"] != frame.get("frame_index")
+                    or frame_identity["pts"] != frame.get("timestamp")
+                    or frame_identity["evidence_sha256"] != frame.get("evidence_sha256")
+                    or frame_identity["evidence_sha256"] not in evidence_hashes
+                    or frame_identity["model_run_id"] != run_id
+                    or not isinstance(frame_identity["pixel_sha256"], str)
+                    or S.HASH_RE.fullmatch(frame_identity["pixel_sha256"]) is None
+                    or not isinstance(frame_identity["shape"], list)
+                    or len(frame_identity["shape"]) != 3
+                    or any(type(value) is not int or value <= 0
+                           for value in frame_identity["shape"])
+                    or frame_identity["shape"][2] != 3):
+                invalid("Hand landmark frame identity is inconsistent")
+        for hand_index, observation in enumerate(result["hands"]):
+            if (not isinstance(observation, dict) or set(observation) != observation_fields
+                    or observation["contract"] != HAND_EVIDENCE_CONTRACT
+                    or observation["scene_index"] != frame.get("scene_index")
+                    or observation["frame_index"] != frame.get("frame_index")
+                    or observation["pts"] != frame.get("timestamp")
+                    or observation["evidence_sha256"] != frame.get("evidence_sha256")
+                    or observation["evidence_sha256"] not in evidence_hashes
+                    or observation["model_run_id"] != run_id
+                    or observation["hand_index"] != hand_index
+                    or observation["subject_ref"] is not None
+                    or observation["landmark_names"] != list(HAND_LANDMARK_NAMES)
+                    or not finite_triplets(observation["landmarks_normalized"])
+                    or not finite_triplets(observation["landmarks_pixel"])
+                    or not finite_triplets(observation["world_landmarks_m"])
+                    or not isinstance(observation["pixel_sha256"], str)
+                    or S.HASH_RE.fullmatch(observation["pixel_sha256"]) is None
+                    or frame_identity is None
+                    or observation["pixel_sha256"] != frame_identity["pixel_sha256"]
+                    or not isinstance(observation["box_xyxy"], list)
+                    or len(observation["box_xyxy"]) != 4
+                    or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                           or not math.isfinite(float(value)) for value in observation["box_xyxy"])
+                    or observation["box_xyxy"][2] <= observation["box_xyxy"][0]
+                    or observation["box_xyxy"][3] <= observation["box_xyxy"][1]
+                    or type(observation["outside_frame"]) is not bool
+                    or observation["handedness_raw"] not in {"Left", "Right"}
+                    or isinstance(observation["handedness_score"], bool)
+                    or not isinstance(observation["handedness_score"], (int, float))
+                    or not math.isfinite(float(observation["handedness_score"]))
+                    or not 0 <= float(observation["handedness_score"]) <= 1
+                    or (observation["handedness_category_index"] is not None
+                        and (type(observation["handedness_category_index"]) is not int
+                             or observation["handedness_category_index"] < 0))
+                    or observation["handedness_score_kind"]
+                    != "mediapipe_category_score_uncalibrated"
+                    or observation["handedness_mirrored_input_assumption_verified"] is not False
+                    or observation["review_status"] != "unreviewed"
+                    or not isinstance(observation["uncertainty"], str)
+                    or not observation["uncertainty"]):
+                invalid("Hand landmark observation identity or geometry is inconsistent")
+            observation_identity = {
+                "scene_index": observation["scene_index"],
+                "frame_index": observation["frame_index"], "pts": observation["pts"],
+                "evidence_sha256": observation["evidence_sha256"],
+                "pixel_sha256": observation["pixel_sha256"],
+                "model_run_id": observation["model_run_id"],
+                "hand_index": observation["hand_index"],
+            }
+            encoded = json.dumps(observation_identity, ensure_ascii=True, sort_keys=True,
+                                 separators=(",", ":"), allow_nan=False).encode("ascii")
+            expected_id = "handobs-" + hashlib.sha256(encoded).hexdigest()[:40]
+            if observation["observation_id"] != expected_id or expected_id in observations_seen:
+                invalid("Hand landmark observation id is inconsistent or duplicated")
+            observations_seen.add(expected_id)
+    if len(model_fingerprints) > 1:
+        invalid("Hand landmark model identity changed within one candidate")
 
 
 def _expressive_result(measured: Dict[str, Any], keyframe: Dict[str, Any]) -> Dict[str, Any]:
@@ -1027,10 +2402,371 @@ def _run_ocr(frame: Any, ocr_extractor: Optional[OCRExtractor]) -> Dict[str, Any
     try:
         result = ocr_extractor.extract_text(frame)
     except Exception as exc:
-        return {"status": "failed", "error": str(exc)}
+        return {"status": "failed",
+                "error": safe_failure_reason(exc, "ocr_inference_failed")}
     result.setdefault("status", "not_run" if ocr_extractor.engine is None else "success")
     if result["status"] == "not_run":
         result.setdefault("reason", "ocr_runtime_unavailable")
+    return result
+
+
+def _spread(items: Sequence[Any], limit: int) -> List[Any]:
+    """Choose a deterministic cross-section without favouring only the start."""
+    values = list(items)
+    if limit <= 0 or not values:
+        return []
+    if len(values) <= limit:
+        return values
+    if limit == 1:
+        return [values[len(values) // 2]]
+    indices = []
+    for position in range(limit):
+        index = (position * (len(values) - 1)) // (limit - 1)
+        if index not in indices:
+            indices.append(index)
+    return [values[index] for index in indices]
+
+
+def _build_portable_visual_projection(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the bounded visual subset carried by a professional task.
+
+    The full object/relationship/hand result remains the durable vision-job
+    artifact.  This plan is deterministic, contains no host paths and reports
+    every omission rather than implying that its small portable cross-section
+    is complete.
+    """
+    scene_payloads: Dict[int, Dict[str, Any]] = {}
+    sampling = candidate.get("object_sampling") or {}
+    tracking = sampling.get("tracking") or {}
+    tracks = sorted((tracking.get("tracks") or []), key=lambda item: (
+        int(item.get("scene_index", 0)),
+        int((item.get("observations") or [{"frame_index": "0"}])[0]["frame_index"]),
+        str(item.get("track_id", ""))))
+    track_scenes = {str(track.get("track_id")): int(track.get("scene_index", 0))
+                    for track in tracks}
+    object_rows: List[Dict[str, Any]] = []
+    object_frames: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+    for track in tracks:
+        scene_index = int(track.get("scene_index", 0))
+        for observation in track.get("observations") or []:
+            digest = observation.get("evidence_id")
+            if not isinstance(digest, str):
+                continue
+            sample = {"frame_index": str(observation.get("frame_index")),
+                      "pts": observation.get("pts"), "evidence_sha256": digest}
+            key = (scene_index, sample["frame_index"], digest)
+            object_frames.setdefault(key, {"scene_index": scene_index, **sample})
+            object_rows.append({
+                "scene_index": scene_index,
+                "observation_id": observation.get("observation_id"),
+                "track_id": track.get("track_id"),
+                "frame_index": sample["frame_index"], "pts": sample["pts"],
+                "evidence_sha256": digest,
+                "class_id": observation.get("class_id"),
+                "class_label": observation.get("class_label"),
+                "box_xyxy": observation.get("box_xyxy"),
+                "score": observation.get("score"),
+                "score_kind": observation.get("score_kind"),
+            })
+    ordered_object_frames = sorted(object_frames.values(), key=lambda item: (
+        item["scene_index"], int(item["frame_index"]), item["evidence_sha256"]))
+    selected_object_frames = _spread(
+        ordered_object_frames, PORTABLE_OBJECT_EVIDENCE_FRAMES)
+    selected_object_keys = {(item["scene_index"], item["frame_index"],
+                             item["evidence_sha256"]) for item in selected_object_frames}
+    projected_objects = [item for item in object_rows
+                         if (item["scene_index"], item["frame_index"],
+                             item["evidence_sha256"]) in selected_object_keys]
+    projected_objects = _spread(projected_objects, PORTABLE_OBJECT_OBSERVATIONS)
+    selected_track_ids = {item["track_id"] for item in projected_objects}
+    projected_tracks = _spread(
+        [track for track in tracks if track.get("track_id") in selected_track_ids],
+        PORTABLE_OBJECT_TRACKS)
+    for scene_index in sorted({item["scene_index"] for item in projected_objects}):
+        observations = [item for item in projected_objects
+                        if item["scene_index"] == scene_index]
+        scene_tracks = []
+        for track in projected_tracks:
+            if int(track.get("scene_index", -1)) != scene_index:
+                continue
+            values = track.get("observations") or []
+            scene_tracks.append({
+                "track_id": track.get("track_id"), "class_id": track.get("class_id"),
+                "class_label": track.get("class_label"),
+                "observation_count": len(values),
+                "start_frame": values[0].get("frame_index") if values else None,
+                "end_frame": values[-1].get("frame_index") if values else None,
+                "ambiguity": track.get("ambiguity"),
+                "ambiguity_reason": track.get("ambiguity_reason"),
+                "termination_reason": track.get("termination_reason"),
+            })
+        samples = [{key: item[key] for key in ("frame_index", "pts", "evidence_sha256")}
+                   for item in selected_object_frames if item["scene_index"] == scene_index]
+        total_observations = sum(len(track.get("observations") or []) for track in tracks
+                                 if int(track.get("scene_index", -1)) == scene_index)
+        total_tracks = sum(1 for track in tracks
+                           if int(track.get("scene_index", -1)) == scene_index)
+        scene_payloads.setdefault(scene_index, {})["object"] = {
+            "source_contract": sampling.get("contract"),
+            "tracking_contract": tracking.get("contract"),
+            "scene_index": scene_index,
+            "sample_frames": samples,
+            "observations": observations,
+            "tracks": scene_tracks,
+            "projection": {
+                "total_observations": total_observations,
+                "projected_observations": len(observations),
+                "omitted_observations": total_observations - len(observations),
+                "total_tracks": total_tracks,
+                "projected_tracks": len(scene_tracks),
+                "omitted_tracks": total_tracks - len(scene_tracks),
+                "projection_complete": (total_observations == len(observations)
+                                        and total_tracks == len(scene_tracks)),
+                "omission_reason": (None if total_observations == len(observations)
+                                    and total_tracks == len(scene_tracks)
+                                    else "portable_projection_budget"),
+            },
+            "authority": "unreviewed_sampled_detector_and_geometric_association_only",
+        }
+
+    source_relations = list((candidate.get("object_relations") or {}).get("relations") or [])
+    relation_rows = []
+    for relation in _spread(source_relations, PORTABLE_RELATION_CANDIDATES):
+        safe_name = SAFE_RELATION_NAMES.get(relation.get("relation"))
+        scene_index = track_scenes.get(str(relation.get("object_ref")))
+        if safe_name is None or scene_index is None:
+            continue
+        projected_samples = []
+        for sample in relation.get("samples") or []:
+            evidence = sample.get("evidence_ids") or []
+            if not evidence:
+                continue
+            projected_samples.append({
+                "scene_index": scene_index,
+                "frame_index": str(sample.get("frame_index")),
+                "pts": sample.get("pts"), "evidence_sha256": evidence[0],
+                "object_box": sample.get("object_box"),
+                "subject_box": sample.get("subject_box"),
+                "edge_gap": sample.get("edge_gap"),
+            })
+        relation_rows.append((relation, safe_name, scene_index, projected_samples))
+    relation_frame_map: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+    for _, _, _, values in relation_rows:
+        for item in values:
+            key = (item["scene_index"], item["frame_index"], item["evidence_sha256"])
+            relation_frame_map.setdefault(key, {key: item[key] for key in (
+                "scene_index", "frame_index", "pts", "evidence_sha256")})
+    selected_relation_frames = _spread(
+        sorted(relation_frame_map.values(), key=lambda item: (
+            item["scene_index"], int(item["frame_index"]), item["evidence_sha256"])),
+        PORTABLE_RELATION_EVIDENCE_FRAMES)
+    selected_relation_keys = {(item["scene_index"], item["frame_index"],
+                               item["evidence_sha256"]) for item in selected_relation_frames}
+    projected_relations: Dict[int, List[Dict[str, Any]]] = {}
+    for relation, safe_name, scene_index, values in relation_rows:
+        samples = [item for item in values if (
+            item["scene_index"], item["frame_index"], item["evidence_sha256"])
+            in selected_relation_keys]
+        if not samples:
+            continue
+        projected_relations.setdefault(scene_index, []).append({
+            "relation_candidate": safe_name,
+            "subject_ref": relation.get("subject_ref"),
+            "object_ref": relation.get("object_ref"),
+            "recipient_ref": relation.get("recipient_ref"),
+            "start_frame": relation.get("start_frame"),
+            "end_frame": relation.get("end_frame"),
+            "window_pts": relation.get("window_pts"),
+            "score": relation.get("score"),
+            "score_kind": relation.get("score_kind"),
+            "review_status": relation.get("review_status"),
+            "samples": samples,
+            "source_uncertainty": relation.get("uncertainty"),
+        })
+    for scene_index, relations in projected_relations.items():
+        total = sum(1 for relation in source_relations
+                    if track_scenes.get(str(relation.get("object_ref"))) == scene_index)
+        samples = [{key: item[key] for key in ("frame_index", "pts", "evidence_sha256")}
+                   for item in selected_relation_frames if item["scene_index"] == scene_index]
+        scene_payloads.setdefault(scene_index, {})["relations"] = {
+            "source_contract": (candidate.get("object_relations") or {}).get("contract"),
+            "scene_index": scene_index, "sample_frames": samples,
+            "relation_candidates": relations,
+            "projection": {"total_relations": total,
+                           "projected_relations": len(relations),
+                           "omitted_relations": total - len(relations),
+                           "projection_complete": total == len(relations),
+                           "omission_reason": (None if total == len(relations)
+                                               else "portable_projection_budget")},
+            "authority": "geometric_relation_candidates_not_action_recognition",
+        }
+
+    hand_rows = []
+    hand_frames: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+    for frame in sorted(candidate.get("keyframes") or [], key=lambda item: (
+            int(item.get("scene_index", 0)), int(item.get("frame_index", 0)))):
+        result = frame.get("hands") or {}
+        if result.get("status") != "success":
+            continue
+        scene_index = int(frame.get("scene_index", 0))
+        for observation in result.get("hands") or []:
+            digest = observation.get("evidence_sha256")
+            if not isinstance(digest, str):
+                continue
+            sample = {"scene_index": scene_index,
+                      "frame_index": str(observation.get("frame_index")),
+                      "pts": observation.get("pts"), "evidence_sha256": digest}
+            key = (scene_index, sample["frame_index"], digest)
+            hand_frames.setdefault(key, sample)
+            hand_rows.append((sample, _jsonable(observation)))
+    selected_hand_frames = _spread(
+        sorted(hand_frames.values(), key=lambda item: (
+            item["scene_index"], int(item["frame_index"]), item["evidence_sha256"])),
+        PORTABLE_HAND_EVIDENCE_FRAMES)
+    selected_hand_keys = {(item["scene_index"], item["frame_index"],
+                           item["evidence_sha256"]) for item in selected_hand_frames}
+    projected_hands = _spread(
+        [(sample, observation) for sample, observation in hand_rows if (
+            sample["scene_index"], sample["frame_index"], sample["evidence_sha256"])
+         in selected_hand_keys], PORTABLE_HAND_OBSERVATIONS)
+    for scene_index in sorted({sample["scene_index"] for sample, _ in projected_hands}):
+        observations = [observation for sample, observation in projected_hands
+                        if sample["scene_index"] == scene_index]
+        samples = [{key: item[key] for key in ("frame_index", "pts", "evidence_sha256")}
+                   for item in selected_hand_frames if item["scene_index"] == scene_index]
+        total = sum(1 for sample, _ in hand_rows if sample["scene_index"] == scene_index)
+        scene_payloads.setdefault(scene_index, {})["hands"] = {
+            "source_contract": HAND_EVIDENCE_CONTRACT,
+            "scene_index": scene_index, "sample_frames": samples,
+            "observations": observations,
+            "projection": {"total_observations": total,
+                           "projected_observations": len(observations),
+                           "omitted_observations": total - len(observations),
+                           "projection_complete": total == len(observations),
+                           "omission_reason": (None if total == len(observations)
+                                               else "portable_projection_budget")},
+            "authority": "hand_keypoint_observations_only",
+            "unsupported_assertions": list(HAND_UNSUPPORTED_ASSERTIONS),
+        }
+
+    total_counts = {
+        "object_observations": sum(len(track.get("observations") or []) for track in tracks),
+        "object_tracks": len(tracks), "relation_candidates": len(source_relations),
+        "hand_observations": len(hand_rows),
+    }
+    if not any(total_counts.values()):
+        return {"manifest": None, "scenes": {}}
+
+    admitted: Dict[int, Dict[str, Any]] = {}
+    used_bytes = 0
+    for scene_index in sorted(scene_payloads):
+        for module in ("object", "relations", "hands"):
+            value = scene_payloads[scene_index].get(module)
+            if value is None:
+                continue
+            size = len(S.canonical_json(value))
+            if used_bytes + size > PORTABLE_VISUAL_PROJECTION_BYTES:
+                continue
+            admitted.setdefault(scene_index, {})[module] = value
+            used_bytes += size
+    projected_counts = {
+        "object_observations": sum(len(value["object"]["observations"])
+            for value in admitted.values() if "object" in value),
+        "object_tracks": sum(len(value["object"]["tracks"])
+            for value in admitted.values() if "object" in value),
+        "relation_candidates": sum(len(value["relations"]["relation_candidates"])
+            for value in admitted.values() if "relations" in value),
+        "hand_observations": sum(len(value["hands"]["observations"])
+            for value in admitted.values() if "hands" in value),
+    }
+    evidence_keys = set()
+    for scene_index, value in admitted.items():
+        for module in ("object", "relations", "hands"):
+            for sample in (value.get(module) or {}).get("sample_frames", []):
+                evidence_keys.add((scene_index, sample["frame_index"],
+                                   sample["evidence_sha256"]))
+    complete = total_counts == projected_counts
+    manifest = {
+        "raw_candidate_sha256": S.sha256_text(candidate),
+        "source_job_id": candidate.get("job_id"),
+        "full_result_scope": "local_durable_vision_job_and_project_backup_not_embedded",
+        "totals": total_counts,
+        "projected": projected_counts,
+        "omitted": {key: total_counts[key] - projected_counts[key] for key in total_counts},
+        "projection_complete": complete,
+        "omission_reason": None if complete else "portable_projection_budget",
+        "limits": {"canonical_parameter_bytes": PORTABLE_VISUAL_PROJECTION_BYTES,
+                   "used_parameter_bytes": used_bytes,
+                   "evidence_frames": PORTABLE_VISUAL_EVIDENCE_FRAMES,
+                   "used_evidence_frames": len(evidence_keys),
+                   "object_observations": PORTABLE_OBJECT_OBSERVATIONS,
+                   "object_tracks": PORTABLE_OBJECT_TRACKS,
+                   "relation_candidates": PORTABLE_RELATION_CANDIDATES,
+                   "hand_observations": PORTABLE_HAND_OBSERVATIONS},
+    }
+    return {"manifest": manifest,
+            "scenes": {str(index): admitted[index] for index in sorted(admitted)}}
+
+
+def _portable_projection_claims(candidate: Dict[str, Any], index: int,
+                                window: Dict[str, Any],
+                                projection: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not projection:
+        return []
+    job_id = candidate["job_id"]
+    result: List[Dict[str, Any]] = []
+
+    def claim(*, token: str, claim_type: str, statement: str, method_id: str,
+              parameters: Dict[str, Any], model_run_id: Optional[str],
+              uncertainty: str) -> Dict[str, Any]:
+        return {"id": S.make_id("clm", f"{job_id}:{index}:{token}"),
+                "claim_type": claim_type, "statement": statement,
+                "subject_ref": None, "object_ref": None, "recipient_ref": None,
+                "time_window": window, "evidence_ids": [],
+                "method": {"id": method_id, "version": "1", "parameters": parameters},
+                "model_run_id": model_run_id, "score": None, "score_kind": "none",
+                "measurement": None, "uncertainty_reason": uncertainty}
+
+    manifest = projection.get("manifest")
+    if index == 0 and manifest is not None:
+        result.append(claim(
+            token="portable-projection-manifest", claim_type="unspecified",
+            statement=("专业 JSON 仅携带视觉作业的有界、可核验证据投影；完整模型结果仍保存在"
+                       "本地持久化作业与项目备份中。"),
+            method_id="visual-candidate-projection-manifest-v1",
+            parameters=manifest, model_run_id=None,
+            uncertainty="该清单声明可移植投影的损失范围，不是对视频内容的事实判断。"))
+    scene = (projection.get("scenes") or {}).get(str(index), {})
+    if "object" in scene:
+        value = scene["object"]
+        result.append(claim(
+            token="portable-object-observations", claim_type="observable",
+            statement=(f"COCO-80 检测器在该镜头的抽样帧返回 "
+                       f"{len(value['observations'])} 个未复核框候选；稀疏几何关联不代表身份或持续跟踪。"),
+            method_id="object-observation-projection-v1", parameters=value,
+            model_run_id=_module_run_id(job_id, "object"),
+            uncertainty=("物体框可能误检或漏检；轨迹仅连接同场景、同类别的稀疏抽样框，"
+                         "不证明对象身份、接触、支撑、状态变化、意图或动作。")))
+    if "relations" in scene:
+        value = scene["relations"]
+        result.append(claim(
+            token="portable-relation-candidates", claim_type="unspecified",
+            statement=(f"几何规则在该镜头返回 {len(value['relation_candidates'])} 条未复核关系候选；"
+                       "安全名称仅描述框距离或图像平面运动，不构成动作识别。"),
+            method_id="object-relation-candidate-projection-v1", parameters=value,
+            model_run_id=_module_run_id(job_id, "object_relations"),
+            uncertainty=("候选缺少手部接触、支撑、遮挡和状态变化证据；不得据此声称拿起、"
+                         "放下、打开、关闭、递交、抓握、持有或控制转移。")))
+    if "hands" in scene:
+        value = scene["hands"]
+        result.append(claim(
+            token="portable-hand-landmarks", claim_type="observable",
+            statement=(f"固定手部关键点提供器在该镜头抽样帧返回 "
+                       f"{len(value['observations'])} 条未复核的 21 点观测。"),
+            method_id="hand-landmark-observation-projection-v1", parameters=value,
+            model_run_id=_module_run_id(job_id, "hands"),
+            uncertainty=("关键点与原始左右手分类均为未校准模型输出，输入镜像假设未验证；"
+                         "不能推出触碰、抓握、持有、动作或人物身份。")))
     return result
 
 
@@ -1039,6 +2775,7 @@ def _limit_global_claims(candidate):
     discovery = (candidate.get("boundary_sampling") or {}).get("global_discovery")
     if not discovery or discovery.get("status") != "success":
         return
+    projection = _build_portable_visual_projection(candidate)
     for index, scene in enumerate(candidate["scenes"]):
         frame = next((f for f in candidate["keyframes"] if f["scene_index"] == index), None)
         if frame is None:
@@ -1047,7 +2784,8 @@ def _limit_global_claims(candidate):
         global_events = [e for e in events if e.get("metrics", {}).get("analysis_scope") == "full_range"]
         while global_events:
             claims = _candidate_claims(candidate, index, scene, _seconds_ratio(scene["start"]),
-                                       _seconds_ratio(scene["end"]), frame)["claims"]
+                                       _seconds_ratio(scene["end"]), frame,
+                                       projection=projection)["claims"]
             if len(claims) <= SS.MAX_CLAIMS:
                 break
             removed = global_events.pop()
@@ -1063,7 +2801,8 @@ def _run_clip(frame: Any, clip_extractor: Optional[CLIPExtractor]) -> Dict[str, 
     try:
         result = clip_extractor.classify(frame)
     except Exception as exc:
-        return {"status": "failed", "error": str(exc)}
+        return {"status": "failed",
+                "error": safe_failure_reason(exc, "clip_inference_failed")}
     return result
 
 
@@ -1073,7 +2812,9 @@ def _run_vlm(frame: Any, vlm_extractor: Optional[VLMExtractor]) -> Dict[str, Any
     try:
         result = vlm_extractor.caption(frame)
     except Exception as exc:
-        return {"status": "failed", "error": str(exc), "caption": ""}
+        return {"status": "failed",
+                "error": safe_failure_reason(exc, "vlm_inference_failed"),
+                "caption": ""}
     return result
 
 
@@ -1174,7 +2915,9 @@ class VisionJobs:
                  slot_wait_seconds: float = 900, face_model_path: Optional[str] = None,
                  clip_model_path: Optional[str] = None, vlm_model_path: Optional[str] = None,
                  person_model_path: Optional[str] = None, landmark_model_path: Optional[str] = None,
-                 landmark_python: Optional[str] = None):
+                 landmark_python: Optional[str] = None,
+                 hand_model_path: Optional[str] = None,
+                 action_video_model_path: Optional[str] = None):
         for value in (poll_seconds, slot_wait_seconds):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise SchemaInvalid("SCHEMA_INVALID", "Vision waits must be finite positive seconds")
@@ -1199,6 +2942,11 @@ class VisionJobs:
         self.person_model_path = person_model_path if person_model_path is not None else os.getenv("TRACE_ANNOTATE_PERSON_MODEL")
         self.landmark_model_path = landmark_model_path if landmark_model_path is not None else os.getenv("TRACE_ANNOTATE_LANDMARK_MODEL")
         self.landmark_python = landmark_python if landmark_python is not None else os.getenv("TRACE_ANNOTATE_LANDMARK_PYTHON")
+        self.hand_model_path = (hand_model_path if hand_model_path is not None
+                                else os.getenv("TRACE_ANNOTATE_HAND_MODEL"))
+        self.action_video_model_path = (
+            action_video_model_path if action_video_model_path is not None
+            else os.getenv("TRACE_ANNOTATE_ACTION_VIDEO_MODEL"))
         self._loaded_optional_config = None
         self._extractors = None
         self._extractor_error = None
@@ -1217,6 +2965,12 @@ class VisionJobs:
         return OV.provider_config(person_model=self.person_model_path or "",
                                   landmark_model=self.landmark_model_path or "",
                                   landmark_python=self.landmark_python or "")
+
+    def _hand_config(self) -> Dict[str, Any]:
+        return _hand_configuration(self.hand_model_path)
+
+    def _action_video_config(self) -> Dict[str, Any]:
+        return _action_video_configuration(self.action_video_model_path)
 
     def is_closing(self) -> bool:
         return self._closing.is_set() or (self._external_closing is not None and self._external_closing.is_set())
@@ -1243,6 +2997,11 @@ class VisionJobs:
                 ready = instance is not None and instance.detector is not None
             elif key == "ocr":
                 ready = instance is not None and instance.engine is not None
+            elif key == "hands":
+                identity = instance.code_identity if instance is not None else {}
+                ready = (instance is not None
+                         and getattr(instance, "_status", None) == "success"
+                         and identity.get("weights_sha256") == HAND_WEIGHTS_SHA256)
             else:
                 ready = instance is not None and instance.model is not None
             return "loaded" if ready else "unavailable"
@@ -1254,6 +3013,9 @@ class VisionJobs:
             "clip": adapter_state("clip"),
             "vlm": adapter_state("vlm"),
             "person": adapter_state("person"),
+            "object": adapter_state("object"),
+            "hands": adapter_state("hands"),
+            "action_video": self._action_video_config()["status"],
             "landmarks": ("not_loaded" if self.landmark_model_path and self.landmark_python else "unavailable"),
         }
         return {"operation": OPERATION, "version": VERSION, "domain": DOMAIN,
@@ -1267,6 +3029,8 @@ class VisionJobs:
         S.require_id(command_id)
         parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config(),
                                  model_resources=self._model_config(),
+                                 hand_configuration=self._hand_config(),
+                                 action_video_configuration=self._action_video_config(),
                                  execution_deployment=self._execution_config())
         items = [{"task_id": task_id, "expected_revision": expected_revision, "expected_sha256": expected_sha256}]
         request = {"kind": "queue.create_batch", "items": items, "operation": OPERATION,
@@ -1296,6 +3060,8 @@ class VisionJobs:
         S.require_id(command_id)
         parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config(),
                                  model_resources=self._model_config(),
+                                 hand_configuration=self._hand_config(),
+                                 action_video_configuration=self._action_video_config(),
                                  execution_deployment=self._execution_config())
         if not isinstance(items, list) or not items:
             raise SchemaInvalid("SCHEMA_INVALID", "Vision batch needs at least one task")
@@ -1346,9 +3112,10 @@ class VisionJobs:
         so one broken adapter never disables the other extractors.
         """
         optional = self._optional_config()
-        if self._extractors is not None and self._loaded_optional_config == optional:
+        loaded_configuration = {"optional": optional, "hands": self._hand_config()}
+        if self._extractors is not None and self._loaded_optional_config == loaded_configuration:
             return
-        self._loaded_optional_config = optional
+        self._loaded_optional_config = loaded_configuration
         # CLIP and VLM always run in owned child processes.  A local Face/OCR
         # constructor failure must not silently switch those modules back to
         # the legacy in-process path or omit their execution receipts.
@@ -1358,10 +3125,16 @@ class VisionJobs:
             ocr = OCRExtractor(thresholds=thresholds)
             person = PersonExtractor(model_path=optional["person"]["model_path"],
                                      expected_sha256=optional["person"]["weights_sha256"])
-            self._extractors = {"face": face, "ocr": ocr, "clip": None, "vlm": None, "person": person}
+            objects = ObjectExtractor(model_path=optional["person"]["model_path"],
+                                      expected_sha256=optional["person"]["weights_sha256"])
+            hands = HandLandmarkExtractor(model_path=self.hand_model_path)
+            self._extractors = {"face": face, "ocr": ocr, "clip": None, "vlm": None,
+                                "person": person, "object": objects, "hands": hands}
         except Exception as exc:
-            self._extractor_error = str(exc)
-            self._extractors = {"face": None, "ocr": None, "clip": None, "vlm": None, "person": None}
+            self._extractor_error = safe_failure_reason(
+                exc, "extractor_initialization_failed")
+            self._extractors = {"face": None, "ocr": None, "clip": None, "vlm": None,
+                                "person": None, "object": None, "hands": None}
 
     def _processor(self, job: Dict[str, Any], context: Any) -> Dict[str, Any]:
         parameters = _validate_job(job)
@@ -1418,6 +3191,8 @@ class VisionJobs:
                 deployment = self._execution_config()
                 if parameters["job_identity"] != _job_identity(
                         optional_providers=self._optional_config(), model_resources=resources,
+                        hand_configuration=self._hand_config(),
+                        action_video_configuration=self._action_video_config(),
                         execution_deployment=deployment):
                     raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
                                          "Legacy or changed execution deployment; resubmit a new vision job")
@@ -1425,6 +3200,8 @@ class VisionJobs:
                 self._load_extractors(thresholds)
                 if parameters["job_identity"] != _job_identity(
                         optional_providers=self._optional_config(), model_resources=resources,
+                        hand_configuration=self._hand_config(),
+                        action_video_configuration=self._action_video_config(),
                         execution_deployment=deployment):
                     raise WorkspaceError("VISION_RESUBMIT_REQUIRED", "Optional provider configuration changed while loading; resubmit")
                 extractors = self._extractors or {"face": None, "ocr": None, "clip": None}
@@ -1434,6 +3211,8 @@ class VisionJobs:
                 keyframes: List[Dict[str, Any]] = []
                 scene_frames: Dict[int, List[Dict[str, Any]]] = {}
                 motion_by_scene: Dict[int, Dict[str, Any]] = {}
+                hand_configuration = parameters["job_identity"]["config"].get("hand_landmarks")
+                action_video_configuration = parameters["job_identity"]["config"].get("action_video")
 
                 def flush_scene(index: int) -> None:
                     samples = scene_frames.pop(index, None)
@@ -1453,6 +3232,8 @@ class VisionJobs:
                     end = S.rational_value(window["end"])
                     scenes = [scene for scene in scenes
                               if scene["end"] > start and scene["start"] < end]
+                action_video_inputs: Dict[int, List[Dict[str, Any]]] = {
+                    index: [] for index in range(len(scenes))}
                 if scene_result["status"] == "success" and scenes:
                     boundary_seconds = [scene["start"] for scene in scenes]
                     boundaries = VS.boundary_indices(self.store, job["media_snapshot"]["id"], boundary_seconds)
@@ -1463,6 +3244,16 @@ class VisionJobs:
                     decoded = VS.decode_samples(
                         self.store, job["media_snapshot"]["id"], plan, work / "samples",
                         cancelled=cancelled, ffmpeg=ffmpeg)
+                    hand_is_native = bool(
+                        hand_configuration is not None
+                        and hand_configuration["model"]["status"] == "available")
+                    hand_sample_keys = (_uniform_hand_sample_keys(decoded["decoded"])
+                                        if hand_is_native else
+                                        {(str(item["frame_index"]), item["sha256"])
+                                         for item in decoded["decoded"]})
+                    hand_phase_deadline = (
+                        time.monotonic() + HAND_PHASE_TIMEOUT_SECONDS
+                        if hand_is_native else None)
                     sampling = {"frame_map_sha256": plan["frame_map_sha256"],
                                 "truncated": plan["truncated"],
                                 "planned": plan["planned"], "returned": plan["returned"],
@@ -1480,8 +3271,43 @@ class VisionJobs:
                             flush_scene(active_scene)
                         active_scene = scene_index
                         frame = _load_frame(Path(item["path"]))
+                        timestamp = _seconds_ratio(seconds)
                         face_result = _run_face(frame, extractors["face"])
                         person_result = _run_person(frame, extractors.get("person"))
+                        object_result = _run_object(frame, extractors.get("object"))
+                        hand_result = None
+                        if hand_configuration is not None:
+                            hand_extractor = extractors.get("hands")
+                            hand_key = (str(item["frame_index"]), item["sha256"])
+                            if hand_key not in hand_sample_keys:
+                                hand_result = _skipped_hand_result(
+                                    hand_extractor, hand_configuration,
+                                    "hand_landmark_sampling_budget_exhausted")
+                            elif (hand_phase_deadline is not None
+                                  and time.monotonic() >= hand_phase_deadline):
+                                hand_result = _skipped_hand_result(
+                                    hand_extractor, hand_configuration,
+                                    "hand_landmark_phase_timeout")
+                            else:
+                                def hand_cancelled() -> bool:
+                                    return (cancelled()
+                                            or hand_phase_deadline is not None
+                                            and time.monotonic() >= hand_phase_deadline)
+                                try:
+                                    hand_result = _run_hands(
+                                        frame, hand_extractor, scene_index=scene_index,
+                                        frame_index=item["frame_index"], pts=timestamp,
+                                        evidence_sha256=item["sha256"],
+                                        model_run_id=_module_run_id(job["id"], "hands"),
+                                        configuration=hand_configuration,
+                                        cancelled=hand_cancelled)
+                                except InterruptedError:
+                                    if cancelled():
+                                        raise WorkspaceError(
+                                            "CANCELLED", "Vision hand analysis was cancelled")
+                                    hand_result = _skipped_hand_result(
+                                        hand_extractor, hand_configuration,
+                                        "hand_landmark_phase_timeout")
                         framing_result = _shot_framing(frame, face_result, person_result)
                         landmark_images.append({"path": str(item["path"]),
                                                 "frame_index": item["frame_index"],
@@ -1489,21 +3315,25 @@ class VisionJobs:
                         ocr_result = _run_ocr(frame, extractors["ocr"])
                         clip_result = _run_clip(frame, extractors["clip"]) if not self._isolated_heavy else {}
                         vlm_result = _run_vlm(frame, extractors["vlm"]) if not self._isolated_heavy else {}
-                        keyframes.append({
+                        keyframe = {
                             "scene_index": scene_index,
                             "frame_index": item["frame_index"],
                             "source_pts": item["source_pts"],
                             "proxy_pts": item["proxy_pts"],
                             "roles": item["roles"],
-                            "timestamp": _seconds_ratio(seconds),
+                            "timestamp": timestamp,
                             "evidence_sha256": item["sha256"],
                             "face": face_result,
                             "person": person_result,
+                            "object": object_result,
                             "framing": framing_result,
                             "ocr": ocr_result,
                             "clip": clip_result,
                             "vlm": vlm_result,
-                        })
+                        }
+                        if hand_result is not None:
+                            keyframe["hands"] = hand_result
+                        keyframes.append(keyframe)
                         scene_frames.setdefault(scene_index, []).append({
                             "frame_index": item["frame_index"], "seconds": seconds,
                             "frame": frame})
@@ -1611,7 +3441,8 @@ class VisionJobs:
                                     "status": "empty_scene",
                                     "provided_samples": 0,
                                     "required_samples": CONTENT_MIN_SAMPLES,
-                                    "message": str(exc),
+                                    "message": safe_failure_reason(
+                                        exc, "content_sampling_scene_failed"),
                                     "max_gap_frames": 0,
                                     "changes": 0,
                                     "filtered": 0,
@@ -1630,6 +3461,13 @@ class VisionJobs:
                                 samples.append({"frame_index": item["frame_index"],
                                                 "seconds": float(S.rational_value(item["seconds"])),
                                                 "frame": _load_frame(Path(item["path"]))})
+                                action_video_inputs[scene_index].append({
+                                    "scene_index": scene_index,
+                                    "frame_index": item["frame_index"],
+                                    "pts": item["seconds"],
+                                    "evidence_sha256": item["sha256"],
+                                    "path": str(item["path"]),
+                                })
                                 content_frames.append({
                                     "scene_index": scene_index,
                                     "frame_index": item["frame_index"],
@@ -1696,9 +3534,17 @@ class VisionJobs:
                         }
                     except Exception as exc:
                         content_sampling = {"status": "failed",
-                                            "error": type(exc).__name__,
-                                            "message": str(exc)[:240]}
-                actions_sampling = _action_candidates(keyframes)
+                                            "error": safe_failure_reason(
+                                                exc, "content_sampling_failed"),
+                                            "message": "content_sampling_failed"}
+                object_sampling, object_relations = _object_analysis(keyframes, job["id"])
+                actions_sampling = _action_candidates(keyframes, job["id"])
+                action_video_sampling = None
+                if action_video_configuration is not None:
+                    action_video_sampling = _run_action_video_sampling(
+                        action_video_configuration, self.action_video_model_path,
+                        action_video_inputs, (work / "action-video").resolve(),
+                        cancelled=cancelled)
                 try:
                     acoustics_sampling = _measure_audio(
                         Path(source), ffmpeg, work, window=window,
@@ -1707,10 +3553,13 @@ class VisionJobs:
                     if exc.code == "CANCELLED":
                         raise
                     acoustics_sampling = {"status": "failed", "reason": exc.code,
-                                          "message": str(exc)[:240], "measurement": None}
+                                          "message": safe_failure_reason(
+                                              exc, "acoustic_analysis_failed"),
+                                          "measurement": None}
                 except Exception as exc:
-                    acoustics_sampling = {"status": "failed", "reason": type(exc).__name__,
-                                          "message": str(exc)[:240], "measurement": None}
+                    reason = safe_failure_reason(exc, "acoustic_analysis_failed")
+                    acoustics_sampling = {"status": "failed", "reason": reason,
+                                          "message": reason, "measurement": None}
                 boundary_frames: List[Dict[str, Any]] = []
                 boundary_sampling: Dict[str, Any] = {
                     "status": "not_run",
@@ -1814,9 +3663,11 @@ class VisionJobs:
                         boundary_sampling["event_count"] = len(detected)
                         boundary_sampling["overlap_mapping"] = "each decoded boundary frame is reused by every scene window that covers it"
                     except Exception as exc:
+                        reason = safe_failure_reason(
+                            exc, "boundary_sampling_failed")
                         boundary_sampling = {"status": "failed",
-                                             "error": type(exc).__name__,
-                                             "message": str(exc)[:240]}
+                                             "error": reason,
+                                             "message": reason}
                         boundary_frames = []
                 if scene_result["status"] == "success" and scenes:
                     try:
@@ -1829,15 +3680,19 @@ class VisionJobs:
                     except WorkspaceError as exc:
                         if exc.code in {"CANCELLED", "LEASE_LOST"}:
                             raise
+                        message = safe_failure_reason(
+                            exc, "transition_discovery_failed")
                         boundary_sampling["global_discovery"] = {"status": "failed", "error": exc.code,
-                            "message": str(exc)[:240], "coverage": {"complete": False}}
+                            "message": message, "coverage": {"complete": False}}
                         boundary_sampling.update(local_status=boundary_sampling["status"], status="failed",
-                                                 error=exc.code, message=str(exc)[:240])
+                                                 error=exc.code, message=message)
                     except Exception as exc:
-                        boundary_sampling["global_discovery"] = {"status": "failed", "error": type(exc).__name__,
-                            "message": str(exc)[:240], "coverage": {"complete": False}}
+                        message = safe_failure_reason(
+                            exc, "transition_discovery_failed")
+                        boundary_sampling["global_discovery"] = {"status": "failed", "error": message,
+                            "message": message, "coverage": {"complete": False}}
                         boundary_sampling.update(local_status=boundary_sampling["status"], status="failed",
-                                                 error=type(exc).__name__, message=str(exc)[:240])
+                                                 error=message, message=message)
                 extractor_status = {
                     "scene": scene_result["status"],
                     "face": _aggregate_status(keyframes, "face"),
@@ -1845,8 +3700,11 @@ class VisionJobs:
                     "clip": _aggregate_status(keyframes, "clip"),
                     "vlm": _aggregate_status(keyframes, "vlm"),
                     "person": _aggregate_status(keyframes, "person"),
+                    "object": _aggregate_status(keyframes, "object"),
                     "landmarks": _aggregate_status(keyframes, "landmarks"),
                 }
+                if hand_configuration is not None:
+                    extractor_status["hands"] = _aggregate_status(keyframes, "hands")
                 motion_status = "success" if any(
                     frame.get("motion", {}).get("status") == "success" for frame in keyframes) else "not_run"
                 module_status = dict(extractor_status)
@@ -1858,11 +3716,21 @@ class VisionJobs:
                                    else "success" if any(frame.get("boundary_events") for frame in keyframes)
                                    else boundary_sampling.get("status", "not_run")),
                     "actions": actions_sampling.get("status", "not_run"),
+                    "object_relations": ("not_run" if object_relations.get("status") == "not_run"
+                                         else "insufficient_evidence"
+                                         if object_relations.get("status") == "unknown" else "success"),
                     "content": content_sampling.get("status", "not_run"),
                     "expressive": _aggregate_status(keyframes, "expressive"),
                     "acoustics": acoustics_sampling.get("status", "not_run"),
                 })
+                if action_video_sampling is not None:
+                    module_status["action_video"] = action_video_sampling["status"]
+                    module_status["action_video_reason"] = action_video_sampling["reason"]
                 module_status["actions_reason"] = actions_sampling.get("reason")
+                module_status["object_reason"] = object_sampling.get("reason")
+                module_status["object_relations_reason"] = object_relations.get("reason")
+                if hand_configuration is not None:
+                    module_status["hands_reason"] = _first_module_reason(keyframes, "hands")
                 module_status["actions_supported"] = actions_sampling.get("supported")
                 module_status["actions_unsupported"] = actions_sampling.get("unsupported")
                 module_status["expressive_reason"] = _first_module_reason(keyframes, "expressive") or landmark_result.get("reason")
@@ -1893,6 +3761,8 @@ class VisionJobs:
                     "boundary_frames": boundary_frames, "boundary_sampling": boundary_sampling,
                     "content_sampling": content_sampling,
                     "content_frames": content_frames,
+                    "object_sampling": _jsonable(object_sampling),
+                    "object_relations": _jsonable(object_relations),
                     "actions_sampling": _jsonable(actions_sampling),
                     "acoustics_sampling": _jsonable(acoustics_sampling),
                     "extractor_status": extractor_status, "module_status": module_status,
@@ -1901,6 +3771,8 @@ class VisionJobs:
                     "job_identity": parameters["job_identity"], "evidence": evidence,
                     "semantic_listening": "not_performed", "source_unchanged": True,
                     "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
+                if action_video_sampling is not None:
+                    candidate["action_video_sampling"] = _jsonable(action_video_sampling)
                 _limit_global_claims(candidate)
                 scene_counts = {str(index): len(frame.get("boundary_events", []))
                     for index in range(len(scenes))
@@ -1912,7 +3784,9 @@ class VisionJobs:
                     job, extractors, keyframes, scene_result,
                     boundary_sampling, boundary_frames, module_status,
                     digest, window, actions_sampling, acoustics_sampling,
-                    content_sampling, content_frames, model_execution)
+                    content_sampling, content_frames, model_execution,
+                    object_sampling, object_relations,
+                    action_video_sampling, action_video_configuration)
                 self._validate_candidate(candidate, job)
                 context.raise_if_cancelled()
                 return candidate
@@ -2000,6 +3874,14 @@ class VisionJobs:
                 self._condition.wait(min(left, .05))
             stopped = not self._runners and not self._heartbeats and not (self._drainer is not None and self._drainer.is_alive())
             if stopped:
+                hands = (self._extractors or {}).get("hands")
+                if hands is not None:
+                    try:
+                        hands.close()
+                    except Exception:
+                        # Shutdown must release ownership state even if a native
+                        # runtime reports a late close failure.
+                        pass
                 self._extractors = None
                 self._loaded_optional_config = None
             return {"stopped": stopped,
@@ -2017,8 +3899,21 @@ class VisionJobs:
                                  "extractor_status", "module_status", "job_identity",
                                  "model_runs", "evidence", "boundary_frames", "boundary_sampling"}
         expected = expected | {"content_sampling", "actions_sampling", "acoustics_sampling"}
+        requires_objects = (parameters["job_identity"]["config"].get("object_sampling", {})
+                            .get("evidence_contract") == OBJECT_EVIDENCE_CONTRACT)
+        requires_hands = (parameters["job_identity"]["config"].get("hand_landmarks", {})
+                          .get("contract") == HAND_EVIDENCE_CONTRACT)
+        requires_action_video = (parameters["job_identity"]["config"].get("action_video", {})
+                                 .get("contract") == ACTION_VIDEO_EVIDENCE_CONTRACT)
+        if requires_action_video:
+            expected.add("action_video_sampling")
+        object_fields = {"object_sampling", "object_relations"}
+        if requires_objects:
+            expected |= object_fields
         if (not isinstance(value, dict) or not expected <= set(value)
-                or set(value) - expected - {"sampling", "content_frames", "model_execution"}
+                or set(value) - expected - {"sampling", "content_frames", "model_execution"} - object_fields
+                or (object_fields & set(value)) not in (set(), object_fields)
+                or requires_objects and not object_fields <= set(value)
                 or any(value[key] != item for key, item in fixed.items())
                 or value["window"] != parameters["window"]
                 or value["job_identity"] != parameters["job_identity"]
@@ -2112,9 +4007,32 @@ class VisionJobs:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision model-run identities are duplicated")
             run_ids.add(checked["id"])
         optional = parameters["job_identity"]["config"].get("optional_providers")
+        optional_modules = ["person", "landmarks", "expressive"]
+        if requires_objects:
+            optional_modules.append("object")
         if optional is not None and any(_module_run_id(job["id"], name) not in run_ids
-                                        for name in ("person", "landmarks", "expressive")):
+                                        for name in optional_modules):
             raise WorkspaceError("RECOVERY_REQUIRED", "Current vision contract requires optional provider status records")
+        if requires_content:
+            modules = {"face", "ocr", "clip", "vlm", "scene", "motion", "content",
+                       "actions", "acoustics", "boundary"}
+            if requires_objects:
+                modules.add("object_relations")
+            if requires_hands:
+                modules.add("hands")
+            if requires_action_video:
+                modules.add("action_video")
+            if optional is not None:
+                modules.update({"person", "landmarks", "expressive"})
+                if requires_objects:
+                    modules.add("object")
+            expected_run_ids = {_module_run_id(job["id"], name) for name in modules}
+            if run_ids != expected_run_ids:
+                missing = sorted(expected_run_ids - run_ids)
+                unexpected = sorted(run_ids - expected_run_ids)
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED",
+                    f"Current vision model-run set is incomplete or unexpected: missing={missing}; unexpected={unexpected}")
         content_run = next((run for run in model_runs
                             if run["id"] == _module_run_id(job["id"], "content")), None)
         if requires_content and content_run is None:
@@ -2135,10 +4053,54 @@ class VisionJobs:
             parts = PurePosixPath(name).parts
             if (not name or any(part in {"", ".", ".."} or "\\" in part or ":" in part for part in parts)
                     or path in paths or not isinstance(evidence["sha256"], str) or S.HASH_RE.fullmatch(evidence["sha256"]) is None
-                    or not isinstance(evidence["size_bytes"], str) or not evidence["size_bytes"].isdigit()):
+                    or not isinstance(evidence["size_bytes"], str)
+                    or not evidence["size_bytes"].isascii()
+                    or not evidence["size_bytes"].isdecimal()
+                    or len(evidence["size_bytes"]) > 16
+                    or not 0 <= int(evidence["size_bytes"]) <= MAX_EVIDENCE_SOURCE_BYTES):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence path or identity is invalid")
             paths.add(path)
         evidence_hashes = {item["sha256"] for item in value["evidence"]}
+        hand_run_id = _module_run_id(job["id"], "hands")
+        if requires_hands:
+            hand_status = _aggregate_status(value["keyframes"], "hands")
+            if (value["extractor_status"].get("hands") != hand_status
+                    or value["module_status"].get("hands") != hand_status):
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Hand landmark aggregate status is inconsistent")
+            _validate_hand_analysis(
+                value["keyframes"], job_id=job["id"], model_runs=model_runs,
+                evidence_hashes=evidence_hashes,
+                configuration=parameters["job_identity"]["config"]["hand_landmarks"])
+        elif (any("hands" in frame for frame in value["keyframes"])
+              or hand_run_id in run_ids):
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Legacy candidate carries undeclared hand evidence")
+        if object_fields <= set(value):
+            _validate_object_analysis(value["object_sampling"], value["object_relations"],
+                                      keyframes=value["keyframes"], job_id=job["id"],
+                                      model_runs=model_runs, evidence_hashes=evidence_hashes)
+        _validate_action_sampling(value["actions_sampling"], job_id=job["id"],
+                                  model_runs=model_runs, evidence_hashes=evidence_hashes)
+        action_video_run_id = _module_run_id(job["id"], "action_video")
+        if requires_action_video:
+            _validate_action_video_sampling(
+                value["action_video_sampling"],
+                configuration=parameters["job_identity"]["config"]["action_video"],
+                scenes=value["scenes"], content_frames=content_frames,
+                evidence_hashes=evidence_hashes, model_runs=model_runs,
+                job_id=job["id"], digest=value["file_sha256"], window=value["window"])
+            if (value["module_status"].get("action_video")
+                    != value["action_video_sampling"]["status"]
+                    or value["module_status"].get("action_video_reason")
+                    != value["action_video_sampling"]["reason"]):
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Auxiliary video-action module status is inconsistent")
+        elif ("action_video_sampling" in value or action_video_run_id in run_ids
+              or "action_video" in value["module_status"]
+              or "action_video_reason" in value["module_status"]):
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Legacy candidate carries undeclared video-action output")
         model_execution = value.get("model_execution", {})
         if (not isinstance(model_execution, dict)
                 or any(module not in {"clip", "vlm"} for module in model_execution)):
@@ -2223,6 +4185,10 @@ class VisionJobs:
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate or commit is corrupt") from exc
 
     def _read_result(self, job_id: str) -> Dict[str, Any]:
+        return self._read_result_with_snapshot(job_id)[0]
+
+    def _capture_result_snapshot(self, job_id: str) -> Dict[str, Any]:
+        """Capture only registered candidate identity under a short DB lock."""
         S.require_id(job_id)
         with self.store.transaction():
             job = self.queue.get_job(job_id)
@@ -2236,33 +4202,157 @@ class VisionJobs:
             durable = self.store.conn.execute("SELECT body FROM durable_commits WHERE id=?", (commit["id"],)).fetchone()
             descriptor = commit["artifact"]
             row = self.store.conn.execute("SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?", (descriptor["id"],)).fetchone()
+            registered = ({"id": descriptor["id"], "relative_path": row[0],
+                           "sha256": row[1], "size_bytes": str(row[2])}
+                          if row is not None else None)
             if (durable is None or json.loads(durable[0]) != commit or commit["job_id"] != job_id
                     or commit["disposition"] != "candidate" or row is None or row[0] != "objects/" + row[1]
                     or any(commit[key] != job[key] for key in ("task_id", "input_revision", "input_sha256",
                                                                "processor_version", "idempotency_key", "lease_generation", "worker_id"))
-                    or descriptor != {"id": descriptor["id"], "relative_path": row[0], "sha256": row[1], "size_bytes": str(row[2])}
+                    or descriptor != registered
                     or not 0 < row[2] <= MAX_RESULT_BYTES):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision commit or artifact binding is inconsistent")
-            path = self.store.root / row[0]
-            _safe(path)
+            return {"job": job, "commit": commit, "artifact": registered,
+                    "job_sha256": S.sha256_bytes(S.canonical_json(job))}
+
+    def _verify_result_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """Recheck candidate/job registrations without touching object bytes."""
+        try:
+            job_id = snapshot["job"]["id"]
+            current = self.queue.get_job(job_id)
+            if (S.sha256_bytes(S.canonical_json(current)) != snapshot["job_sha256"]
+                    or current["commit"] != snapshot["commit"]):
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Vision job changed while its candidate was prepared")
+            durable = self.store.conn.execute(
+                "SELECT body FROM durable_commits WHERE id=?",
+                (snapshot["commit"]["id"],)).fetchone()
+            row = self.store.conn.execute(
+                "SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?",
+                (snapshot["artifact"]["id"],)).fetchone()
+            registered = ({"id": snapshot["artifact"]["id"], "relative_path": row[0],
+                           "sha256": row[1], "size_bytes": str(row[2])}
+                          if row is not None else None)
+            if (durable is None or json.loads(durable[0]) != snapshot["commit"]
+                    or registered != snapshot["artifact"]):
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Vision candidate registration changed during apply")
+            self._validate_snapshot(current)
+        except WorkspaceError:
+            raise
+        except (sqlite3.DatabaseError, json.JSONDecodeError, KeyError, TypeError,
+                ValueError, IndexError) as exc:
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Vision candidate registration changed during apply") from exc
+
+    def _replay_committed_apply(self, job_id: str, *, command_id: str,
+                                expected_revision: int, expected_sha256: str,
+                                request_body: bytes) -> Optional[Dict[str, Any]]:
+        """Replay a committed import without reopening its candidate object.
+
+        The immutable task revision contains the exact candidates and model-run
+        declarations admitted by the original command. Reconstructing that
+        payload lets ``apply_task_command`` verify its stored request hash even
+        after the disposable candidate object is unavailable.
+        """
+        with self.store.transaction():
+            receipt = self.store.conn.execute(
+                "SELECT task_id,response FROM command_receipts WHERE command_id=?",
+                (command_id,)).fetchone()
+            if receipt is None:
+                return None
             try:
-                info = path.stat()
-                if not stat.S_ISREG(info.st_mode) or info.st_size != row[2]:
-                    raise ValueError("Candidate is not the registered regular file")
-                with path.open("rb") as stream:
-                    data = stream.read(MAX_RESULT_BYTES + 1)
-                if len(data) != row[2] or S.sha256_bytes(data) != row[1]:
-                    raise ValueError("Candidate identity mismatch")
-                value = json.loads(data)
-                if S.canonical_json(value) != data:
-                    raise ValueError("Candidate is not canonical finite JSON")
-                try:
-                    self._validate_candidate(value, job)
-                except SchemaInvalid as exc:
-                    raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate schema is corrupt") from exc
-                return value
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate is unavailable or corrupt") from exc
+                response = json.loads(receipt[1]) if receipt[1] else {}
+                revision = response["revision"]
+                if type(revision) is not int:
+                    raise ValueError("invalid receipt revision")
+                row = self.store.conn.execute(
+                    "SELECT body FROM task_revisions WHERE task_id=? AND revision=?",
+                    (receipt[0], revision)).fetchone()
+                if row is None:
+                    raise Conflict(
+                        "IDEMPOTENCY_CONFLICT", "Command does not identify this candidate import")
+                historical = json.loads(row[0])
+                annotations = [
+                    annotation for annotation in historical["annotations"]
+                    if annotation.get("provenance", {}).get("job_id") == job_id
+                ]
+                previous_revision = response["previous_revision"]
+                if type(previous_revision) is not int:
+                    raise ValueError("invalid previous receipt revision")
+                before = self.store.conn.execute(
+                    "SELECT body FROM task_revisions WHERE task_id=? AND revision=?",
+                    (receipt[0], previous_revision)).fetchone()
+                if before is None:
+                    raise ValueError("missing previous task revision")
+                prior = json.loads(before[0])
+                prior_run_ids = {
+                    run.get("id") for run in prior.get("extensions", {}).get(
+                        "professional", {}).get("model_runs", [])
+                    if isinstance(run, dict)
+                }
+                model_runs = [
+                    run for run in historical.get("extensions", {}).get(
+                        "professional", {}).get("model_runs", [])
+                    if run.get("id") not in prior_run_ids
+                ]
+                if not annotations:
+                    raise Conflict(
+                        "IDEMPOTENCY_CONFLICT", "Command does not identify this candidate import")
+            except Conflict:
+                raise
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Committed vision receipt or revision is corrupt") from exc
+            return self.store.apply_task_command(
+                command_id=command_id, task_id=receipt[0],
+                expected_revision=expected_revision, expected_sha256=expected_sha256,
+                operation="import_vision_candidates",
+                payload={"candidates": annotations, "source_job_id": job_id,
+                         "model_runs": model_runs},
+                request_body=request_body)["response"]
+
+    def _read_result_with_snapshot(self, job_id: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        snapshot = self._capture_result_snapshot(job_id)
+        descriptor = snapshot["artifact"]
+        path = self.store.root / descriptor["relative_path"]
+        _safe(path)
+        try:
+            before = path.lstat()
+            if (stat.S_ISLNK(before.st_mode)
+                    or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+                    or not stat.S_ISREG(before.st_mode)
+                    or before.st_size != int(descriptor["size_bytes"])):
+                raise ValueError("Candidate is not the registered regular file")
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                        != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)):
+                    raise ValueError("Candidate changed before read")
+                data = stream.read(MAX_RESULT_BYTES + 1)
+                after_read = os.fstat(stream.fileno())
+            after_path = path.lstat()
+            _safe(path)
+            if (len(data) != int(descriptor["size_bytes"])
+                    or (after_read.st_dev, after_read.st_ino, after_read.st_size,
+                        after_read.st_mtime_ns)
+                    != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                    or (after_path.st_dev, after_path.st_ino, after_path.st_size,
+                        after_path.st_mtime_ns)
+                    != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    or S.sha256_bytes(data) != descriptor["sha256"]):
+                raise ValueError("Candidate identity mismatch")
+            value = json.loads(data)
+            if S.canonical_json(value) != data:
+                raise ValueError("Candidate is not canonical finite JSON")
+            self._validate_candidate(value, snapshot["job"])
+            with self.store.transaction():
+                self._verify_result_snapshot(snapshot)
+            return value, snapshot
+        except SchemaInvalid as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate schema is corrupt") from exc
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate is unavailable or corrupt") from exc
 
     def apply(self, job_id: str, *, command_id: str, expected_revision: int,
               expected_sha256: str, request_body: bytes) -> Dict[str, Any]:
@@ -2277,38 +4367,22 @@ class VisionJobs:
         """
         from .professional_store import apply_vision_candidates
 
+        S.require_id(command_id)
+        S.require_hash(expected_sha256)
+        if type(expected_revision) is not int or not 0 <= expected_revision <= S.MAX_SAFE_INTEGER:
+            raise SchemaInvalid("SCHEMA_INVALID", "Expected revision must be a nonnegative safe integer")
+        if not isinstance(request_body, bytes):
+            raise SchemaInvalid("SCHEMA_INVALID", "Invalid command payload")
+        replay = self._replay_committed_apply(
+            job_id, command_id=command_id, expected_revision=expected_revision,
+            expected_sha256=expected_sha256, request_body=request_body)
+        if replay is not None:
+            return replay
+        try:
+            result, result_snapshot = self._read_result_with_snapshot(job_id)
+        except (OSError, ValueError, KeyError, TypeError, RecursionError, SchemaInvalid) as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate or commit is corrupt") from exc
         with self.store.transaction():
-            S.require_id(command_id)
-            S.require_hash(expected_sha256)
-            if type(expected_revision) is not int or not 0 <= expected_revision <= S.MAX_SAFE_INTEGER:
-                raise SchemaInvalid("SCHEMA_INVALID", "Expected revision must be a nonnegative safe integer")
-            if not isinstance(request_body, bytes):
-                raise SchemaInvalid("SCHEMA_INVALID", "Invalid command payload")
-            result = self.result(job_id)
-            receipt = self.store.conn.execute(
-                "SELECT response FROM command_receipts WHERE command_id=?", (command_id,)).fetchone()
-            if receipt:
-                # Replay the payload that was actually committed, even when a
-                # later mapper fixes projection rules or the task is edited.
-                response = json.loads(receipt[0]) if receipt[0] else {}
-                row = self.store.conn.execute(
-                    "SELECT body FROM task_revisions WHERE task_id=? AND revision=?",
-                    (result["task_id"], response.get("revision"))).fetchone()
-                if row is None:
-                    raise Conflict("IDEMPOTENCY_CONFLICT", "Command does not identify this candidate import")
-                historical = json.loads(row[0])
-                saved = {annotation["id"]: annotation for annotation in historical["annotations"]
-                         if annotation.get("provenance", {}).get("job_id") == result["job_id"]}
-                identifiers = [S.make_id("ann", result["job_id"] + ":" + str(index))
-                               for index in range(len(result["scenes"]))]
-                if any(identifier not in saved for identifier in identifiers):
-                    raise Conflict("IDEMPOTENCY_CONFLICT", "Command does not identify this candidate import")
-                annotations = [saved[identifier] for identifier in identifiers]
-                return self.store.apply_task_command(command_id=command_id, task_id=result["task_id"],
-                    expected_revision=expected_revision, expected_sha256=expected_sha256,
-                    operation="import_vision_candidates", payload={"candidates": annotations,
-                    "source_job_id": result["job_id"],
-                    "model_runs": result.get("model_runs") or []}, request_body=request_body)["response"]
             current = self.store.get_task(result["task_id"])
             if current["revision"] != expected_revision:
                 raise revision_conflict(expected_revision, current["revision"])
@@ -2317,22 +4391,46 @@ class VisionJobs:
                                details={"expected_sha256": expected_sha256,
                                         "current_sha256": current["content_sha256"]})
             media = self.queue.get_job(job_id)["media_snapshot"]
-            annotations = _candidate_annotations(result, duration=media["duration"])
             template = next(value for value in self.store.list_templates()
                             if (value["id"], value["version"]) ==
                             (current["template_id"], current["template_version"]))
-            model_runs = result.get("model_runs") or []
-            # Validate before publishing thumbnails: rolling back SQLite cannot
-            # remove immutable objects written for a rejected projection.
-            for annotation in annotations:
-                PS.validate_annotation(annotation, media, template,
-                                       model_run_ids={run["id"] for run in model_runs})
-            _attach_candidate_evidence(self.store, result, annotations)
-            return apply_vision_candidates(
-                store=self.store, command_id=command_id, task_id=result["task_id"],
-                expected_revision=expected_revision, expected_sha256=expected_sha256,
-                candidates=annotations, source_job_id=result["job_id"],
-                model_runs=model_runs, request_body=request_body)
+        annotations = _candidate_annotations(result, duration=media["duration"])
+        model_runs = result.get("model_runs") or []
+        # Decoding, hashing and JPEG generation happen without a SQLite write
+        # transaction.  No object is published until the full projection and
+        # all of its semantic references validate.
+        publication = _prepare_candidate_evidence(self.store, result, annotations)
+        projected_artifacts = {item["artifact"]["id"] for item in publication}
+        for annotation in annotations:
+            PS.validate_annotation(annotation, media, template,
+                                   artifact_ids=projected_artifacts,
+                                   model_run_ids={run["id"] for run in model_runs})
+        with self.store._evidence_publication_scope() as publication_token:
+            _prepublish_candidate_evidence(self.store, publication)
+            _verify_prepublished_candidate_evidence(self.store, publication)
+            with self.store.transaction():
+                replay = self._replay_committed_apply(
+                    job_id, command_id=command_id, expected_revision=expected_revision,
+                    expected_sha256=expected_sha256, request_body=request_body)
+                if replay is not None:
+                    return replay
+                self._verify_result_snapshot(result_snapshot)
+                current = self.store.get_task(result["task_id"])
+                if current["revision"] != expected_revision:
+                    raise revision_conflict(expected_revision, current["revision"])
+                if (current["content_sha256"] != expected_sha256
+                        or self.store.task_digest(current) != expected_sha256):
+                    raise Conflict("MEDIA_CHANGED", "Task content hash mismatch",
+                                   details={"expected_sha256": expected_sha256,
+                                            "current_sha256": current["content_sha256"]})
+                response = apply_vision_candidates(
+                    store=self.store, command_id=command_id, task_id=result["task_id"],
+                    expected_revision=expected_revision, expected_sha256=expected_sha256,
+                    candidates=annotations, source_job_id=result["job_id"],
+                    model_runs=model_runs, request_body=request_body)
+                _bind_candidate_evidence(
+                    self.store, publication, publication_token)
+                return response
 
 
 def _find_ffmpeg() -> str:
@@ -2507,7 +4605,11 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
                       acoustics_sampling: Optional[Dict[str, Any]] = None,
                       content_sampling: Optional[Dict[str, Any]] = None,
                       content_frames: Optional[List[Dict[str, Any]]] = None,
-                      model_execution: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                      model_execution: Optional[Dict[str, Any]] = None,
+                      object_sampling: Optional[Dict[str, Any]] = None,
+                      object_relations: Optional[Dict[str, Any]] = None,
+                      action_video_sampling: Optional[Dict[str, Any]] = None,
+                      action_video_configuration: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Record one real run per executed module, including honest non-success.
 
     Weights are hashed only when a local file exists. A failed or not-run
@@ -2575,6 +4677,30 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
             failure_reason=_first_module_reason(keyframes, "person") or "no sampled frames",
             code_version="optional-local-providers-v1:" + optional["implementation_sha256"],
             score_kind="confidence"))
+        object_identity = extractor_identity("object", OBJECT_PROVIDER)
+        runs.append(_model_run_record(
+            job_id, "object", provider=object_identity.get("provider", "onnxruntime"),
+            model_name=object_identity.get("model_name", OBJECT_PROVIDER),
+            model_version=object_identity.get("model_version", "unavailable"),
+            weights_sha256=object_identity.get("weights_sha256"),
+            license=object_identity.get("license", "unverified"),
+            preprocessing={"input": object_identity.get("input"),
+                           "output_coordinates": "decoded_frame_xyxy",
+                           "label_set": object_identity.get("label_set"),
+                           "label_set_sha256": object_identity.get("label_set_sha256"),
+                           "label_source": object_identity.get("label_source"),
+                           "upstream_revision": object_identity.get("upstream_revision"),
+                           "forward_sharing": object_identity.get("forward_sharing")},
+            parameters={"classes": "COCO-80 excluding person class 0",
+                        "score_threshold": OBJECT_SCORE_THRESHOLD,
+                        "nms_iou": .5,
+                        "detector_max_objects": OBJECT_DETECTOR_MAX_OBJECTS,
+                        "pipeline_max_objects_per_keyframe": MAX_OBJECTS_PER_KEYFRAME,
+                        "score_calibration": "not_established"},
+            input_value=frame_input, output_value=_frame_output(keyframes, "object"),
+            status=module_status.get("object", "not_run"),
+            failure_reason=_first_module_reason(keyframes, "object") or "no sampled frames",
+            code_version=f"vision_jobs={VERSION}; objects=1", score_kind="none"))
         landmark = optional["landmarks"]
         runs.append(_model_run_record(
             job_id, "landmarks", provider="mediapipe-tasks-cpu", model_name="Face Landmarker / Face Mesh V2",
@@ -2600,6 +4726,46 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
             status=module_status.get("expressive", "not_run"),
             failure_reason=module_status.get("expressive_reason") or "no sampled frames",
             code_version="optional-local-providers-v1:" + optional["implementation_sha256"], score_kind="rule_score"))
+
+    hand = job["parameters"]["job_identity"]["config"].get("hand_landmarks")
+    if hand is not None:
+        model = hand["model"]
+        available = model["status"] == "available"
+        official = (available and model.get("sha256") == HAND_WEIGHTS_SHA256
+                    and model.get("size_bytes") == str(HAND_MODEL_SIZE))
+        runs.append(_model_run_record(
+            job_id, "hands",
+            provider="mediapipe-tasks-cpu" if available else "unavailable",
+            model_name=HAND_PROVIDER if official else "unverified_local_task",
+            model_version="float16/1" if official else hand["runtime_version"],
+            weights_sha256=model.get("sha256") if available else None,
+            license=HAND_MODEL_LICENSE if official else "unverified local weights",
+            preprocessing={
+                "input": "decoded BGR keyframe converted to RGB",
+                "running_mode": "IMAGE", "pixel_digest": "sha256 of decoded BGR uint8 bytes",
+                "output_coordinates": "normalized image, decoded-frame pixels, and MediaPipe world metres",
+                "model_source": HAND_MODEL_URL if official else None,
+                "model_card": HAND_MODEL_CARD if official else None,
+                "model_license_source": HAND_LICENSE_SOURCE if official else None,
+                "runtime_license_source": HAND_RUNTIME_LICENSE_SOURCE,
+                "path_identity_sha256": model.get("path_identity_sha256"),
+                "mirror_state_verified": False,
+            },
+            parameters={
+                "max_hands": 4, "offline": True, "downloads_allowed": False,
+                "authority": hand["authority"],
+                "cancellation_boundary": hand["cancellation_boundary"],
+                "sampling_policy": hand["sampling_policy"],
+                "max_frames_per_job": hand["max_frames_per_job"],
+                "phase_timeout_seconds": hand["phase_timeout_seconds"],
+                "coverage": _hand_coverage(keyframes),
+                "unsupported_assertions": list(HAND_UNSUPPORTED_ASSERTIONS),
+            },
+            input_value=frame_input, output_value=_frame_output(keyframes, "hands"),
+            status=module_status.get("hands", "not_run"),
+            failure_reason=_first_module_reason(keyframes, "hands") or "no sampled frames",
+            code_version=f"vision_jobs={VERSION}; hands={HAND_CODE_VERSION}",
+            score_kind="none"))
 
     ocr_identity = extractor_identity("ocr", "RapidOCR")
     runs.append(_model_run_record(
@@ -2741,8 +4907,8 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         code_version=f"vision_jobs={VERSION}; scene_change=1", score_kind="rule_score"))
 
     runs.append(_model_run_record(
-        job_id, "actions", provider="trace-annotate", model_name="subject-translation-v1",
-        model_version="1", weights_sha256=None, license="Project source",
+        job_id, "actions", provider="subject-translation-v1", model_name="subject-translation-v1",
+        model_version="3", weights_sha256=None, license="Project source",
         preprocessing={"input": "one-to-one person xyxy tracks; explicit face xywh fallback; per scene; max gap 5s",
                        "time_domain": DOMAIN},
         parameters={"walk_band_heights_per_s": [0.15, 1.2],
@@ -2753,11 +4919,43 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         output_value={"module": "actions",
                       "tracks": _jsonable((actions_sampling or {}).get("tracks") or []),
                       "candidates": _jsonable((actions_sampling or {}).get("candidates") or []),
+                      "class_results": _jsonable((actions_sampling or {}).get("class_results") or {}),
                       "coverage": {"supported": module_status.get("actions_supported"),
                                    "unsupported": module_status.get("actions_unsupported")}},
         status=module_status.get("actions", "not_run"),
         failure_reason=module_status.get("actions_reason"),
-        code_version=f"vision_jobs={VERSION}; actions=1",
+        code_version=f"vision_jobs={VERSION}; actions=3",
+        score_kind="rule_score"))
+
+    if action_video_configuration is not None:
+        if action_video_sampling is None:
+            raise SchemaInvalid("SCHEMA_INVALID",
+                                "A configured video-action module requires its sampling outcome")
+        runs.append(_action_video_model_run(
+            job_id, digest, window, action_video_sampling,
+            _validate_action_video_configuration(action_video_configuration)))
+
+    object_sampling = object_sampling or {}
+    object_relations = object_relations or {}
+    relation_input = {"basis": "sparse_sampled_object_and_subject_tracks",
+                      "object_tracking": object_sampling.get("tracking"),
+                      "subject_tracks": _relation_subject_tracks(keyframes)}
+    runs.append(_model_run_record(
+        job_id, "object_relations", provider="trace-annotate",
+        model_name=RELATION_CONTRACT, model_version="1", weights_sha256=None,
+        license="Project source",
+        preprocessing={"input": "sparse sampled COCO boxes and person boxes",
+                       "time_domain": DOMAIN, "hard_scene_boundary": True,
+                       "continuous_frame_tracking": False},
+        parameters={"near_gap": .35, "contact_gap": .08,
+                    "held_min_samples": 3,
+                    "tracking": (object_sampling.get("tracking") or {}).get("parameters"),
+                    "action_assertions": "unsupported"},
+        input_value=relation_input,
+        output_value={"module": "object_relations", "result": object_relations},
+        status=module_status.get("object_relations", "not_run"),
+        failure_reason=module_status.get("object_relations_reason"),
+        code_version=f"vision_jobs={VERSION}; object_tracks=1",
         score_kind="rule_score"))
 
     acoustics = acoustics_sampling or {}
@@ -2812,8 +5010,50 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
     return runs
 
 
-def _evidence_preview(source: Path) -> Path:
-    """Create a small JPEG preview of one sampled keyframe.
+def _read_stable_evidence_bytes(store, descriptor: Dict[str, Any]) -> bytes:
+    """Read one bounded job-evidence file without following replacement races."""
+    try:
+        size = int(descriptor["size_bytes"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise WorkspaceError(
+            "VISION_EVIDENCE_UNAVAILABLE", "Evidence size is invalid") from exc
+    if not 0 <= size <= MAX_EVIDENCE_SOURCE_BYTES:
+        raise WorkspaceError(
+            "VISION_EVIDENCE_UNAVAILABLE", "Evidence exceeds the publication byte budget")
+    source = store.root / descriptor["relative_path"]
+    _safe(source)
+    try:
+        before = source.lstat()
+        if (stat.S_ISLNK(before.st_mode)
+                or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+                or not stat.S_ISREG(before.st_mode) or before.st_size != size):
+            raise ValueError("not a stable regular file")
+        with source.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                    != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)):
+                raise ValueError("evidence changed before read")
+            data = stream.read(MAX_EVIDENCE_SOURCE_BYTES + 1)
+            after_read = os.fstat(stream.fileno())
+        after_path = source.lstat()
+        _safe(source)
+        if (len(data) != size
+                or (after_read.st_dev, after_read.st_ino, after_read.st_size,
+                    after_read.st_mtime_ns)
+                != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                or (after_path.st_dev, after_path.st_ino, after_path.st_size,
+                    after_path.st_mtime_ns)
+                != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                or S.sha256_bytes(data) != descriptor["sha256"]):
+            raise ValueError("evidence identity changed")
+        return data
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise WorkspaceError(
+            "VISION_EVIDENCE_UNAVAILABLE", "Candidate evidence is missing or changed") from exc
+
+
+def _evidence_preview(source: bytes) -> bytes:
+    """Create a small in-memory JPEG preview of verified sampled bytes.
 
     Full keyframe samples are hundreds of kilobytes each. A compact preview keeps
     the professional exchange document inside its bounded HTTP envelope and lets
@@ -2823,25 +5063,27 @@ def _evidence_preview(source: Path) -> Path:
     """
     from PIL import Image
 
-    handle, name = tempfile.mkstemp(prefix="vision-sample-", suffix=".jpg", dir=source.parent)
-    os.close(handle)
+    if not isinstance(source, bytes) or not source:
+        raise WorkspaceError(
+            "VISION_EVIDENCE_UNAVAILABLE", "Preview source must be verified bytes")
+    output = io.BytesIO()
     try:
-        with Image.open(source) as image:
+        with Image.open(io.BytesIO(source)) as image:
             image = image.convert("RGB")
             image.thumbnail((240, 240), Image.LANCZOS)
-            image.save(name, "JPEG", quality=78, optimize=True)
-    except BaseException:
-        try:
-            os.unlink(name)
-        except OSError:
-            pass
-        raise
-    return Path(name)
+            image.save(output, "JPEG", quality=78, optimize=True)
+        data = output.getvalue()
+        if not data or len(data) > MAX_FRAME_BYTES:
+            raise ValueError("preview byte budget exceeded")
+        return data
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise WorkspaceError(
+            "VISION_EVIDENCE_UNAVAILABLE", "Evidence preview could not be decoded") from exc
 
 
-def _attach_candidate_evidence(store, candidate: Dict[str, Any],
-                               annotations: List[Dict[str, Any]]) -> None:
-    """Create and pin compact previews of sampled keyframes as evidence.
+def _prepare_candidate_evidence(store, candidate: Dict[str, Any],
+                                annotations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Verify samples and project evidence ids without publishing objects.
 
     The vision job workspace is temporary. A candidate that is applied to the
     task must own durable evidence, otherwise cleanup or export would leave a
@@ -2849,15 +5091,100 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
     against the job candidate, then a 240px JPEG preview is registered as an
     immutable artifact so the portable document stays inside its byte budget.
     """
-    samples = {item["sha256"]: item for item in candidate.get("evidence") or []}
+    samples: Dict[str, Dict[str, Any]] = {}
+    for item in candidate.get("evidence") or []:
+        previous = samples.get(item["sha256"])
+        if previous is not None and previous["size_bytes"] != item["size_bytes"]:
+            raise WorkspaceError(
+                "VISION_EVIDENCE_UNAVAILABLE", "Duplicate evidence digest has inconsistent size")
+        samples.setdefault(item["sha256"], item)
+    publication: List[Dict[str, Any]] = []
+    unique: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    artifact_bytes: Dict[str, bytes] = {}
+    preview_cache: Dict[Tuple[str, str, str], bytes] = {}
+    owned_source_cache: Dict[Tuple[str, str, str], bytes] = {}
+    preparation_input_bytes = 0
+    publication_bytes = 0
+
+    def descriptor_key(descriptor: Dict[str, Any]) -> Tuple[str, str, str]:
+        return (descriptor["relative_path"], descriptor["sha256"],
+                descriptor["size_bytes"])
+
+    def read_source(descriptor: Dict[str, Any]) -> bytes:
+        nonlocal preparation_input_bytes
+        try:
+            size = int(descriptor["size_bytes"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise WorkspaceError(
+                "VISION_EVIDENCE_UNAVAILABLE", "Evidence size is invalid") from exc
+        if preparation_input_bytes + size > MAX_EVIDENCE_PREPARATION_INPUT_BYTES:
+            raise WorkspaceError(
+                "ANALYSIS_LIMIT_EXCEEDED",
+                "Evidence preparation exceeds the cumulative input byte budget")
+        preparation_input_bytes += size
+        return _read_stable_evidence_bytes(store, descriptor)
+
+    def preview_bytes(descriptor: Dict[str, Any]) -> bytes:
+        key = descriptor_key(descriptor)
+        if key not in preview_cache:
+            # The full source is released as soon as the compact preview has
+            # been encoded; only bounded preview bytes stay resident.
+            preview_cache[key] = _evidence_preview(read_source(descriptor))
+        return preview_cache[key]
+
+    def owned_source_bytes(descriptor: Dict[str, Any]) -> bytes:
+        key = descriptor_key(descriptor)
+        if key not in owned_source_cache:
+            owned_source_cache[key] = read_source(descriptor)
+        return owned_source_cache[key]
+
+    def append_publication(item: Dict[str, Any]) -> None:
+        nonlocal publication_bytes
+        key = (item["artifact"]["id"], item["owner_id"], item["role"])
+        previous = unique.get(key)
+        if previous is not None:
+            if previous != item:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Prepared evidence binding is inconsistent")
+            return
+        ident = item["artifact"]["id"]
+        prior_data = artifact_bytes.get(ident)
+        if prior_data is not None and prior_data != item["data"]:
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Prepared evidence bytes are inconsistent")
+        if prior_data is None:
+            next_size = publication_bytes + len(item["data"])
+            if next_size > MAX_EVIDENCE_PUBLICATION_BYTES:
+                raise WorkspaceError(
+                    "ANALYSIS_LIMIT_EXCEEDED",
+                    "Prepared evidence exceeds the publication byte budget")
+            publication_bytes = next_size
+            artifact_bytes[ident] = item["data"]
+        unique[key] = item
+        publication.append(item)
+
     keyframes = candidate.get("keyframes") or []
     boundary_frames = candidate.get("boundary_frames") or []
     content_frames = candidate.get("content_frames") or []
     frames = list(keyframes) + list(boundary_frames) + list(content_frames)
+    frames_by_scene: Dict[int, List[Dict[str, Any]]] = {}
+    transitions_by_scene: Dict[int, List[Dict[str, Any]]] = {}
+    keyframes_by_key: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+    content_by_key: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+    for frame in frames:
+        frames_by_scene.setdefault(frame.get("scene_index"), []).append(frame)
+    for frame in boundary_frames:
+        transitions_by_scene.setdefault(frame.get("scene_index"), []).append(frame)
+    for frame in keyframes:
+        keyframes_by_key[(frame["scene_index"], str(frame["frame_index"]),
+                          frame["evidence_sha256"])] = frame
+    for frame in content_frames:
+        content_by_key[(frame["scene_index"], str(frame["frame_index"]),
+                        frame["evidence_sha256"])] = frame
+    portable_projection_frames: set[Tuple[int, str, str]] = set()
     for index, annotation in enumerate(annotations):
-        scene_frames = [frame for frame in frames if frame.get("scene_index") == index]
-        transition_frames = [frame for frame in boundary_frames
-                             if frame.get("scene_index") == index]
+        scene_frames = frames_by_scene.get(index, [])
+        transition_frames = transitions_by_scene.get(index, [])
         evidence_ids: List[str] = []
         frame_artifacts: Dict[str, str] = {}
         sample_artifacts: Dict[Tuple[str, str], str] = {}
@@ -2894,10 +5221,8 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
             if claim["method"]["id"] != "scene-change-v1":
                 continue
             for sample in claim["method"]["parameters"].get("sample_frames", []):
-                match = next((frame for frame in content_frames
-                              if frame["scene_index"] == index
-                              and frame["frame_index"] == sample["frame_index"]
-                              and frame["evidence_sha256"] == sample["evidence_sha256"]), None)
+                match = content_by_key.get((index, str(sample.get("frame_index")),
+                                            sample.get("evidence_sha256")))
                 if match is None:
                     raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
                                          "Content change has no matching decoded content sample")
@@ -2909,10 +5234,8 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
             if claim["method"]["id"] != "subject-translation-v1":
                 continue
             for sample in claim["method"]["parameters"].get("sample_frames", []):
-                match = next((frame for frame in keyframes
-                              if frame["scene_index"] == index
-                              and str(frame["frame_index"]) == str(sample.get("frame_index"))
-                              and frame.get("evidence_sha256") == sample.get("evidence_sha256")), None)
+                match = keyframes_by_key.get((index, str(sample.get("frame_index")),
+                                              sample.get("evidence_sha256")))
                 if match is None:
                     raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
                                          "Action candidate has no matching decoded subject sample")
@@ -2920,28 +5243,62 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                            and frame["evidence_sha256"] == match["evidence_sha256"]
                            for frame in selected):
                     selected.append(match)
+        for claim in annotation["attributes"]["semantic"]["claims"]:
+            if claim["method"]["id"] != AV.PROVIDER:
+                continue
+            frame_samples = claim["method"]["parameters"].get("sample_frames", [])
+            # The claim binds the identities of all sixteen model inputs.  Three
+            # immutable previews (first/middle/last) keep portable evidence
+            # bounded while still making the exact sampled window inspectable.
+            positions = sorted({0, len(frame_samples) // 2, len(frame_samples) - 1})
+            for position in positions:
+                if position < 0 or position >= len(frame_samples):
+                    continue
+                sample = frame_samples[position]
+                match = content_by_key.get((index, str(sample.get("frame_index")),
+                                            sample.get("evidence_sha256")))
+                if match is None or match.get("seconds") != sample.get("pts"):
+                    raise WorkspaceError(
+                        "VISION_EVIDENCE_UNAVAILABLE",
+                        "Video-action hint has no matching decoded content sample")
+                if not any(str(frame["frame_index"]) == str(match["frame_index"])
+                           and frame["evidence_sha256"] == match["evidence_sha256"]
+                           for frame in selected):
+                    selected.append(match)
+        for claim in annotation["attributes"]["semantic"]["claims"]:
+            if claim["method"]["id"] not in PORTABLE_PROJECTION_METHODS:
+                continue
+            for sample in claim["method"]["parameters"].get("sample_frames", []):
+                frame_index = str(sample.get("frame_index"))
+                digest = sample.get("evidence_sha256")
+                key = (index, frame_index, digest)
+                portable_projection_frames.add(key)
+                if len(portable_projection_frames) > PORTABLE_VISUAL_EVIDENCE_FRAMES:
+                    raise WorkspaceError(
+                        "RECOVERY_REQUIRED",
+                        "Portable visual projection exceeds its evidence-frame budget")
+                match = keyframes_by_key.get(key)
+                if (match is None
+                        or match.get("timestamp", match.get("seconds")) != sample.get("pts")):
+                    raise WorkspaceError(
+                        "VISION_EVIDENCE_UNAVAILABLE",
+                        "Portable visual projection has no exact decoded keyframe evidence")
+                if not any(str(frame["frame_index"]) == frame_index
+                           and frame["evidence_sha256"] == digest for frame in selected):
+                    selected.append(match)
         for frame in selected:
             digest = frame.get("evidence_sha256")
             descriptor = samples.get(digest)
             if descriptor is None:
                 raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
                                      "Candidate keyframe has no registered sample")
-            source = store.root / descriptor["relative_path"]
-            _safe(source)
-            if (not source.is_file() or source.stat().st_size != int(descriptor["size_bytes"])
-                    or stream_sha256(source) != digest):
-                raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
-                                     "Candidate sample is missing or changed")
-            preview = _evidence_preview(source)
-            try:
-                artifact = store._put_file(preview)
-            finally:
-                try:
-                    preview.unlink()
-                except OSError:
-                    pass
-            store.bind_artifact_reference(artifact, owner_kind="evidence",
-                owner_id=annotation["id"], role="vision-sample-preview", owner_revision="0")
+            data = preview_bytes(descriptor)
+            preview_sha256 = S.sha256_bytes(data)
+            artifact = {"id": S.make_id("art", preview_sha256),
+                        "relative_path": "objects/" + preview_sha256,
+                        "sha256": preview_sha256, "size_bytes": str(len(data))}
+            append_publication({"artifact": artifact, "data": data, "path": None,
+                                "owner_id": annotation["id"], "role": "vision-sample-preview"})
             if artifact["id"] not in evidence_ids:
                 evidence_ids.append(artifact["id"])
             # General keyframe claims retain their own first-selected sample.
@@ -2957,15 +5314,12 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
             if descriptor is None:
                 raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
                                      "Acoustic claim has no decoded audio evidence")
-            source = store.root / descriptor["relative_path"]
-            _safe(source)
-            if (not source.is_file() or source.stat().st_size != int(descriptor["size_bytes"])
-                    or stream_sha256(source) != descriptor["sha256"]):
-                raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
-                                     "Acoustic evidence is missing or changed")
-            artifact = store._put_file(source)
-            store.bind_artifact_reference(artifact, owner_kind="evidence",
-                owner_id=annotation["id"], role="vision-acoustic-audio", owner_revision="0")
+            data = owned_source_bytes(descriptor)
+            artifact = {"id": S.make_id("art", descriptor["sha256"]),
+                        "relative_path": "objects/" + descriptor["sha256"],
+                        "sha256": descriptor["sha256"], "size_bytes": descriptor["size_bytes"]}
+            append_publication({"artifact": artifact, "data": data,
+                                "owner_id": annotation["id"], "role": "vision-acoustic-audio"})
             evidence_ids.append(artifact["id"])
             for claim in acoustic_claims:
                 claim["evidence_ids"] = [artifact["id"]]
@@ -3003,6 +5357,112 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                 claim["evidence_ids"] = list(dict.fromkeys(
                     sample_artifacts[(str(sample["frame_index"]), sample["evidence_sha256"])]
                     for sample in claim["method"]["parameters"].get("sample_frames", [])))
+            elif claim["method"]["id"] == AV.PROVIDER:
+                samples_for_claim = claim["method"]["parameters"].get("sample_frames", [])
+                positions = sorted({0, len(samples_for_claim) // 2,
+                                    len(samples_for_claim) - 1})
+                claim["evidence_ids"] = list(dict.fromkeys(
+                    sample_artifacts[(str(samples_for_claim[position]["frame_index"]),
+                                      samples_for_claim[position]["evidence_sha256"])]
+                    for position in positions if 0 <= position < len(samples_for_claim)))
+            elif claim["method"]["id"] in PORTABLE_PROJECTION_METHODS:
+                claim["evidence_ids"] = list(dict.fromkeys(
+                    sample_artifacts[(str(sample["frame_index"]), sample["evidence_sha256"])]
+                    for sample in claim["method"]["parameters"].get("sample_frames", [])))
+                if not claim["evidence_ids"]:
+                    raise WorkspaceError(
+                        "VISION_EVIDENCE_UNAVAILABLE",
+                        "Portable visual projection claim has no immutable frame evidence")
+    return list(unique.values())
+
+
+def _prepublish_candidate_evidence(store, publication: Sequence[Dict[str, Any]]) -> None:
+    """Register verified bytes outside the final task transaction."""
+    # The depth belongs to the serialized store connection, not to a caller.
+    # Inspect it while holding the same RLock used by transactions: another
+    # thread is allowed to finish normally, while a same-thread nested call
+    # still observes its own active transaction and is refused.
+    with store._mutex:
+        if store._depth or store.conn.in_transaction:
+            raise Conflict(
+                "EVIDENCE_PUBLICATION_IN_TRANSACTION",
+                "Evidence bytes must be published before the final business transaction")
+    for item in publication:
+        if not isinstance(item.get("data"), bytes):
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Prepared evidence must own immutable bytes")
+        artifact = store._put_artifact(item["data"])
+        if artifact != item["artifact"]:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Prepared evidence identity changed before publication")
+
+
+def _verify_prepublished_candidate_evidence(
+        store, publication: Sequence[Dict[str, Any]]) -> None:
+    """Re-read registered objects after publication and before task commit."""
+    seen = set()
+    checked_bytes = 0
+    for item in publication:
+        descriptor = item["artifact"]
+        if descriptor["id"] in seen:
+            continue
+        seen.add(descriptor["id"])
+        try:
+            size = int(descriptor["size_bytes"])
+            checked_bytes += size
+            if (size < 0 or checked_bytes > MAX_EVIDENCE_PUBLICATION_BYTES
+                    or descriptor["relative_path"] != "objects/" + descriptor["sha256"]):
+                raise ValueError("invalid published descriptor")
+            path = store.root / descriptor["relative_path"]
+            _safe(path)
+            before = path.lstat()
+            if (stat.S_ISLNK(before.st_mode)
+                    or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+                    or not stat.S_ISREG(before.st_mode) or before.st_size != size):
+                raise ValueError("published object is not a stable regular file")
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                        != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)):
+                    raise ValueError("published object changed before verification")
+                data = stream.read(size + 1)
+                after_read = os.fstat(stream.fileno())
+            after_path = path.lstat()
+            _safe(path)
+            if (len(data) != size or S.sha256_bytes(data) != descriptor["sha256"]
+                    or (after_read.st_dev, after_read.st_ino, after_read.st_size,
+                        after_read.st_mtime_ns)
+                    != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                    or (after_path.st_dev, after_path.st_ino, after_path.st_size,
+                        after_path.st_mtime_ns)
+                    != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)):
+                raise ValueError("published object identity changed")
+        except (OSError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Prepublished evidence object is unavailable or corrupt") from exc
+
+
+def _bind_candidate_evidence(store, publication: Sequence[Dict[str, Any]],
+                             publication_token: Any) -> None:
+    """Bind preverified registrations inside the final business transaction."""
+    for item in publication:
+        store._bind_preverified_artifact_reference(
+            publication_token, item["artifact"], owner_kind="evidence",
+            owner_id=item["owner_id"], role=item["role"], owner_revision="0")
+
+
+def _publish_candidate_evidence(store, publication: Sequence[Dict[str, Any]]) -> None:
+    """Compatibility helper for callers that publish and bind in one operation."""
+    with store._evidence_publication_scope() as publication_token:
+        _prepublish_candidate_evidence(store, publication)
+        _verify_prepublished_candidate_evidence(store, publication)
+        with store.transaction():
+            _bind_candidate_evidence(store, publication, publication_token)
+
+
+def _attach_candidate_evidence(store, candidate: Dict[str, Any],
+                               annotations: List[Dict[str, Any]]) -> None:
+    """Backward-compatible helper: prepare then publish verified evidence."""
+    _publish_candidate_evidence(store, _prepare_candidate_evidence(store, candidate, annotations))
 
 
 def _frame_seconds(candidate: Dict[str, Any], frame_index: Any) -> Optional[float]:
@@ -3081,7 +5541,8 @@ def _event_time_window(candidate: Dict[str, Any], event: Dict[str, Any],
 
 def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, Any],
                       start: Dict[str, str], end: Dict[str, str],
-                      keyframe: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+                      keyframe: Optional[Dict[str, Any]], *,
+                      projection: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build versioned, observation-only claims for one candidate.
 
     The claims describe what the local detector actually returned: a time
@@ -3107,6 +5568,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
         "measurement": None,
         "uncertainty_reason": "算法候选；未进行人工边界复核",
     }]
+    claims.extend(_portable_projection_claims(candidate, index, window, projection))
     if keyframe is not None:
         claims.append({
             "id": S.make_id("clm", f"{job_id}:{index}:keyframe"),
@@ -3244,6 +5706,11 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
             })
         actions = candidate.get("actions_sampling") or {}
         for number, action in enumerate(actions.get("candidates") or []):
+            if (action.get("action") not in {"走", "跑"}
+                    or action.get("provider") != "subject-translation-v1"
+                    or action.get("method") != "subject-translation-v1"
+                    or action.get("model_run_id") != _module_run_id(job_id, "actions")):
+                continue
             window_seconds = action.get("window_seconds") or {}
             try:
                 left = float(window_seconds.get("start"))
@@ -3253,31 +5720,100 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
             if (not math.isfinite(left) or not math.isfinite(right)
                     or max(left, float(scene["start"])) >= min(right, float(scene["end"]))):
                 continue
+            pts_window = action.get("window_pts")
+            try:
+                if (not isinstance(pts_window, dict) or set(pts_window) != {"start", "end"}
+                        or any(S.rational(pts_window[key]) != pts_window[key]
+                               for key in ("start", "end"))
+                        or S.rational_value(pts_window["start"])
+                        >= S.rational_value(pts_window["end"])):
+                    continue
+            except (TypeError, ValueError, WorkspaceError):
+                continue
             claims.append({
                 "id": S.make_id("clm", f"{job_id}:{index}:action:{number}"),
                 "claim_type": "measured",
-                "statement": (f"主体框位移测得候选动作“{action.get('action')}”"
-                              f"（{left:.3f}–{right:.3f} 秒）；动作类别与主体身份需人工确认。"),
-                "subject_ref": action.get("subject_id"),
-                "time_window": {"start": {"seconds": _seconds_ratio(left)},
-                                "end": {"seconds": _seconds_ratio(right)}},
+                "statement": (f"subject-translation-v1 根据主体框轨迹测得候选动作“{action.get('action')}”"
+                              f"（{left:.3f}–{right:.3f} 秒）；该规则结果与主体身份需人工确认。"),
+                "subject_ref": action.get("subject_ref"),
+                "object_ref": action.get("object_ref"),
+                "recipient_ref": action.get("recipient_ref"),
+                "time_window": {"start": {"seconds": pts_window["start"]},
+                                "end": {"seconds": pts_window["end"]}},
                 "evidence_ids": [],
-                "method": {"id": "subject-translation-v1", "version": "1",
+                "method": {"id": action["provider"], "version": "3",
                            "parameters": {"action": action.get("action"),
-                                          "subject_id": action.get("subject_id"),
+                                          "action_contract": "action-candidate-v3",
+                                          "subject_ref": action.get("subject_ref"),
+                                          "object_ref": action.get("object_ref"),
+                                          "recipient_ref": action.get("recipient_ref"),
+                                          "window_pts": pts_window,
                                           "sample_frames": action.get("sample_frames") or [],
                                           "metrics": action.get("metrics"),
                                           "walk_band": [0.15, 1.2],
                                           "run_band": [1.2, 6.0]}},
-                "model_run_id": _module_run_id(job_id, "actions"),
+                "model_run_id": action["model_run_id"],
                 "score": float(action.get("score") or 0.0),
                 "score_kind": "rule_score",
                 "measurement": {"value": float((action.get("metrics") or {}).get("speed_heights_per_s") or 0.0),
                                 "unit": "subject_heights/s", "basis": "measured",
-                                "analysis_window": {"start": {"seconds": _seconds_ratio(left)},
-                                                    "end": {"seconds": _seconds_ratio(right)}}},
+                                "analysis_window": {"start": {"seconds": pts_window["start"]},
+                                                    "end": {"seconds": pts_window["end"]}}},
                 "uncertainty_reason": action.get("uncertainty")
                 or "仅由主体框位移推出，动作类别需人工确认",
+            })
+        action_video = candidate.get("action_video_sampling") or {}
+        for number, action_window in enumerate(action_video.get("windows") or []):
+            result = action_window.get("result") or {}
+            if (action_window.get("scene_index") != index
+                    or action_window.get("status") != "success"
+                    or result.get("decision") != "auxiliary_candidate"
+                    or result.get("authority") != "auxiliary_window_semantics_only"
+                    or result.get("subject_ref") is not None
+                    or result.get("object_ref") is not None
+                    or result.get("recipient_ref") is not None
+                    or len(result.get("semantic_hints") or []) != 1
+                    or len(claims) >= SS.MAX_CLAIMS):
+                continue
+            hint = result["semantic_hints"][0]
+            if hint not in {"close", "open", "pick_up", "put_down_surface"}:
+                continue
+            input_window = action_window.get("input") or {}
+            pts = input_window.get("window_pts") or {}
+            ranked = result.get("ranked") or []
+            if not ranked:
+                continue
+            top = ranked[0]
+            claims.append({
+                "id": S.make_id("clm", f"{job_id}:{index}:action-video:{number}:{hint}"),
+                "claim_type": "unspecified",
+                "statement": (f"固定 VideoMAE/SSV2 模型在该 16 帧抽样窗口返回语义提示“{hint}”；"
+                              "该提示未绑定主体、物体、接收者或动作完成事实，必须人工复核。"),
+                "subject_ref": None, "object_ref": None, "recipient_ref": None,
+                "time_window": {"start": {"seconds": pts["start"]},
+                                "end": {"seconds": pts["end"]}},
+                "evidence_ids": [],
+                "method": {"id": AV.PROVIDER, "version": "1",
+                           "parameters": {
+                               "auxiliary_hint_contract": ACTION_VIDEO_HINT_CONTRACT,
+                               "semantic_hint": hint,
+                               "decision": result["decision"],
+                               "window_pts": pts,
+                               "sample_frames": list(input_window.get("frames") or []),
+                               "class_id": top.get("class_id"),
+                               "upstream_label": top.get("label"),
+                               "raw_score_kind": result.get("score_kind"),
+                               "authority": result.get("authority"),
+                               "review_status": result.get("review_status"),
+                               "participant_binding": "none",
+                               "supported_hints": list(action_video.get("supported_hints") or []),
+                               "unsupported_actions": list(action_video.get("unsupported_actions") or []),
+                           }},
+                "model_run_id": _module_run_id(job_id, "action_video"),
+                "score": float(top["score"]), "score_kind": "softmax",
+                "measurement": None,
+                "uncertainty_reason": result.get("uncertainty")
+                or "仅为窗口语义提示，不能证明主体、对象、精确动作边界或完成状态",
             })
         acoustics = candidate.get("acoustics_sampling") or {}
         measurement = acoustics.get("measurement") or {}
@@ -3380,6 +5916,9 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 or (None if transition_window_is_exact
                     else "边界事件缺少可用的帧级区间；claim 使用镜头上下文窗口"),
             })
+    for claim in claims:
+        claim.setdefault("object_ref", None)
+        claim.setdefault("recipient_ref", None)
     return {"version": SEMANTIC_VERSION, "claims": claims}
 
 
@@ -3394,6 +5933,7 @@ def _candidate_annotations(candidate: Dict[str, Any], *,
     authoritative. A caption is never treated as a fact.
     """
     annotations = []
+    projection = _build_portable_visual_projection(candidate)
     for index, scene in enumerate(candidate["scenes"]):
         start = _seconds_ratio(float(scene["start"]))
         end = _seconds_ratio(float(scene["end"]))
@@ -3406,6 +5946,13 @@ def _candidate_annotations(candidate: Dict[str, Any], *,
         keyframe = next((frame for frame in candidate["keyframes"]
                          if frame["scene_index"] == index), None)
         tags = ["vision-candidate", "auto-scene-cut"]
+        projected_scene = (projection.get("scenes") or {}).get(str(index), {})
+        if "object" in projected_scene:
+            tags.append("vision-object-candidate")
+        if "relations" in projected_scene:
+            tags.append("vision-relation-candidate")
+        if "hands" in projected_scene:
+            tags.append("vision-hand-landmarks")
         text_draft = ""
         if keyframe is not None:
             face = keyframe.get("face", {})
@@ -3448,6 +5995,14 @@ def _candidate_annotations(candidate: Dict[str, Any], *,
                 if (math.isfinite(left) and math.isfinite(right)
                         and max(left, float(scene["start"])) < min(right, float(scene["end"]))):
                     tags.append("vision-action-" + str(action.get("action")))
+            for action_window in (candidate.get("action_video_sampling") or {}).get("windows") or []:
+                result = action_window.get("result") or {}
+                if (action_window.get("scene_index") == index
+                        and action_window.get("status") == "success"
+                        and result.get("decision") == "auxiliary_candidate"):
+                    for hint in result.get("semantic_hints") or []:
+                        if hint in {"close", "open", "pick_up", "put_down_surface"}:
+                            tags.append("vision-action-window-" + hint)
             if index == 0 and (candidate.get("acoustics_sampling") or {}).get("status") == "success":
                 tags.append("vision-acoustics")
             for event in keyframe.get("boundary_events") or []:
@@ -3460,7 +6015,8 @@ def _candidate_annotations(candidate: Dict[str, Any], *,
             "text": text_draft,
             "tags": tags,
             "track": CANDIDATE_TRACK,
-            "attributes": {"semantic": _candidate_claims(candidate, index, scene, start, end, keyframe)},
+            "attributes": {"semantic": _candidate_claims(
+                candidate, index, scene, start, end, keyframe, projection=projection)},
             "evidence_ids": [],
             "provenance": {"origin": "model_candidate", "actor_id": "vision-worker",
                            "job_id": candidate["job_id"]},

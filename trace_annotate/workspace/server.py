@@ -12,6 +12,7 @@ import secrets
 import socket
 import threading
 import time
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -745,7 +746,12 @@ class _Handler(BaseHTTPRequestHandler):
             if len(parts) > 1:
                 _require_id(parts[1], "resource_id")
             raw, body = self._read_body()
-            with store.transaction():
+            # Vision apply deliberately prepares and publishes immutable
+            # evidence before its short final task transaction. Wrapping the
+            # whole request in the generic server transaction would hold a
+            # write lock across file reads/JPEG encoding and defeat that
+            # contract, so this one route owns its transaction boundaries.
+            with (nullcontext() if vision_apply else store.transaction()):
                 if render_submit:
                     _fields(body, {"command_id", "expected_revision", "expected_sha256", "recipe"})
                     result = self.server.render_jobs.submit(parts[1], **body)

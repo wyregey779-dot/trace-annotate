@@ -58,12 +58,23 @@ owners. Its contents are passive source provenance and are not executed or
 treated as current approval. A standalone professional JSON carries the current
 task in full and historical artifact descriptors, not those artifact bytes.
 
-Version1 accepts the supported annotation fields, `visual-semantics-v1` claims
-and evidence IDs backed by verifiable registered artifacts. Arbitrary custom
+Version1 accepts the supported annotation fields, frozen `visual-semantics-v1`,
+`visual-semantics-v2` and `visual-semantics-v3` claims, and evidence IDs backed
+by verifiable registered artifacts. Arbitrary custom
 attributes are rejected explicitly. Semantic claims, model-run provenance,
 review state and evidence descriptors remain in the exported current task.
 Unknown versions, malformed data, invalid digests, stale revisions and reused
 command IDs with different requests are rejected without replacing saved data.
+
+An applied optional VideoMAE result is exported only as an unreviewed
+`videomae-window-hint-v1` semantic hint. It records the exact sixteen-frame
+window, pinned local model identity and path-redacted owned-process receipt,
+while all participant references remain null. It does not overwrite the
+independent subject-translation walk/run candidate and is not an
+`action-candidate-v3` fact. Missing or failed model runs remain explicit run
+receipts and produce no hint claim. Professional export/import preserves this
+distinction and its durable preview evidence; it never upgrades the hint to
+human review.
 
 The HTTP command/document limit is1MiB; the exporter reserves4KiB of that limit
 for the import command envelope. The current task must remain within

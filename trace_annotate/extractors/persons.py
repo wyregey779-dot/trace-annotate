@@ -9,12 +9,14 @@ identity, absence-of-person, action, or calibrated probability is asserted.
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-from .base import BaseExtractor
+from .base import BaseExtractor, safe_failure_reason
 
 PROVIDER = 'nanodet-person-v1'
 OFFICIAL_WEIGHTS_SHA256 = '4b82da9944b88577175ee23a459dce2e26e6e4be573def65b1055dc2d9720186'
@@ -24,6 +26,47 @@ SCORE_THRESHOLD = .5
 NMS_THRESHOLD = .5
 MAX_PERSONS = 100
 MAX_MODEL_BYTES = 32 * 1024 * 1024
+
+
+def _reject_reparse_components(path: Path) -> None:
+    absolute = path.absolute()
+    for component in (absolute, *absolute.parents):
+        try:
+            info = component.lstat()
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(info.st_mode)
+                or bool(getattr(info, 'st_file_attributes', 0) & 0x400)):
+            raise ValueError('person_model_must_be_regular_file')
+
+
+def _read_stable_model(path: Path) -> bytes:
+    _reject_reparse_components(path)
+    before = path.lstat()
+    if (stat.S_ISLNK(before.st_mode)
+            or bool(getattr(before, 'st_file_attributes', 0) & 0x400)
+            or not stat.S_ISREG(before.st_mode)):
+        raise ValueError('person_model_must_be_regular_file')
+    if before.st_size > MAX_MODEL_BYTES:
+        raise ValueError('person_model_exceeds_byte_budget')
+    with path.open('rb') as source:
+        opened = os.fstat(source.fileno())
+        if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)):
+            raise ValueError('person_model_changed_during_read')
+        data = source.read(MAX_MODEL_BYTES + 1)
+        after_read = os.fstat(source.fileno())
+    after_path = path.lstat()
+    _reject_reparse_components(path)
+    if (len(data) > MAX_MODEL_BYTES
+            or (after_read.st_dev, after_read.st_ino, after_read.st_size,
+                after_read.st_mtime_ns)
+            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            or (after_path.st_dev, after_path.st_ino, after_path.st_size,
+                after_path.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)):
+        raise ValueError('person_model_changed_during_read')
+    return data
 
 
 def decode_person_outputs(outputs: Sequence[Any], frame_size: Sequence[int],
@@ -37,9 +80,17 @@ def decode_person_outputs(outputs: Sequence[Any], frame_size: Sequence[int],
     """
     if len(outputs) != 6:
         raise ValueError('unexpected_nanodet_output_count')
+    if (not isinstance(threshold, (int, float)) or isinstance(threshold, bool)
+            or not np.isfinite(float(threshold)) or not 0 <= float(threshold) <= 1):
+        raise ValueError('invalid_person_score_threshold')
+    if len(frame_size) != 2 or len(transform) != 4:
+        raise ValueError('invalid_frame_transform')
     width, height = frame_size
     sx, sy, left, top = transform
-    if width <= 0 or height <= 0 or sx <= 0 or sy <= 0:
+    values = (width, height, sx, sy, left, top)
+    if (any(not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not np.isfinite(float(value)) for value in values)
+            or width <= 0 or height <= 0 or sx <= 0 or sy <= 0):
         raise ValueError('invalid_frame_transform')
     candidates = []
     for level, stride in enumerate(STRIDES):
@@ -51,12 +102,17 @@ def decode_person_outputs(outputs: Sequence[Any], frame_size: Sequence[int],
             raise ValueError('unexpected_nanodet_output_shape')
         if not np.isfinite(cls).all() or not np.isfinite(raw).all():
             raise ValueError('nonfinite_nanodet_output')
+        if np.any(cls < 0) or np.any(cls > 1):
+            raise ValueError('invalid_nanodet_score_range')
         selected = np.flatnonzero((cls[0, :, 0] >= threshold)
                                   & (cls[0].argmax(axis=1) == 0))
         for index in selected:
             logits = raw[0, index].reshape(4, 8).astype(np.float64)
             probs = np.exp(logits - logits.max(axis=1, keepdims=True))
-            probs /= probs.sum(axis=1, keepdims=True)
+            totals = probs.sum(axis=1, keepdims=True)
+            if not np.isfinite(totals).all() or np.any(totals <= 0):
+                raise ValueError('invalid_nanodet_distribution')
+            probs /= totals
             distance = (probs @ np.arange(8)) * stride
             cx = (index % side) * stride + (stride - 1) * .5
             cy = (index // side) * stride + (stride - 1) * .5
@@ -97,17 +153,10 @@ class PersonExtractor(BaseExtractor):
         self._status, self._reason = 'not_run', 'person_weights_unavailable'
         self.weights_sha256 = None
         self.runtime_version = 'unavailable'
-        if not model_path or not Path(model_path).is_file():
+        if not model_path:
             return
         try:
-            if Path(model_path).stat().st_size > MAX_MODEL_BYTES:
-                self._status, self._reason = 'failed', 'person_model_exceeds_byte_budget'
-                return
-            with Path(model_path).open('rb') as source:
-                data = source.read(MAX_MODEL_BYTES + 1)
-            if len(data) > MAX_MODEL_BYTES:
-                self._status, self._reason = 'failed', 'person_model_exceeds_byte_budget'
-                return
+            data = _read_stable_model(Path(model_path))
             self.weights_sha256 = hashlib.sha256(data).hexdigest()
             if expected_sha256 and self.weights_sha256 != expected_sha256:
                 self._status, self._reason = 'failed', 'weights_hash_mismatch'
@@ -125,8 +174,14 @@ class PersonExtractor(BaseExtractor):
             self.model = ort.InferenceSession(data, sess_options=options,
                                               providers=['CPUExecutionProvider'])
             self._status, self._reason = 'success', None
+        except FileNotFoundError:
+            return
+        except ValueError as exc:
+            self._status = 'failed'
+            self._reason = safe_failure_reason(exc, 'person_model_load_failed')
         except Exception as exc:
-            self._status, self._reason = 'failed', 'person_model_load_failed: ' + str(exc)[:240]
+            self._status = 'failed'
+            self._reason = safe_failure_reason(exc, 'person_model_load_failed')
 
     @property
     def name(self) -> str:
@@ -168,7 +223,8 @@ class PersonExtractor(BaseExtractor):
                         persons_detected=detections,
                         uncertainty='Model detections may include screen people or statues; zero detections do not prove absence.')
         except Exception as exc:
-            return dict(empty, status='failed', reason='person_inference_failed: ' + str(exc)[:240])
+            return dict(empty, status='failed',
+                        reason=safe_failure_reason(exc, 'person_inference_failed'))
 
     def extract(self, asset_item: Dict[str, Any], staged_path: str) -> Dict[str, Any]:
         from ..core.hasher import safe_load_image

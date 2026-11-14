@@ -18,6 +18,21 @@ from trace_annotate.workspace import vision_jobs as V
 from tests.test_workspace_vision_jobs import clip, store, task, submit
 
 
+CURRENT_MODEL_RUN_MODULES = frozenset({
+    "face", "person", "object", "landmarks", "expressive", "hands",
+    "ocr", "clip", "vlm", "scene", "motion", "content", "actions",
+    "action_video", "object_relations", "acoustics", "boundary",
+})
+
+
+def assert_current_model_run_set(result, job_id):
+    expected = {V._module_run_id(job_id, module)
+                for module in CURRENT_MODEL_RUN_MODULES}
+    actual = {run["id"] for run in result["model_runs"]}
+    assert len(actual) == len(result["model_runs"]), "model-run ids must be unique"
+    assert actual == expected
+
+
 def settings():
     return dict(R.policy(), wait_seconds=.1, frame_seconds=.1)
 
@@ -311,7 +326,7 @@ def test_normal_pipeline_uses_separate_phases_and_releases_models(store,monkeypa
         assert jobs.run_pending()[0]['state']=='succeeded'
         result=jobs.result(queued['id'])
         assert calls==['clip','vlm']
-        assert len(result['model_runs'])==13
+        assert_current_model_run_set(result,queued['id'])
         assert jobs.options()['capabilities']['clip']=='unavailable'
         assert all(frame['clip']['status']=='not_run' for frame in result['keyframes'])
     finally:
@@ -418,7 +433,7 @@ def test_completed_pre_resource_candidate_keeps_read_and_apply_paths(store,monke
             assert jobs.run_pending()[0]['state']=='succeeded'
         old=jobs.result(batch['jobs'][0]['id'])
         assert 'model_resources' not in old['job_identity']['config']
-        assert len(old['model_runs'])==13
+        assert_current_model_run_set(old,batch['jobs'][0]['id'])
         jobs.apply(batch['jobs'][0]['id'],command_id='apply-old-resource-candidate',
             expected_revision=current['revision'],expected_sha256=current['content_sha256'],request_body=b'{}')
         assert jobs.result(batch['jobs'][0]['id'])==old

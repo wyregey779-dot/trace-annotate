@@ -1,6 +1,7 @@
 """Bounded acoustic decoding and honest energy-activity semantics."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -41,6 +42,9 @@ def test_measure_audio_decodes_only_the_requested_window_without_pcm_pipe_captur
                               cancelled=lambda: False)
     assert result["status"] == "success"
     assert result["window_seconds"] == {"start": 12.5, "end": 14.0}
+    assert type(result["requested_window_seconds"]["start"]) is float
+    assert type(result["coverage"]["requested_seconds"]) is float
+    json.dumps(V._jsonable(result), allow_nan=False)
     assert result["measurement"]["window_seconds"]["start"] == 12.5
     assert result["measurement"]["activity_kind"] == "energy_above_adaptive_threshold"
     decode = commands[0]

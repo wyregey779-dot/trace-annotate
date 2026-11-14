@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import copy
 import base64
+import hashlib
 import shutil
 import subprocess
 import threading
@@ -228,10 +229,17 @@ def test_action_projection_requires_positive_half_open_scene_overlap():
                      {"action": "touch-left", "window_seconds": {"start": 0.0, "end": 1.0}},
                      {"action": "touch-right", "window_seconds": {"start": 2.0, "end": 3.0}},
                      {"action": "empty", "window_seconds": {"start": 1.5, "end": 1.5}},
-                     {"action": "walking", "window_seconds": {"start": 1.25, "end": 1.75}},
+                     {"action": "走", "window_seconds": {"start": 1.25, "end": 1.75},
+                      "window_pts": {"start": S.rational(1.25),
+                                     "end": S.rational(1.75)},
+                      "subject_ref": "subject-1", "object_ref": None, "recipient_ref": None,
+                      "provider": "subject-translation-v1", "method": "subject-translation-v1",
+                      "model_run_id": V._module_run_id("job-action-window", "actions"),
+                      "sample_frames": [], "metrics": {"speed_heights_per_s": .5},
+                      "score": .5, "uncertainty": "requires review"},
                  ]}}
     annotation = V._candidate_annotations(candidate)[0]
-    assert [tag for tag in annotation["tags"] if tag.startswith("vision-action-")] == ["vision-action-walking"]
+    assert [tag for tag in annotation["tags"] if tag.startswith("vision-action-")] == ["vision-action-走"]
     actions = [claim for claim in annotation["attributes"]["semantic"]["claims"]
                if claim["method"]["id"] == "subject-translation-v1"]
     assert len(actions) == 1
@@ -306,6 +314,170 @@ def test_model_runs_use_loaded_weight_identity_and_separate_licenses():
     assert ocr["preprocessing"]["weights_files"] == [{"role": "det", "sha256": "c" * 64, "size_bytes": 123}]
 
 
+def test_object_pipeline_associates_sparse_samples_without_asserting_actions():
+    keyframes = []
+    for index, (frame, seconds) in enumerate(((0, 0), (90, 3), (180, 6))):
+        digest = f"{index + 1:064x}"
+        x = index * 8
+        keyframes.append({
+            "scene_index": 0, "frame_index": str(frame),
+            "timestamp": S.rational(seconds), "evidence_sha256": digest,
+            "object": {"status": "success", "reason": None, "provider": V.OBJECT_PROVIDER,
+                       "objects_detected": [{"class_id": 39, "class_label": "bottle",
+                                             "box": [x, 0, x + 10, 10], "score": .8,
+                                             "score_kind": "model_score_uncalibrated"}]},
+            "person": {"status": "success", "persons_detected": [
+                {"box": [x + 9, 0, x + 49, 20], "confidence": .9}]},
+            "face": {"status": "not_run"},
+        })
+    sampling, relations = V._object_analysis(keyframes, "job-objects")
+    assert sampling["status"] == "success"
+    assert sampling["tracking"]["parameters"]["max_gap_frames"] == 89
+    assert sampling["tracking"]["parameters"]["max_gap_seconds"] == 5.0
+    assert len(sampling["tracking"]["tracks"]) == 1
+    assert sampling["tracking"]["scope"].startswith("sparse_observation_")
+    assert relations["status"] == "success"
+    assert {item["relation"] for item in relations["relations"]} >= {
+        "near", "contact_candidate", "co_moving", "held_by"}
+    assert all("action" not in item for item in relations["relations"])
+    assert relations["unsupported_action_assertions"] == [
+        "pick_up", "put_down", "open", "close", "hand_over"]
+
+
+def test_object_pipeline_caps_each_sample_and_discloses_truncation():
+    detections = [{"class_id": 39, "class_label": "bottle", "box": [i, 0, i + 1, 1],
+                   "score": .8, "score_kind": "model_score_uncalibrated"}
+                  for i in range(V.MAX_OBJECTS_PER_KEYFRAME + 3)]
+    extractor = SimpleNamespace(detect_objects=lambda frame: {
+        "status": "success", "reason": None, "provider": V.OBJECT_PROVIDER,
+        "object_count": len(detections), "objects_detected": detections,
+        "excluded_class_ids": [0]})
+    result = V._run_object(np.zeros((4, 4, 3), dtype=np.uint8), extractor)
+    assert result["object_count"] == V.MAX_OBJECTS_PER_KEYFRAME
+    assert result["detector_object_count"] == len(detections)
+    assert result["truncated"] is True
+    assert len(result["objects_detected"]) == V.MAX_OBJECTS_PER_KEYFRAME
+
+
+def test_hand_sampling_is_bounded_uniform_and_covers_both_ends():
+    decoded = [{"frame_index": str(index), "sha256": f"{index:064x}"}
+               for index in range(100)]
+    selected = V._uniform_hand_sample_keys(decoded)
+    indexes = sorted(int(frame) for frame, _digest in selected)
+    assert len(selected) == V.MAX_HAND_KEYFRAMES
+    assert indexes[0] == 0 and indexes[-1] == 99
+    assert max(right - left for left, right in zip(indexes, indexes[1:])) <= 7
+    assert V._uniform_hand_sample_keys([]) == set()
+    assert V._uniform_hand_sample_keys(decoded[:1]) == {("0", f"{0:064x}")}
+
+
+def test_hand_observations_bind_frame_evidence_run_and_reject_tampering():
+    config = V._validate_hand_configuration({
+        "contract": V.HAND_EVIDENCE_CONTRACT, "provider": V.HAND_PROVIDER,
+        "model": {"status": "available", "name": "hand_landmarker.task",
+                  "path_identity_sha256": "1" * 64,
+                  "sha256": V.HAND_WEIGHTS_SHA256,
+                  "size_bytes": str(V.HAND_MODEL_SIZE)},
+        "expected_size_bytes": str(V.HAND_MODEL_SIZE),
+        "expected_sha256": V.HAND_WEIGHTS_SHA256,
+        "runtime_version": "0.test", "offline": True,
+        "authority": "hand_keypoint_observations_only",
+        "cancellation_boundary": "owned_subprocess_polled_during_inference",
+        "sampling_policy": V.HAND_SAMPLING_POLICY,
+        "max_frames_per_job": V.MAX_HAND_KEYFRAMES,
+        "phase_timeout_seconds": V.HAND_PHASE_TIMEOUT_SECONDS,
+    })
+    job_id, run_id = "job-hand-binding", V._module_run_id("job-hand-binding", "hands")
+    pts, evidence, pixel = {"n": "1", "d": "2"}, "2" * 64, "3" * 64
+    observation_identity = {
+        "scene_index": 2, "frame_index": "7", "pts": pts,
+        "evidence_sha256": evidence, "pixel_sha256": pixel,
+        "model_run_id": run_id, "hand_index": 0,
+    }
+    encoded = json.dumps(observation_identity, ensure_ascii=True, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("ascii")
+    observation = {
+        "contract": V.HAND_EVIDENCE_CONTRACT,
+        "observation_id": "handobs-" + hashlib.sha256(encoded).hexdigest()[:40],
+        **observation_identity, "subject_ref": None,
+        "landmark_names": list(V.HAND_LANDMARK_NAMES),
+        "landmarks_normalized": [[.1 + index / 1000, .2 + index / 1000, 0.0]
+                                  for index in range(21)],
+        "landmarks_pixel": [[2.0 + index / 10, 2.0 + index / 10, 0.0]
+                            for index in range(21)],
+        "world_landmarks_m": [[index / 1000, index / 2000, 0.0]
+                              for index in range(21)],
+        "box_xyxy": [1.0, 1.0, 10.0, 8.0], "outside_frame": False,
+        "handedness_raw": "Left", "handedness_score": .8,
+        "handedness_category_index": 1,
+        "handedness_score_kind": "mediapipe_category_score_uncalibrated",
+        "handedness_mirrored_input_assumption_verified": False,
+        "review_status": "unreviewed",
+        "uncertainty": "Unreviewed keypoints do not establish touch, grasp or action.",
+    }
+    raw_identity = {
+        "provider": "mediapipe-tasks-cpu", "model_name": V.HAND_PROVIDER,
+        "model_version": "float16/1", "model_source": V.HAND_MODEL_URL,
+        "model_card": V.HAND_MODEL_CARD, "weights_path": r"D:\private\hand.task",
+        "weights_size": V.HAND_MODEL_SIZE, "weights_sha256": V.HAND_WEIGHTS_SHA256,
+        "license": V.HAND_MODEL_LICENSE, "license_source": V.HAND_LICENSE_SOURCE,
+        "runtime_license_source": V.HAND_RUNTIME_LICENSE_SOURCE,
+        "runtime_version": "0.test", "code_version": V.HAND_CODE_VERSION,
+        "running_mode": "IMAGE", "max_hands": 4, "offline": True,
+        "downloads_allowed": False, "authority": "hand_keypoint_observations_only",
+    }
+    raw_result = {
+        "status": "success", "hands": [observation], "provider": "hand_landmarks",
+        "model_identity": raw_identity, "fingerprint": "ignored",
+        "review_status": "unreviewed", "authority": "hand_keypoint_observations_only",
+        "unsupported_assertions": list(V.HAND_UNSUPPORTED_ASSERTIONS),
+        "cancellation_boundary": "owned_subprocess_polled_during_inference",
+        "frame_identity": {"scene_index": 2, "frame_index": "7", "pts": pts,
+                           "evidence_sha256": evidence, "pixel_sha256": pixel,
+                           "model_run_id": run_id, "shape": [10, 20, 3]},
+    }
+    extractor = SimpleNamespace(
+        code_identity=raw_identity,
+        analyze_frame=lambda *_args, **_kwargs: copy.deepcopy(raw_result))
+    result = V._run_hands(
+        np.zeros((10, 20, 3), dtype=np.uint8), extractor,
+        scene_index=2, frame_index="7", pts=pts, evidence_sha256=evidence,
+        model_run_id=run_id, configuration=config, cancelled=lambda: False)
+    assert "weights_path" not in result["model_identity"]
+    assert result["model_identity"]["path_identity_sha256"] == "1" * 64
+    frame = {"scene_index": 2, "frame_index": "7", "timestamp": pts,
+             "evidence_sha256": evidence, "hands": result}
+    run = V._model_run_record(
+        job_id, "hands", provider="mediapipe-tasks-cpu", model_name=V.HAND_PROVIDER,
+        model_version="float16/1", weights_sha256=V.HAND_WEIGHTS_SHA256,
+        license=V.HAND_MODEL_LICENSE,
+        preprocessing={"path_identity_sha256": "1" * 64},
+        parameters={"max_hands": 4, "offline": True, "downloads_allowed": False,
+                    "authority": "hand_keypoint_observations_only",
+                    "cancellation_boundary": "owned_subprocess_polled_during_inference",
+                    "sampling_policy": V.HAND_SAMPLING_POLICY,
+                    "max_frames_per_job": V.MAX_HAND_KEYFRAMES,
+                    "phase_timeout_seconds": V.HAND_PHASE_TIMEOUT_SECONDS,
+                    "coverage": V._hand_coverage([frame]),
+                    "unsupported_assertions": list(V.HAND_UNSUPPORTED_ASSERTIONS)},
+        input_value=V._keyframe_input([frame]), output_value=V._frame_output([frame], "hands"),
+        status="success", failure_reason=None,
+        code_version=f"vision_jobs={V.VERSION}; hands={V.HAND_CODE_VERSION}")
+    V._validate_hand_analysis([frame], job_id=job_id, model_runs=[run],
+                              evidence_hashes={evidence}, configuration=config)
+    for mutate in (
+            lambda value: value["hands"][0].update(model_run_id="run-other"),
+            lambda value: value["hands"][0].update(action="grasp"),
+            lambda value: value["hands"][0].update(review_status="accepted"),
+            lambda value: value["frame_identity"].update(pts={"n": "2", "d": "3"})):
+        changed = copy.deepcopy(result)
+        mutate(changed)
+        altered = dict(frame, hands=changed)
+        fail_code("RECOVERY_REQUIRED", lambda value=altered: V._validate_hand_analysis(
+            [value], job_id=job_id, model_runs=[run], evidence_hashes={evidence},
+            configuration=config))
+
+
 def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights", vlm_model_path="nonexistent-vlm-weights")
     initial = task(store)
@@ -315,6 +487,7 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert identity["pipeline"] == "vision-assist-v1"
     assert len(identity["config_sha256"]) == 64
     assert identity["config"]["sampling"]["max_frames"] == V.MAX_KEYFRAMES
+    assert identity["config"]["hand_landmarks"]["model"]["status"] == "unavailable"
     fail_code("VISION_NOT_READY", lambda: jobs.result(queued["id"]))
     done = jobs.run_pending()[0]
     assert done["state"] == "succeeded"
@@ -336,10 +509,32 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
                for item in content["scene_results"])
     runs = result["model_runs"]
     modules = {"face", "ocr", "clip", "vlm", "scene", "motion", "content",
-               "actions", "acoustics", "boundary", "person", "landmarks", "expressive"}
+               "actions", "object_relations", "acoustics", "boundary", "person", "object",
+                   "landmarks", "expressive", "hands", "action_video"}
     run_ids = {run["id"] for run in runs}
-    assert len(run_ids) == len(runs) == len(modules)
-    assert run_ids == {V._module_run_id(queued["id"], name) for name in modules}
+    expected_run_ids = {V._module_run_id(queued["id"], name) for name in modules}
+    assert len(run_ids) == len(runs), "duplicate model-run ids must be rejected"
+    assert not (expected_run_ids - run_ids), "required model-run ids are missing"
+    assert not (run_ids - expected_run_ids), "unexpected model-run ids are present"
+    duplicate_runs = copy.deepcopy(result)
+    duplicate_runs["model_runs"].append(copy.deepcopy(duplicate_runs["model_runs"][0]))
+    fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(
+        duplicate_runs, jobs.queue.get_job(queued["id"])))
+    missing_actions_run = copy.deepcopy(result)
+    missing_actions_run["model_runs"] = [run for run in missing_actions_run["model_runs"]
+                                          if run["id"] != V._module_run_id(queued["id"], "actions")]
+    fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(
+        missing_actions_run, jobs.queue.get_job(queued["id"])))
+    for module in ("object", "object_relations", "hands"):
+        missing_object_run = copy.deepcopy(result)
+        missing_object_run["model_runs"] = [run for run in missing_object_run["model_runs"]
+                                             if run["id"] != V._module_run_id(queued["id"], module)]
+        fail_code("RECOVERY_REQUIRED", lambda value=missing_object_run: jobs._validate_candidate(
+            value, jobs.queue.get_job(queued["id"])))
+    tampered_relations = copy.deepcopy(result)
+    tampered_relations["object_relations"]["scope"] = "action_recognition"
+    fail_code("RECOVERY_REQUIRED", lambda: jobs._validate_candidate(
+        tampered_relations, jobs.queue.get_job(queued["id"])))
     assert all(claim["model_run_id"] is None or claim["model_run_id"] in run_ids
                for annotation in V._candidate_annotations(result)
                for claim in annotation["attributes"]["semantic"]["claims"])
@@ -351,11 +546,29 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
     assert content_run["parameters"]["reported_outcome_status"] == "insufficient_samples"
     for run in runs:
         assert SS.validate_model_run(run) == run
-    for module in ("person", "landmarks", "expressive"):
+    for module in ("person", "object", "landmarks", "expressive", "hands"):
         optional_run = next(run for run in runs if run["id"] == V._module_run_id(queued["id"], module))
         assert optional_run["status"] == "not_run"
         assert optional_run["failure_reason"]
         assert optional_run["output_sha256"] is None
+    assert result["extractor_status"]["hands"] == "not_run"
+    assert all(frame["hands"]["status"] == "not_run"
+               and frame["hands"]["reason"] == "hand_landmark_weights_missing"
+               and frame["hands"]["hands"] == [] for frame in result["keyframes"])
+    outcomes = result["actions_sampling"]["class_results"]
+    assert set(outcomes) == set(V.ACTION_VOCAB)
+    for action in ("拿起", "放下", "打开", "关闭", "递交"):
+        assert outcomes[action]["status"] == "not_run"
+        assert outcomes[action]["reason"] == "provider_unavailable"
+    action_run = next(run for run in runs if run["id"] == V._module_run_id(queued["id"], "actions"))
+    assert action_run["provider"] == "subject-translation-v1"
+    assert result["object_sampling"]["status"] == "not_run"
+    assert result["object_sampling"]["tracking"]["status"] == "not_run"
+    assert result["object_relations"]["status"] == "not_run"
+    assert result["object_relations"]["relations"] == []
+    relation_run = next(run for run in runs
+                        if run["id"] == V._module_run_id(queued["id"], "object_relations"))
+    assert relation_run["status"] == "not_run"
     assert any(run["status"] == "not_run" and run["failure_reason"] for run in runs)
     assert all(run["status"] == "success" or run["failure_reason"] for run in runs)
     assert len(result["scenes"]) >= 1
@@ -522,7 +735,7 @@ def test_apply_imports_candidates_as_model_candidate_and_refuses_reviewed(store)
     assert all(a["review_status"] == "unreviewed" for a in after["annotations"])
     for annotation in after["annotations"]:
         semantic = annotation["attributes"]["semantic"]
-        assert semantic["version"] == "visual-semantics-v2"
+        assert semantic["version"] == "visual-semantics-v3"
         assert semantic["claims"]
         assert all(claim["claim_type"] in {"observable", "measured"}
                    for claim in semantic["claims"])
@@ -556,11 +769,14 @@ def test_apply_projection_preflight_preserves_receipts_and_immutable_objects(sto
         before_receipts = list(store.conn.execute("SELECT command_id,request_sha256 FROM command_receipts"))
         invalid = copy.deepcopy(candidate)
         invalid["scenes"][0] = {"start": 1.5, "end": 2.0, "duration": 0.5}
-        monkeypatch.setattr(jobs, "result", lambda job_id: invalid)
+        _, result_snapshot = jobs._read_result_with_snapshot(queued["id"])
+        monkeypatch.setattr(jobs, "_read_result_with_snapshot",
+                            lambda job_id: (invalid, result_snapshot))
         fail_code("VISION_CANDIDATE_OUTSIDE_MEDIA", lambda: jobs.apply(
             queued["id"], command_id="outside-media", expected_revision=current["revision"],
             expected_sha256=current["content_sha256"], request_body=b"{}"))
-        monkeypatch.setattr(jobs, "result", lambda job_id: candidate)
+        monkeypatch.setattr(jobs, "_read_result_with_snapshot",
+                            lambda job_id: (candidate, result_snapshot))
         fail_code("REVISION_CONFLICT", lambda: jobs.apply(
             queued["id"], command_id="stale-projection", expected_revision=current["revision"] + 1,
             expected_sha256=current["content_sha256"], request_body=b"{}"))
@@ -599,11 +815,62 @@ def test_apply_replays_committed_projection_after_mapper_changes(store, monkeypa
             payload={"annotation_id": after["annotations"][0]["id"], "changes": {"text": "later edit"}},
             request_body=b"{}")
         edited = task(store)
+        # A committed command is replayed from its immutable task revision,
+        # not from the disposable candidate object.
+        descriptor = jobs.queue.get_job(queued["id"])["commit"]["artifact"]
+        candidate_path = store.root / descriptor["relative_path"]
+        candidate_path.write_bytes(b"x" * int(descriptor["size_bytes"]))
         assert jobs.apply(queued["id"], **arguments) == original_receipt
         assert task(store) == edited
         assert {path.name for path in store.objects_dir.iterdir()} == objects
         fail_code("IDEMPOTENCY_CONFLICT", lambda: jobs.apply(
             queued["id"], **dict(arguments, request_body=b"different-body")))
+    finally:
+        jobs.close()
+
+
+def test_concurrent_identical_apply_is_one_commit_and_one_replay(store, monkeypatch):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        current = task(store)
+        queued = submit(jobs, command_id="concurrent-submit")["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        barrier = threading.Barrier(2)
+        original = V._prepublish_candidate_evidence
+
+        def aligned(project, publication):
+            original(project, publication)
+            barrier.wait(timeout=20)
+
+        monkeypatch.setattr(V, "_prepublish_candidate_evidence", aligned)
+        arguments = dict(command_id="concurrent-apply",
+                         expected_revision=current["revision"],
+                         expected_sha256=current["content_sha256"],
+                         request_body=b"same-request")
+        results = []
+        errors = []
+
+        def apply_one():
+            try:
+                results.append(jobs.apply(queued["id"], **arguments))
+            except BaseException as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=apply_one) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(30)
+        assert all(not worker.is_alive() for worker in workers)
+        assert not errors
+        assert len(results) == 2 and results[0] == results[1]
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM command_receipts WHERE command_id='concurrent-apply'").fetchone()[0] == 1
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM durable_commits WHERE id=?",
+            (results[0]["commit_id"],)).fetchone()[0] == 1
+        assert task(store)["revision"] == current["revision"] + 1
     finally:
         jobs.close()
 
@@ -816,6 +1083,151 @@ def test_content_evidence_does_not_borrow_another_decode_of_the_same_frame(tmp_p
         project.close()
 
 
+def test_prepared_evidence_publication_rolls_back_database_bindings(tmp_path):
+    project = WorkspaceStore(tmp_path / "evidence-transaction")
+    project.create()
+    try:
+        data = b"prepared-vision-evidence"
+        digest = S.sha256_bytes(data)
+        artifact = {"id": S.make_id("art", digest),
+                    "relative_path": "objects/" + digest,
+                    "sha256": digest, "size_bytes": str(len(data))}
+        publication = [{"artifact": artifact, "data": data, "path": None,
+                        "owner_id": "ann-transaction", "role": "vision-sample-preview"}]
+        with project._evidence_publication_scope() as publication_token:
+            V._prepublish_candidate_evidence(project, publication)
+            with pytest.raises(RuntimeError, match="late apply failure"):
+                with project.transaction():
+                    V._bind_candidate_evidence(project, publication, publication_token)
+                    raise RuntimeError("late apply failure")
+        assert project.conn.execute(
+            "SELECT 1 FROM artifacts WHERE id=?", (artifact["id"],)).fetchone() is not None
+        assert project.conn.execute(
+            "SELECT 1 FROM artifact_references WHERE artifact_id=?", (artifact["id"],)).fetchone() is None
+        assert (project.root / artifact["relative_path"]).read_bytes() == data
+        cleaned = project.sweep_unbound_artifacts(apply=True)
+        assert cleaned["removed"] == 1
+        assert not (project.root / artifact["relative_path"]).exists()
+    finally:
+        project.close()
+
+
+def test_prepublish_waits_for_another_thread_transaction(store):
+    data = b"serialized-prepublication"
+    digest = S.sha256_bytes(data)
+    artifact = {"id": S.make_id("art", digest),
+                "relative_path": "objects/" + digest,
+                "sha256": digest, "size_bytes": str(len(data))}
+    publication = [{"artifact": artifact, "data": data,
+                    "owner_id": "ann-serialized", "role": "vision-sample-preview"}]
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    errors = []
+
+    def hold_transaction():
+        try:
+            with store.transaction():
+                entered.set()
+                if not release.wait(15):
+                    raise TimeoutError("transaction release timed out")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def publish():
+        try:
+            V._prepublish_candidate_evidence(store, publication)
+            completed.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    owner = threading.Thread(target=hold_transaction)
+    publisher = threading.Thread(target=publish)
+    owner.start()
+    assert entered.wait(10)
+    publisher.start()
+    assert not completed.wait(.2)
+    release.set()
+    owner.join(10)
+    publisher.join(10)
+    assert not owner.is_alive() and not publisher.is_alive() and not errors
+    assert completed.is_set()
+    assert (store.root / artifact["relative_path"]).read_bytes() == data
+
+
+def test_prepublish_refuses_same_thread_transaction(store):
+    data = b"nested-prepublication"
+    digest = S.sha256_bytes(data)
+    publication = [{"artifact": {"id": S.make_id("art", digest),
+                    "relative_path": "objects/" + digest,
+                    "sha256": digest, "size_bytes": str(len(data))},
+                    "data": data, "owner_id": "ann-nested",
+                    "role": "vision-sample-preview"}]
+    with store.transaction():
+        fail_code("EVIDENCE_PUBLICATION_IN_TRANSACTION",
+                  lambda: V._prepublish_candidate_evidence(store, publication))
+
+
+def test_prepublished_evidence_tamper_is_rejected_before_binding(store):
+    data = b"prepublished-object-identity"
+    digest = S.sha256_bytes(data)
+    artifact = {"id": S.make_id("art", digest),
+                "relative_path": "objects/" + digest,
+                "sha256": digest, "size_bytes": str(len(data))}
+    publication = [{"artifact": artifact, "data": data,
+                    "owner_id": "ann-tampered", "role": "vision-sample-preview"}]
+    with store._evidence_publication_scope():
+        V._prepublish_candidate_evidence(store, publication)
+        (store.root / artifact["relative_path"]).write_bytes(b"x" * len(data))
+        fail_code("RECOVERY_REQUIRED",
+                  lambda: V._verify_prepublished_candidate_evidence(store, publication))
+    assert store.conn.execute(
+        "SELECT 1 FROM artifact_references WHERE artifact_id=?", (artifact["id"],)).fetchone() is None
+
+
+def test_evidence_preparation_enforces_cumulative_input_budget(store, monkeypatch):
+    first = "1" * 64
+    second = "2" * 64
+    candidate = {
+        "evidence": [
+            {"relative_path": "tmp/first.png", "sha256": first, "size_bytes": "1"},
+            {"relative_path": "tmp/second.png", "sha256": second, "size_bytes": "1"},
+        ],
+        "keyframes": [
+            {"scene_index": 0, "frame_index": "0", "evidence_sha256": first},
+            {"scene_index": 1, "frame_index": "1", "evidence_sha256": second},
+        ],
+        "boundary_frames": [], "content_frames": [],
+    }
+    annotations = [
+        {"id": "ann-budget-one", "attributes": {"semantic": {"claims": []}}},
+        {"id": "ann-budget-two", "attributes": {"semantic": {"claims": []}}},
+    ]
+    reads = []
+    monkeypatch.setattr(V, "MAX_EVIDENCE_PREPARATION_INPUT_BYTES", 1)
+    monkeypatch.setattr(V, "_read_stable_evidence_bytes",
+                        lambda project, descriptor: reads.append(descriptor["sha256"]) or b"image")
+    monkeypatch.setattr(V, "_evidence_preview", lambda source: b"preview-" + source)
+    fail_code("ANALYSIS_LIMIT_EXCEEDED",
+              lambda: V._prepare_candidate_evidence(store, candidate, annotations))
+    assert reads == [first]
+
+
+def test_result_snapshot_corrupt_durable_body_is_recovery_error(store):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        queued = submit(jobs, command_id="corrupt-snapshot-submit")["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        snapshot = jobs._capture_result_snapshot(queued["id"])
+        with store.transaction():
+            store.conn.execute("UPDATE durable_commits SET body=? WHERE id=?",
+                               ("{not-json", snapshot["commit"]["id"]))
+        fail_code("RECOVERY_REQUIRED", lambda: jobs._verify_result_snapshot(snapshot))
+    finally:
+        jobs.close()
+
+
 def test_content_sampling_and_claims_stay_inside_requested_middle_window(tmp_path, continuous_content_clip):
     padded = tmp_path / "long-continuous.mp4"
     subprocess.run([
@@ -862,13 +1274,16 @@ def test_content_sampling_and_claims_stay_inside_requested_middle_window(tmp_pat
         project.close()
 
 
-def test_content_contract_invalidates_reuse_but_reads_and_applies_legacy_candidate(store, monkeypatch):
+def test_new_evidence_contracts_invalidate_reuse_but_legacy_candidate_remains_readable(store, monkeypatch):
     jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
                         vlm_model_path="nonexistent-vlm-weights")
     try:
         current = task(store)
         legacy_parameters = dict(V._parameters(),
-                                 job_identity=V._job_identity(content_evidence_contract=None))
+                                 job_identity=V._job_identity(
+                                     content_evidence_contract=None,
+                                     object_evidence_contract=None,
+                                     include_hand_configuration=False))
         old = jobs.queue.create_batch(
             [{"task_id": current["id"], "expected_revision": current["revision"],
               "expected_sha256": current["content_sha256"]}],
@@ -881,19 +1296,31 @@ def test_content_contract_invalidates_reuse_but_reads_and_applies_legacy_candida
             # shape. No detection outputs or successful job state are invented.
             result = processor(job, context)
             result.pop("content_frames")
+            result.pop("object_sampling")
+            result.pop("object_relations")
             result["model_runs"] = [run for run in result["model_runs"]
-                                    if run["id"] != V._module_run_id(job["id"], "content")]
+                                    if run["id"] not in {
+                                        V._module_run_id(job["id"], "content"),
+                                        V._module_run_id(job["id"], "object"),
+                                        V._module_run_id(job["id"], "object_relations")}]
             return result
 
         with monkeypatch.context() as patch:
             # Simulate the old installed identity while producing the old
             # artifact fixture. The current worker below must reject old jobs.
             identity = V._job_identity
-            patch.setattr(V, "_job_identity", lambda **kwargs: identity(content_evidence_contract=None))
+            patch.setattr(V, "_job_identity", lambda **kwargs: identity(
+                content_evidence_contract=None, object_evidence_contract=None,
+                include_hand_configuration=False))
             patch.setattr(jobs, "_processor", old_shape)
             assert jobs.run_pending()[0]["state"] == "succeeded"
         legacy_result = jobs.result(old["id"])
         assert "content_frames" not in legacy_result
+        assert "object_sampling" not in legacy_result
+        assert "object_relations" not in legacy_result
+        assert all("hands" not in frame for frame in legacy_result["keyframes"])
+        assert V._module_run_id(old["id"], "hands") not in {
+            run["id"] for run in legacy_result["model_runs"]}
         pending_parameters = dict(legacy_parameters, window={"start": S.rational(.1), "end": S.rational(.9)})
         pending = jobs.queue.create_batch(
             [{"task_id": current["id"], "expected_revision": current["revision"],
@@ -909,6 +1336,8 @@ def test_content_contract_invalidates_reuse_but_reads_and_applies_legacy_candida
         assert fresh["input_revision"] == old["input_revision"]
         assert fresh["state"] == "queued"
         assert fresh["parameters"]["job_identity"]["config"]["content_sampling"]["evidence_contract"] == V.CONTENT_EVIDENCE_CONTRACT
+        assert fresh["parameters"]["job_identity"]["config"]["object_sampling"]["evidence_contract"] == V.OBJECT_EVIDENCE_CONTRACT
+        assert fresh["parameters"]["job_identity"]["config"]["hand_landmarks"]["contract"] == V.HAND_EVIDENCE_CONTRACT
         fail_code("VISION_NOT_READY", lambda: jobs.result(fresh["id"]))
         assert jobs.run_pending()[0]["state"] == "succeeded"
         assert jobs.result(fresh["id"])["content_frames"]
@@ -1187,6 +1616,39 @@ def test_vision_options_never_loads_models(store, monkeypatch):
     assert options["capabilities"]["scene"] is True
     assert options["capabilities"]["clip"] == "not_loaded"
     assert options["extractor_error"] is None
+
+
+def test_extractor_initialization_failure_never_publishes_local_path(
+        store, monkeypatch):
+    private_path = r"D:\private\models\face.onnx"
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("cannot open " + private_path)
+
+    monkeypatch.setattr(V, "FaceExtractor", explode)
+    jobs = V.VisionJobs(store)
+    jobs._load_extractors(V.MetricThresholds())
+    options = jobs.options()
+    assert options["extractor_error"] == "extractor_initialization_failed"
+    assert "private" not in json.dumps(options).lower()
+
+
+def test_new_visual_wrappers_never_publish_provider_exception_paths():
+    private_path = r"D:\private\models\provider.bin"
+
+    class ExplodingDetector:
+        def detect_people(self, _frame):
+            raise RuntimeError("cannot open " + private_path)
+
+        def detect_objects(self, _frame):
+            raise RuntimeError("cannot open " + private_path)
+
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    person = V._run_person(frame, ExplodingDetector())
+    objects = V._run_object(frame, ExplodingDetector())
+    assert person["reason"] == "person_inference_failed"
+    assert objects["reason"] == "object_inference_failed"
+    assert "private" not in json.dumps([person, objects]).lower()
 
 
 def test_submit_many_rejects_duplicate_tasks(store):

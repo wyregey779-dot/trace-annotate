@@ -1,7 +1,9 @@
 # Persistent workspace development slice
 
-This is part of the `1.1.0.dev1` preview and development code on `main`. It is not included
-in stable `v1.0.2` or a finished batch annotation product. `workspace serve`
+The core workspace is part of the published `1.1.0.dev1` preview and
+development code on `main`; the vision-assistance additions in this checkout
+are an unreleased `1.1.0.dev2` branch. The workspace is not included in stable
+`v1.0.2` or a finished batch annotation product. `workspace serve`
 opens the persistent multi-video segment editor. The existing `video-ui` and
 embodied editor remain separate, compatible annotation interfaces.
 

@@ -25,6 +25,8 @@ def _claim(claim_type="observable", **overrides):
         "score": 0.72,
         "score_kind": "rule_score",
         "measurement": None,
+        "object_ref": None,
+        "recipient_ref": None,
         "uncertainty_reason": None,
     }
     body.update(overrides)
@@ -74,7 +76,8 @@ def test_measured_claim_needs_a_first_class_measurement():
 
 def test_v1_claim_still_validates_and_new_v2_is_explicit():
     legacy = _claim("measured", score=-23.4, score_kind="rule_score")
-    legacy.pop("measurement")
+    for field in ("measurement", "object_ref", "recipient_ref"):
+        legacy.pop(field)
     checked = SS.validate_claim(legacy, evidence_ids={"art-e1"}, version=SS.SEMANTIC_VERSION_V1)
     assert checked["score"] == -23.4 and "measurement" not in checked
     with pytest.raises(SchemaInvalid):
@@ -83,7 +86,7 @@ def test_v1_claim_still_validates_and_new_v2_is_explicit():
 
 def test_semantic_version_is_frozen_and_claims_are_unique():
     with pytest.raises(SchemaInvalid) as exc:
-        SS.validate_semantic({"version": "visual-semantics-v3", "claims": []})
+        SS.validate_semantic({"version": "visual-semantics-v4", "claims": []})
     assert exc.value.code == "UNKNOWN_SEMANTIC_VERSION"
     with pytest.raises(SchemaInvalid):
         SS.validate_semantic({"version": SS.SEMANTIC_VERSION_V1,
@@ -96,6 +99,66 @@ def test_digest_excludes_identifiers_and_self_summaries():
     other["id"] = "claim-0000000000000002"
     assert SS.claim_digest(one) == SS.claim_digest(other)
     assert SS.claim_digest(one) != SS.claim_digest(dict(one, score=0.71))
+    assert SS.claim_digest(one) != SS.claim_digest(dict(one, object_ref="object-1"))
+
+
+def test_v2_remains_valid_and_v3_requires_nullable_action_references():
+    v2 = _claim()
+    v2.pop("object_ref")
+    v2.pop("recipient_ref")
+    assert SS.validate_claim(v2, version=SS.SEMANTIC_VERSION_V2,
+                             evidence_ids={"art-e1"})["measurement"] is None
+    with pytest.raises(SchemaInvalid):
+        SS.validate_claim(v2, evidence_ids={"art-e1"})
+
+
+def test_v3_action_claim_requires_participants_evidence_run_and_window():
+    base = _claim(
+        statement="候选动作：走", subject_ref="subject-1", model_run_id="run-actions",
+        time_window={"start": {"seconds": {"n": "0", "d": "1"}},
+                     "end": {"seconds": {"n": "1", "d": "1"}}},
+        method={"id": "subject-translation-v1", "version": "1", "parameters": {
+            "action_contract": "action-candidate-v3", "action": "走",
+            "window_pts": {"start": {"n": "0", "d": "1"},
+                           "end": {"n": "1", "d": "1"}}}})
+    checked = SS.validate_claim(base, evidence_ids={"art-e1"},
+                                model_run_ids={"run-actions"})
+    assert checked["subject_ref"] == "subject-1"
+    with pytest.raises(SchemaInvalid):
+        SS.validate_claim(dict(base, evidence_ids=[]), evidence_ids=set(),
+                          model_run_ids={"run-actions"})
+    with pytest.raises(SchemaInvalid):
+        SS.validate_claim(dict(base, score=1.01), evidence_ids={"art-e1"},
+                          model_run_ids={"run-actions"})
+    missing_pts = dict(base)
+    missing_pts["method"] = {
+        **base["method"], "parameters": {
+            key: value for key, value in base["method"]["parameters"].items()
+            if key != "window_pts"}}
+    with pytest.raises(SchemaInvalid, match="window_pts"):
+        SS.validate_claim(missing_pts, evidence_ids={"art-e1"},
+                          model_run_ids={"run-actions"})
+    mismatched_pts = dict(base)
+    mismatched_pts["method"] = {
+        **base["method"], "parameters": {
+            **base["method"]["parameters"],
+            "window_pts": {"start": {"n": "0", "d": "1"},
+                           "end": {"n": "2", "d": "1"}}}}
+    with pytest.raises(SchemaInvalid, match="equal to its time window"):
+        SS.validate_claim(mismatched_pts, evidence_ids={"art-e1"},
+                          model_run_ids={"run-actions"})
+    unsupported = dict(base)
+    unsupported.update({"statement": "候选动作：递交", "object_ref": "object-1",
+                        "recipient_ref": "recipient-1"})
+    unsupported["method"] = {"id": "subject-translation-v1", "version": "1",
+                             "parameters": {"action_contract": "action-candidate-v3",
+                                            "action": "递交",
+                                            "window_pts": {
+                                                "start": {"n": "0", "d": "1"},
+                                                "end": {"n": "1", "d": "1"}}}}
+    with pytest.raises(SchemaInvalid, match="does not declare support"):
+        SS.validate_claim(unsupported, evidence_ids={"art-e1"},
+                          model_run_ids={"run-actions"})
 
 
 def test_review_digest_tracks_content_but_not_review_fields():
@@ -122,6 +185,7 @@ def test_review_digest_tracks_content_but_not_review_fields():
 def test_digest_projection_declares_exclusions():
     assert SS.DIGEST_PROJECTIONS["claim"]["excludes"] == ["id"]
     assert SS.DIGEST_PROJECTIONS["claim_v2"]["excludes"] == ["id"]
+    assert SS.DIGEST_PROJECTIONS["claim_v3"]["excludes"] == ["id"]
     assert set(SS.DIGEST_PROJECTIONS["annotation_review"]["excludes"]) == {
         "review_status", "review_binding"}
     assert "output_sha256" in SS.DIGEST_PROJECTIONS["model_run"]["excludes"]

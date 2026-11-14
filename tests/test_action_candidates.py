@@ -69,6 +69,24 @@ def test_candidate_requires_evidence():
                            provider="subject-translation-v1")
 
 
+@pytest.mark.parametrize("overrides", [
+    {"start_frame": "01"},
+    {"start_frame": "3", "end_frame": "2"},
+    {"score": float("nan")},
+    {"score": 2.0},
+    {"evidence_ids": ["bad evidence"]},
+    {"window_seconds": {"start": 2.0, "end": 1.0}},
+])
+def test_legacy_candidate_entry_is_fail_closed(overrides):
+    values = dict(subject_id="s1", start_frame="1", end_frame="2",
+                  evidence_ids=["art-1"], score=0.5,
+                  score_kind="rule_score", provider="subject-translation-v1",
+                  window_seconds={"start": 1.0, "end": 2.0})
+    values.update(overrides)
+    with pytest.raises(ValueError):
+        AC.build_candidate("走", **values)
+
+
 def test_merge_keeps_windows_and_requires_same_subject_and_class():
     first = AC.build_candidate("走", subject_id="s1", start_frame="1", end_frame="4",
                                evidence_ids=["art-4"], score=0.5, score_kind="rule_score",
@@ -152,11 +170,11 @@ def test_merge_does_not_mutate_inputs():
     assert [first, second] == expected
 
 
-def test_candidates_map_to_observable_claims():
+def test_candidates_map_to_explicit_unreviewed_inferences():
     candidate = AC.build_candidate("走", subject_id="s1", start_frame="1", end_frame="4",
                                    evidence_ids=["art-4"], score=0.5,
                                    score_kind="rule_score",
                                    provider="subject-translation-v1")
     claims = AC.candidates_to_claims([candidate])
-    assert claims[0]["claim_type"] == "observable"
+    assert claims[0]["claim_type"] == "unspecified"
     assert claims[0]["uncertainty_reason"]

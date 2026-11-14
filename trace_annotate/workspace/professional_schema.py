@@ -298,7 +298,9 @@ def validate_annotation(annotation, media, template, *, artifact_ids=None, actor
         _invalid("Unknown review status")
     if annotation["provenance"]["origin"] == "model_candidate" and annotation["review_status"] == "reviewed":
         _invalid("Model candidate cannot carry a completed local review")
-    # Semantic claims are admitted only through the frozen visual-semantics-v1 contract.
+    if annotation["review_status"] == "reviewed" and "review_binding" not in annotation:
+        _invalid("Reviewed annotation requires a current review binding")
+    # Semantic claims are admitted only through a supported frozen visual-semantics contract.
     declared_artifacts = set(artifact_ids or ())
     if not isinstance(annotation["attributes"], dict) or set(annotation["attributes"]) - {"semantic"}:
         _invalid("Annotation attributes may only carry semantic claims", "UNSUPPORTED_PROFESSIONAL_EVIDENCE")

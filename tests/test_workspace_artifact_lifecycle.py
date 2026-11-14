@@ -321,6 +321,189 @@ def test_live_import_entry_guard_blocks_gc_and_is_released_on_exit(store, clip):
     assert store.sweep_unbound_artifacts(apply=True)["removed"] == 1
 
 
+def test_live_evidence_publication_scope_blocks_concurrent_gc_until_exit(store):
+    artifact = store._put_artifact(b"evidence waiting for its task transaction")
+    entered, release = threading.Event(), threading.Event()
+    problems = []
+
+    def publish():
+        try:
+            with store._evidence_publication_scope():
+                entered.set()
+                if not release.wait(10):
+                    raise TimeoutError("evidence publication guard not released")
+        except BaseException as exc:
+            problems.append(exc)
+
+    worker = threading.Thread(target=publish)
+    worker.start()
+    try:
+        assert entered.wait(10)
+        with pytest.raises(WorkspaceError) as error:
+            store.sweep_unbound_artifacts(apply=True)
+        assert error.value.code == "GC_ACTIVE_WORK"
+        assert (store.root / artifact["relative_path"]).read_bytes() == (
+            b"evidence waiting for its task transaction")
+    finally:
+        release.set()
+        worker.join(10)
+    assert not worker.is_alive() and not problems
+    assert not store._active_evidence_publications
+    assert store.sweep_unbound_artifacts(apply=True)["removed"] == 1
+    assert not (store.root / artifact["relative_path"]).exists()
+
+
+@pytest.mark.parametrize("publication_kind", ["evidence", "media"])
+def test_close_refuses_active_publication_without_releasing_project_lock(store, publication_kind):
+    token = object()
+    active = (store._active_evidence_publications
+              if publication_kind == "evidence"
+              else getattr(store, "_active_media_publications", None))
+    if active is None:
+        active = store._active_media_publications = set()
+    active.add(token)
+    try:
+        handle = store.lock._handle
+        with pytest.raises(WorkspaceError) as error:
+            store.close()
+        assert error.value.code == "WORKSPACE_BUSY"
+        assert store.lock._handle == handle and handle is not None
+        assert store.conn.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        active.remove(token)
+
+
+def test_artifact_insert_failure_leaves_no_invisible_physical_object(store):
+    data = b"registration failure must remain recoverable"
+    digest = hashlib.sha256(data).hexdigest()
+    target = store.objects_dir / digest
+    store.conn.execute(
+        "CREATE TRIGGER reject_test_artifact BEFORE INSERT ON artifacts "
+        "WHEN NEW.sha256='" + digest + "' BEGIN "
+        "SELECT RAISE(ABORT,'injected artifact registration failure'); END")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="injected artifact registration failure"):
+            store._put_artifact(data)
+    finally:
+        store.conn.execute("DROP TRIGGER reject_test_artifact")
+    assert not target.exists()
+    assert store.conn.execute(
+        "SELECT 1 FROM artifacts WHERE sha256=?", (digest,)).fetchone() is None
+    assert store.conn.execute(
+        "SELECT 1 FROM artifact_gc_pending WHERE sha256=?", (digest,)).fetchone() is None
+
+
+def test_outer_transaction_rollback_removes_new_physical_object(store):
+    data = b"outer transaction rollback cannot leave an invisible object"
+    digest = hashlib.sha256(data).hexdigest()
+    with pytest.raises(RuntimeError, match="rollback after publication"):
+        with store.transaction():
+            artifact = store._put_artifact(data)
+            assert (store.root / artifact["relative_path"]).is_file()
+            raise RuntimeError("rollback after publication")
+    assert not (store.objects_dir / digest).exists()
+    assert store.conn.execute(
+        "SELECT 1 FROM artifacts WHERE sha256=?", (digest,)).fetchone() is None
+    assert store.conn.execute(
+        "SELECT 1 FROM artifact_gc_pending WHERE sha256=?", (digest,)).fetchone() is None
+
+
+def test_process_exit_after_hardlink_recovers_outer_transaction_orphan(tmp_path):
+    root = tmp_path / "publication-crash"
+    project = WorkspaceStore(root)
+    project.create()
+    project.close()
+    data = b"process exits after durable journal and hardlink"
+    digest = hashlib.sha256(data).hexdigest()
+    script = r'''
+import os,sys
+from pathlib import Path
+from trace_annotate.workspace.store import WorkspaceStore
+root=Path(sys.argv[1]);data=bytes.fromhex(sys.argv[2]);store=WorkspaceStore(root);store.open()
+link=os.link
+def crash_after_link(source,target,*args,**kwargs):
+    result=link(source,target,*args,**kwargs)
+    os._exit(75)
+os.link=crash_after_link
+with store.transaction():
+    store._put_artifact(data)
+raise SystemExit(99)
+'''
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script, str(root), data.hex()],
+        capture_output=True, timeout=30)
+    assert result.returncode == 75, result.stderr.decode(errors="replace")
+    target = root / "objects" / digest
+    journal = root / "tmp" / "artifact-publications" / (digest + ".json")
+    assert target.read_bytes() == data
+    assert journal.is_file()
+    recovered = WorkspaceStore(root)
+    recovered.open()
+    try:
+        assert not target.exists()
+        assert not journal.exists()
+        assert recovered.conn.execute(
+            "SELECT 1 FROM artifacts WHERE sha256=?", (digest,)).fetchone() is None
+    finally:
+        recovered.close()
+
+
+def test_preverified_evidence_binding_rollback_leaves_registered_sweepable_object(store):
+    with store._evidence_publication_scope() as publication_token:
+        artifact = store._put_artifact(b"prepublished evidence survives business rollback")
+        with pytest.raises(RuntimeError, match="late task failure"):
+            with store.transaction():
+                store._bind_preverified_artifact_reference(
+                    publication_token, artifact, owner_kind="evidence",
+                    owner_id="ann-evidence-rollback", role="vision-sample-preview")
+                assert store.conn.execute(
+                    "SELECT 1 FROM artifact_references WHERE artifact_id=?",
+                    (artifact["id"],)).fetchone()
+                raise RuntimeError("late task failure")
+        assert store.conn.execute(
+            "SELECT 1 FROM artifact_references WHERE artifact_id=?",
+            (artifact["id"],)).fetchone() is None
+        measured = store.unbound_artifacts()
+        assert {item["id"] for item in measured["artifacts"]} == {artifact["id"]}
+        assert measured["total_bytes"] == artifact["size_bytes"]
+        with pytest.raises(WorkspaceError) as error:
+            store.sweep_unbound_artifacts(apply=True)
+        assert error.value.code == "GC_ACTIVE_WORK"
+    swept = store.sweep_unbound_artifacts(apply=True)
+    assert swept["removed"] == 1
+    assert store.conn.execute(
+        "SELECT 1 FROM artifacts WHERE id=?", (artifact["id"],)).fetchone() is None
+    assert not (store.root / artifact["relative_path"]).exists()
+    with pytest.raises(WorkspaceError) as error:
+        store._bind_preverified_artifact_reference(
+            publication_token, artifact, owner_kind="evidence",
+            owner_id="ann-evidence-rollback", role="vision-sample-preview")
+    assert error.value.code == "RECOVERY_REQUIRED"
+
+
+def test_preverified_evidence_binding_rejects_forged_descriptor_and_owner_kind(store):
+    with store._evidence_publication_scope() as publication_token:
+        artifact = store._put_artifact(b"strict preverified descriptor")
+        for forged in (
+                dict(artifact, id="art-forged"),
+                dict(artifact, relative_path="objects/" + "0" * 64),
+                dict(artifact, sha256="0" * 64),
+                dict(artifact, size_bytes="01")):
+            with pytest.raises(WorkspaceError):
+                store._bind_preverified_artifact_reference(
+                    publication_token, forged, owner_kind="evidence",
+                    owner_id="ann-strict-evidence", role="vision-sample-preview")
+        with pytest.raises(WorkspaceError) as error:
+            store._bind_preverified_artifact_reference(
+                publication_token, artifact, owner_kind="untyped",
+                owner_id="ann-strict-evidence", role="vision-sample-preview")
+        assert error.value.code == "RECOVERY_REQUIRED"
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM artifact_references WHERE artifact_id=?",
+            (artifact["id"],)).fetchone()[0] == 0
+    assert store.sweep_unbound_artifacts(apply=True)["removed"] == 1
+
+
 def test_plain_annotation_command_cannot_forge_imported_provenance(store):
     task = store.get_task(store.list_tasks()[0]["task_id"])
     with pytest.raises(WorkspaceError) as error:

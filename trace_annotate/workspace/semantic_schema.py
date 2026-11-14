@@ -10,13 +10,16 @@ import math
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import schema as S
-from .errors import SchemaInvalid
+from .errors import SchemaInvalid, WorkspaceError
 
-SEMANTIC_VERSION = "visual-semantics-v2"
+SEMANTIC_VERSION = "visual-semantics-v3"
 SEMANTIC_VERSION_V1 = "visual-semantics-v1"
-SEMANTIC_VERSIONS: Tuple[str, ...] = (SEMANTIC_VERSION_V1, SEMANTIC_VERSION)
+SEMANTIC_VERSION_V2 = "visual-semantics-v2"
+SEMANTIC_VERSIONS: Tuple[str, ...] = (
+    SEMANTIC_VERSION_V1, SEMANTIC_VERSION_V2, SEMANTIC_VERSION)
 DIGEST_VERSION = "visual-semantics-v1"
 DIGEST_VERSION_V2 = "visual-semantics-v2"
+DIGEST_VERSION_V3 = "visual-semantics-v3"
 CLAIM_TYPES: Tuple[str, ...] = ("observable", "measured", "interpretation", "unspecified")
 SCORE_KINDS: Tuple[str, ...] = ("similarity", "softmax", "rule_score", "confidence", "none")
 MEASUREMENT_BASES: Tuple[str, ...] = ("measured", "declared")
@@ -26,7 +29,9 @@ ACTOR_TYPES: Tuple[str, ...] = ("human", "assistant", "tool")
 REVIEW_DECISIONS: Tuple[str, ...] = ("accepted", "edited", "rejected")
 MAX_CLAIMS = 32
 MAX_EVIDENCE_PER_CLAIM = 32
-MAX_MODEL_RUNS = 16
+# Remain bounded while leaving room for the explicit object, hand, state,
+# auxiliary-video and composer receipts required by the manipulation pipeline.
+MAX_MODEL_RUNS = 32
 MAX_STATEMENT_CHARS = 2000
 MAX_UNCERTAINTY_CHARS = 500
 MAX_UNIT_CHARS = 120
@@ -37,7 +42,10 @@ CLAIM_FIELDS_V1 = ("id", "claim_type", "statement", "subject_ref", "time_window"
 # v2 adds a first-class measurement object so a measured value is never smuggled
 # into ``score``. ``score`` remains confidence/rule score and is independent.
 CLAIM_FIELDS_V2 = CLAIM_FIELDS_V1 + ("measurement",)
-CLAIM_FIELDS = CLAIM_FIELDS_V2
+# v3 binds the object and recipient identities used by action claims.  Both
+# fields are always present and nullable so absence is explicit and digestible.
+CLAIM_FIELDS_V3 = CLAIM_FIELDS_V2 + ("object_ref", "recipient_ref")
+CLAIM_FIELDS = CLAIM_FIELDS_V3
 MODEL_RUN_FIELDS = ("id", "provider", "model_name", "model_version", "weights_sha256",
                     "license", "preprocessing", "parameters", "input_sha256",
                     "output_sha256", "code_version", "status", "failure_reason",
@@ -54,6 +62,7 @@ CLAIM_DIGEST_FIELDS = ("claim_type", "statement", "subject_ref", "time_window",
                        "evidence_ids", "method", "model_run_id", "score", "score_kind",
                        "uncertainty_reason")
 CLAIM_DIGEST_FIELDS_V2 = CLAIM_DIGEST_FIELDS + ("measurement",)
+CLAIM_DIGEST_FIELDS_V3 = CLAIM_DIGEST_FIELDS_V2 + ("object_ref", "recipient_ref")
 MODEL_RUN_DIGEST_FIELDS = ("provider", "model_name", "model_version", "weights_sha256",
                            "license", "preprocessing", "parameters", "input_sha256",
                            "code_version", "status", "failure_reason", "score_kind")
@@ -68,6 +77,8 @@ DIGEST_PROJECTIONS = {
               "input": {"digest_version": DIGEST_VERSION, "claim": "<projection>"}},
     "claim_v2": {"fields": list(CLAIM_DIGEST_FIELDS_V2), "excludes": ["id"],
                  "input": {"digest_version": DIGEST_VERSION_V2, "claim": "<projection>"}},
+    "claim_v3": {"fields": list(CLAIM_DIGEST_FIELDS_V3), "excludes": ["id"],
+                 "input": {"digest_version": DIGEST_VERSION_V3, "claim": "<projection>"}},
     "semantic": {"fields": ["version", "claims"],
                  "claims_sorted_by": "id",
                  "input": {"digest_version": DIGEST_VERSION, "version": "visual-semantics-v1",
@@ -76,6 +87,10 @@ DIGEST_PROJECTIONS = {
                     "claims_sorted_by": "id",
                     "input": {"digest_version": DIGEST_VERSION_V2, "version": "visual-semantics-v2",
                               "claims": ["<claim digest projections>"]}},
+    "semantic_v3": {"fields": ["version", "claims"],
+                     "claims_sorted_by": "id",
+                     "input": {"digest_version": DIGEST_VERSION_V3, "version": "visual-semantics-v3",
+                               "claims": ["<claim digest projections>"]}},
     "model_run": {"fields": list(MODEL_RUN_DIGEST_FIELDS),
                   "excludes": ["id", "output_sha256"],
                   "input": {"digest_version": DIGEST_VERSION, "run": "<projection>"}},
@@ -170,7 +185,9 @@ def validate_claim(claim: Any, *, actor_type: str = "human", model_run_ids: Iter
         _invalid("Unknown actor type")
     if version not in SEMANTIC_VERSIONS:
         _invalid("Unknown semantic version", "UNKNOWN_SEMANTIC_VERSION")
-    fields = CLAIM_FIELDS_V1 if version == SEMANTIC_VERSION_V1 else CLAIM_FIELDS_V2
+    fields = (CLAIM_FIELDS_V1 if version == SEMANTIC_VERSION_V1
+              else CLAIM_FIELDS_V2 if version == SEMANTIC_VERSION_V2
+              else CLAIM_FIELDS_V3)
     item = _object(claim, fields, "claim")
     S.require_id(item["id"], "claim id")
     claim_type = item["claim_type"]
@@ -178,6 +195,10 @@ def validate_claim(claim: Any, *, actor_type: str = "human", model_run_ids: Iter
         _invalid("claim_type must be one of %s" % (CLAIM_TYPES,), "INVALID_CLAIM_TYPE")
     statement = _bounded_text(item["statement"], "statement", MAX_STATEMENT_CHARS)
     subject = _nullable_id(item["subject_ref"], "subject_ref")
+    object_ref = (_nullable_id(item["object_ref"], "object_ref")
+                  if version == SEMANTIC_VERSION else None)
+    recipient_ref = (_nullable_id(item["recipient_ref"], "recipient_ref")
+                     if version == SEMANTIC_VERSION else None)
     window = _time_window(item["time_window"])
     if not isinstance(item["evidence_ids"], list) or len(item["evidence_ids"]) > MAX_EVIDENCE_PER_CLAIM:
         _invalid("evidence_ids must be a bounded array")
@@ -198,13 +219,51 @@ def validate_claim(claim: Any, *, actor_type: str = "human", model_run_ids: Iter
     if model_run_ids is not None and run_id is not None and run_id not in set(model_run_ids):
         _invalid(f"model run {run_id} is not declared", "INVALID_SEMANTIC_CLAIM")
     score, score_kind = _score(item["score"], item["score_kind"])
-    measurement = _measurement(item.get("measurement"), claim_type) if version != SEMANTIC_VERSION_V1 else None
+    measurement = (_measurement(item.get("measurement"), claim_type)
+                   if version != SEMANTIC_VERSION_V1 else None)
     uncertainty = item["uncertainty_reason"]
     if uncertainty is not None:
         _bounded_text(uncertainty, "uncertainty_reason", MAX_UNCERTAINTY_CHARS)
     if claim_type == "interpretation" and actor_type != "human":
         _invalid("Only a human author may store an interpretation",
                  "INTERPRETATION_REQUIRES_HUMAN")
+    action_contract = method["parameters"].get("action_contract")
+    if version == SEMANTIC_VERSION and action_contract is not None:
+        if action_contract != "action-candidate-v3":
+            _invalid("Unknown action claim contract")
+        from ..extractors.actions import ACTION_REQUIREMENTS, ACTION_VOCAB, provider_coverage
+        action = method["parameters"].get("action")
+        if action not in ACTION_VOCAB:
+            _invalid("Action claim uses a class outside the frozen vocabulary")
+        coverage = provider_coverage(method["id"])
+        if coverage.get("status") != "success" or action not in set(coverage.get("supported") or ()):
+            _invalid("Action provider does not declare support for this action")
+        required = ACTION_REQUIREMENTS[action]
+        if subject is None:
+            _invalid("An action claim requires subject_ref")
+        if "object_ref" in required and object_ref is None:
+            _invalid("This action claim requires object_ref")
+        if "recipient_ref" in required and recipient_ref is None:
+            _invalid("This action claim requires recipient_ref")
+        if action == "递交" and recipient_ref == subject:
+            _invalid("A hand-over recipient must differ from its subject")
+        if window is None or not item["evidence_ids"] or run_id is None or score_kind == "none":
+            _invalid("An action claim requires a window, evidence, model run and scored provider output")
+        pts = method["parameters"].get("window_pts")
+        if not isinstance(pts, dict) or set(pts) != {"start", "end"}:
+            _invalid("An action claim requires its canonical window_pts")
+        try:
+            pts_start, pts_end = S.rational(pts["start"]), S.rational(pts["end"])
+            if (pts_start != pts["start"] or pts_end != pts["end"]
+                    or S.rational_value(pts_start) >= S.rational_value(pts_end)
+                    or window["start"]["seconds"] != pts_start
+                    or window["end"]["seconds"] != pts_end):
+                _invalid("Action PTS must be reduced, ordered and equal to its time window")
+        except (KeyError, TypeError, ValueError, WorkspaceError):
+            _invalid("Action PTS must be reduced, ordered and equal to its time window")
+        lower = -1.0 if score_kind == "similarity" else 0.0
+        if score is None or not lower <= score <= 1.0:
+            _invalid("Action claim score is outside the range admitted by its score kind")
     if claim_type == "measured":
         if version == SEMANTIC_VERSION_V1:
             if score_kind == "none":
@@ -222,6 +281,9 @@ def validate_claim(claim: Any, *, actor_type: str = "human", model_run_ids: Iter
     }
     if version != SEMANTIC_VERSION_V1:
         checked["measurement"] = measurement
+    if version == SEMANTIC_VERSION:
+        checked["object_ref"] = object_ref
+        checked["recipient_ref"] = recipient_ref
     return checked
 
 
@@ -236,11 +298,13 @@ def validate_semantic(value: Any, *, actor_type: str = "human",
     claims = item["claims"]
     if not isinstance(claims, list) or len(claims) > MAX_CLAIMS:
         _invalid("claims must be a bounded array")
+    allowed_runs = None if model_run_ids is None else tuple(model_run_ids)
+    allowed_evidence = tuple(evidence_ids)
     seen = set()
     validated: List[Dict[str, Any]] = []
     for claim in claims:
-        checked = validate_claim(claim, actor_type=actor_type, model_run_ids=model_run_ids,
-                                 evidence_ids=evidence_ids, version=version)
+        checked = validate_claim(claim, actor_type=actor_type, model_run_ids=allowed_runs,
+                                 evidence_ids=allowed_evidence, version=version)
         if checked["id"] in seen:
             _invalid("Claim identifiers must be unique")
         seen.add(checked["id"])
@@ -317,6 +381,9 @@ def validate_review_decision(value: Any, *, content_sha256: Optional[str] = None
 
 
 def claim_digest(claim: Dict[str, Any]) -> str:
+    if "object_ref" in claim or "recipient_ref" in claim:
+        projection = {key: claim[key] for key in CLAIM_DIGEST_FIELDS_V3}
+        return S.sha256_text({"digest_version": DIGEST_VERSION_V3, "claim": projection})
     if "measurement" in claim:
         projection = {key: claim[key] for key in CLAIM_DIGEST_FIELDS_V2}
         return S.sha256_text({"digest_version": DIGEST_VERSION_V2, "claim": projection})
@@ -326,7 +393,9 @@ def claim_digest(claim: Dict[str, Any]) -> str:
 
 def semantic_digest(semantic: Dict[str, Any]) -> str:
     claims = [claim_digest(claim) for claim in sorted(semantic["claims"], key=lambda c: c["id"])]
-    version = DIGEST_VERSION_V2 if semantic["version"] == SEMANTIC_VERSION else DIGEST_VERSION
+    version = (DIGEST_VERSION_V3 if semantic["version"] == SEMANTIC_VERSION
+               else DIGEST_VERSION_V2 if semantic["version"] == SEMANTIC_VERSION_V2
+               else DIGEST_VERSION)
     return S.sha256_text({"digest_version": version, "version": semantic["version"],
                           "claims": claims})
 

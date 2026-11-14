@@ -7,12 +7,14 @@
 
 [English](README.md) · [中文说明](README_CN.md) · [快速上手](docs/QUICKSTART.md) · [版本发布](https://github.com/wyregey779-dot/trace-annotate/releases)
 
-当前预览版：[v1.1.0.dev1](https://github.com/wyregey779-dot/trace-annotate/releases/tag/v1.1.0.dev1)，包含多视频工作台、专业 JSON 与带标注视频导出。
+当前已发布预览版：[v1.1.0.dev1](https://github.com/wyregey779-dot/trace-annotate/releases/tag/v1.1.0.dev1)，包含多视频工作台、专业 JSON 与带标注视频导出。
 最新稳定版仍为 [v1.0.2](https://github.com/wyregey779-dot/trace-annotate/releases/tag/v1.0.2)。
 
 TraceAnnotate 提供本地媒体复核与视频时序标注。开发版新增通用片段模式，支持自由事件标签、文字描述、标签词、多轨道与重叠事件；具身流程继续提供 working/idle、步骤检查与对错判定。Python 库还提供媒体分批暂存、字段来源记录与资产复核辅助功能。
 
 试验工作台新增[专业 JSON 交换与客观媒体分析](docs/PROFESSIONAL_JSON.md)：导出完整当前标注、精确帧锚和已有报告，历史文件需保留项目备份。后台分析明确区分播放代理与原片，结果确认保存后才进入标注修订；测量不会自动证明内容准确或完成声音听审。
+
+尚未发布的 `1.1.0.dev2` 视觉辅助分支还增加有界且未经人工复核的对象框观测、同场景稀疏轨迹与几何关系候选、MediaPipe 21 点手部观测，以及可选的 16 帧 VideoMAE 窗口提示。应用候选时，专业 JSON 只携带确定性的限量截面；完整原始结果仍保存在耐久视觉任务和项目备份中。这些观测不能证明身份、接触、抓握、持有、状态变化、动作完成或模型准确率，也不属于已发布的 `v1.1.0.dev1` 预览版。
 
 工作台还支持导出带标注的视频：保留完整画面，在上下左右添加黑底白字面板，自定义字号、字段和轨道。先预览精确帧，再下载验证后的视频及同一修订的 JSON。请按[工作台入口与操作顺序](docs/PROFESSIONAL_JSON.md#open-the-workspace)启动；原有普通视频和具身标注入口继续保留。
 
@@ -40,7 +42,7 @@ trace-annotate workspace serve --project ../traceannotate-workspace
 
 截图来自实际浏览器，使用合成测试视频和测试标签；图中分析结果仍是候选，尚未保存为报告。
 
-原有 `video-ui` 和 `embodied-ui` 仍是独立流程，其文件和工作台任务不会自动互通。工作台不会自动识别视频内容、跟踪对象或证明标注语义正确。
+原有 `video-ui` 和 `embodied-ui` 仍是独立流程，其文件和工作台任务不会自动互通；两者都没有框选和对象轨迹编辑界面。工作台的可选视觉提供器只生成待复核候选，不会证明标注语义正确。
 
 ## 普通视频片段标注（开发版）
 
@@ -99,7 +101,12 @@ Verified: 2 working segments, 3 idle intervals, 5 subtitle entries.
 | 具身标注 | 浏览器编辑器、working/idle 补集、步骤对账、区间校验与采样一致性评估 | 独立命令与数据规则 |
 | 报告与交换 | HTML 质检、SRT、Label Studio 配置/解析、CVAT 风格 XML、动作标签文本 | 有本地格式测试；外部软件及版本兼容性仍需往返验证 |
 | 可选视觉/OCR | 运动、人脸、OCR 和场景辅助接口 | 需要相应运行时、可执行文件或本地模型 |
-| CLIP 推理 | 规划中；适配器返回 `not_run` | 尚未实现完整图像/文本推理 |
+| 工作台视觉候选 | 通过耐久 `vision-jobs` 执行场景切分、关键帧、人脸/OCR/CLIP 分析和 VLM 描述草稿 | 保持 `model_candidate`/`unreviewed`；缺少权重时明确为 `not_run` |
+| 对象与关系观测 | 有界 COCO-80 对象框、同场景稀疏关联摘要和保守几何关系候选 | 只读辅助并绑定不可变帧证据；不提供空间编辑 UI，也不证明身份连续、接触、持有或动作 |
+| 手部观测 | 有界 MediaPipe Hand Landmarker 结果，保留完整 21 点归一化/像素/世界坐标 | 仅为待复核观测；不推断接触、抓握、持有状态、人物身份或动作 |
+| 辅助动作窗口 | 固定 VideoMAE/SSV2 模型对 16 帧窗口给出有限的关闭/打开/拿起/放到表面提示 | 可选本地非商业权重；不绑定主体、对象和接收者，不证明精确动作边界或动作完成 |
+| 可移植视觉投影 | 在专业 JSON 中保存确定性截面、来源哈希、总量/省略量、预算和不可变帧证据 | 参数最多 128 KiB、12 帧、24 个对象观测、12 个轨迹摘要、12 个关系候选、4 个手部观测；完整原始数据需保留项目备份 |
+| CLIP 推理 | 通过 open_clip 进行真实零样本分类 | 由 `clip` 扩展启用；缺少权重时返回 `not_run`，不会伪造标签 |
 
 ## 安装发行版
 
@@ -159,9 +166,13 @@ trace-annotate embodied-export clip.json --format srt -o clip.srt
 | --- | --- |
 | `python -m pip install -e ".[cv]"` | OpenCV 视频/运动处理与可选 HEIF 支持；YuNet 人脸检测还需要兼容的本地 ONNX 权重 |
 | `python -m pip install -e ".[ocr]"` | RapidOCR 接口，模型与运行时取决于实际安装的包 |
-| `PATH` 中的 `ffmpeg` 可执行文件 | 场景切分辅助工具；pip 不会安装该可执行文件 |
+| `python -m pip install -e ".[full]"` 并另行准备 MediaPipe 手部模型 | 可选 21 点手部观测；程序校验指定本地模型身份，缺少权重时明确为 `not_run` |
+| 另行取得固定 VideoMAE/SSV2 检查点 | 可选 16 帧窗口提示；权重不随安装包提供，需配置为本地目录 |
+| `PATH` 中的 `ffmpeg` 与 `ffprobe` | 视频处理外部程序；二者都必须可解析，pip 安装包不会暗中下载 |
 
-`clip` 扩展安装 PyTorch/torchvision，但不提供 `cn_clip`、模型权重或完整推理实现。`full` 扩展用于安装可选依赖，不会改变这一限制。后续实现条件见 [CLIP 路线图](docs/ROADMAP.md#clip-inference)。
+`clip` 扩展安装 PyTorch/torchvision 与 open_clip，可执行真实零样本推理；首次构建可能把 OpenAI ViT-B-32 权重下载到用户缓存。`vlm` 扩展安装经过测试的 transformers 4.49.x、einops 与 timm，用于本地描述草稿。所有适配器遵循同一状态约定：缺少权重为 `not_run`，执行崩溃为 `failed`，只有真实前向推理才是 `success`；输出在人工升级前始终是 `model_candidate`/`unreviewed`。
+
+VideoMAE 推理代码使用 Apache-2.0 的 `transformers`，但固定的 `MCG-NJU/videomae-small-finetuned-ssv2` 权重采用 CC-BY-NC-4.0。该权重不包含在 TraceAnnotate 的 MIT 安装包中，也不构成商业使用授权；仅在自身用途符合该许可证时另行获取和配置。项目代码、运行时、模型权重和输入数据可能分别受不同许可证约束。
 
 ## 验证与当前限制
 
@@ -170,6 +181,8 @@ trace-annotate embodied-export clip.json --format srt -o clip.srt
 - 项目处于早期阶段。测试与合成数据验证具体行为，尚无公开证据确立大规模采用、模型准确率或规模化性能。
 - 暂存清理会删除暂存副本，应使用专用目录并保留源文件备份。复制校验覆盖文件大小与前 1 MiB，不是全文件校验，也不是硬件写保护，无法防御所有并发文件系统改动。
 - 采样时间轴一致性不等于语义标签质量。复核规则与阈值需要人工解释。
+- 可移植视觉声明只是耐久本地结果中有明确预算与损失说明的截面。结构合法不等于模型准确，也不代表对象、手部或动作已完整覆盖；需要省略数据时必须保留项目备份。
+- 单机模型执行成功不能代替干净安装、支持版本矩阵或发布就绪证据；独立人工复核的准确率数据和外部工具往返仍未完成。
 - 仓库中的 Label Studio “v2.1” 是本项目的标注约定，不是 Label Studio 官方产品版本。外部工具的兼容版本将随往返验证逐步记录。
 
 ## 文档与贡献
@@ -186,4 +199,4 @@ trace-annotate embodied-export clip.json --format srt -o clip.srt
 
 ## 许可证
 
-[MIT](LICENSE)。外部模型权重、可选运行时和数据集可能使用各自的许可证。
+[MIT](LICENSE)。外部模型权重、可选运行时和数据集可能使用各自的许可证。可选的固定 VideoMAE/SSV2 权重采用 CC-BY-NC-4.0，不随安装包提供，也不会继承本仓库的 MIT 许可证。

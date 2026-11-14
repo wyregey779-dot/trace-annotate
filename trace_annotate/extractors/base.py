@@ -9,7 +9,36 @@ Guarantees explicit distinction between:
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import Enum
+import re
 from typing import Dict, Any
+
+
+_SAFE_FAILURE_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,95}\Z")
+
+
+def is_safe_failure_reason(value: object) -> bool:
+    """Return whether a value is a portable, path-free public error code."""
+    return isinstance(value, str) and _SAFE_FAILURE_TOKEN.fullmatch(value) is not None
+
+
+def safe_failure_reason(exc: BaseException, fallback: str) -> str:
+    """Return a bounded public error code without exposing exception text.
+
+    Workspace errors may publish their stable ``code`` and our own validation
+    errors may publish a single ASCII token.  Third-party exception messages
+    are deliberately discarded because they commonly include local paths,
+    model filenames, environment details or user content.
+    """
+    if not is_safe_failure_reason(fallback):
+        raise ValueError("invalid_failure_fallback")
+    code = getattr(exc, "code", None)
+    if is_safe_failure_reason(code):
+        return code
+    if isinstance(exc, ValueError):
+        message = str(exc)
+        if is_safe_failure_reason(message):
+            return message
+    return fallback
 
 
 class ExtractorStatus(str, Enum):

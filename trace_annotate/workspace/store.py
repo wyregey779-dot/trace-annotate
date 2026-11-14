@@ -42,6 +42,9 @@ OBJECTS_DIR = "objects"
 TMP_DIR = "tmp"
 EXPORTS_DIR = "exports"
 LOGS_DIR = "logs"
+PUBLICATION_JOURNAL_DIR = "artifact-publications"
+MAX_PUBLICATION_JOURNALS = 4096
+MAX_PUBLICATION_JOURNAL_BYTES = 1024
 
 DEFAULT_TEMPLATE = {
     "id": "generic-segment",
@@ -100,6 +103,61 @@ def _safe(path):
             continue
         if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
             raise WorkspaceError("UNSAFE_PATH", "Workspace paths cannot contain links or reparse points")
+
+
+def _stable_object_sha256(path, expected_size):
+    """Hash an immutable object without Windows ctime false positives.
+
+    The source-media hasher compares ctime to detect an active recorder. NTFS
+    change-time observations can move during concurrent read-only opens, which
+    is too strict for an already content-addressed object. Bind the open handle
+    to the lexical regular file and require device/inode/size/mtime to remain
+    identical across a bounded streaming read instead.
+    """
+    path = Path(path)
+    _safe(path)
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise WorkspaceError(
+            "RECOVERY_REQUIRED", "Immutable object is unavailable") from exc
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    if (stat.S_ISLNK(before.st_mode)
+            or bool(getattr(before, "st_file_attributes", 0) & 0x400)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_size != expected_size):
+        raise WorkspaceError(
+            "RECOVERY_REQUIRED", "Immutable object is not a stable regular file")
+    digest = hashlib.sha256()
+    read_size = 0
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                    != identity):
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Immutable object changed before verification")
+            while read_size < expected_size:
+                chunk = stream.read(min(1024 * 1024, expected_size - read_size))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                read_size += len(chunk)
+            if stream.read(1) or read_size != expected_size:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Immutable object size changed during verification")
+            after_read = os.fstat(stream.fileno())
+        after_path = path.lstat()
+    except OSError as exc:
+        raise WorkspaceError(
+            "RECOVERY_REQUIRED", "Immutable object became unavailable") from exc
+    if ((after_read.st_dev, after_read.st_ino, after_read.st_size, after_read.st_mtime_ns)
+            != identity
+            or (after_path.st_dev, after_path.st_ino, after_path.st_size,
+                after_path.st_mtime_ns) != identity):
+        raise WorkspaceError(
+            "RECOVERY_REQUIRED", "Immutable object changed during verification")
+    return digest.hexdigest()
 
 
 def _sync_directory(path):
@@ -186,9 +244,18 @@ class WorkspaceStore:
         self._mutex = threading.RLock()
         self._conn = None
         self._depth = 0
+        # Evidence may be registered before the short business transaction that
+        # binds it to a task revision.  Keep GC out of that deliberately small
+        # window without holding either the store mutex or a SQLite transaction.
+        self._active_evidence_publications = set()
+        # Filesystem publication cannot participate in SQLite rollback. Track
+        # links created while a caller transaction is open so a rollback can
+        # remove only links that never obtained a durable artifact row.
+        self._transaction_publications = []
         self.lock_path = self.root / LOCK_FILE
         self.objects_dir = self.root / OBJECTS_DIR
         self.tmp_dir = self.root / TMP_DIR
+        self.publication_journal_dir = self.tmp_dir / PUBLICATION_JOURNAL_DIR
         self.exports_dir = self.root / EXPORTS_DIR
         self.logs_dir = self.root / LOGS_DIR
         self.lock = ProjectLock(self.lock_path)
@@ -221,6 +288,7 @@ class WorkspaceStore:
                 if not directory.is_dir():
                     raise WorkspaceError("RECOVERY_REQUIRED", "Workspace directory is missing")
             self._init_db(new=False)
+            self._recover_publication_journals()
             self._recover_pending_gc()
             self._check_artifacts()
             with self.transaction():
@@ -232,8 +300,13 @@ class WorkspaceStore:
 
     def close(self):
         with self._mutex:
-            if self._conn is not None and getattr(self, "_queue_active_processors", set()):
-                raise Conflict("WORKSPACE_BUSY", "Wait for owned processing to stop before closing the workspace")
+            active_queue = getattr(self, "_queue_active_processors", set())
+            active_media = getattr(self, "_active_media_publications", set())
+            if (self._conn is not None or self.lock._handle is not None) and (
+                    active_queue or active_media or self._active_evidence_publications):
+                raise Conflict(
+                    "WORKSPACE_BUSY",
+                    "Wait for owned processing and publication work to stop before closing the workspace")
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
@@ -260,6 +333,8 @@ class WorkspaceStore:
             marker = f"nested_{depth}"
             connection.execute("BEGIN IMMEDIATE" if depth == 0 else f"SAVEPOINT {marker}")
             self._depth += 1
+            publications = []
+            self._transaction_publications.append(publications)
             try:
                 yield connection
                 connection.execute("COMMIT" if depth == 0 else f"RELEASE SAVEPOINT {marker}")
@@ -270,9 +345,210 @@ class WorkspaceStore:
                     else:
                         connection.execute(f"ROLLBACK TO SAVEPOINT {marker}")
                         connection.execute(f"RELEASE SAVEPOINT {marker}")
+                self._discard_unregistered_publications(publications)
                 raise
+            else:
+                if depth > 0:
+                    self._transaction_publications[-2].extend(publications)
+                else:
+                    self._discard_unregistered_publications(publications)
             finally:
+                self._transaction_publications.pop()
                 self._depth = depth
+
+    def _discard_unregistered_publications(self, publications):
+        """Resolve filesystem journals after commit or rollback.
+
+        A committed registration keeps its verified object. A rolled-back
+        registration removes its verified hardlink. In either case the durable
+        filesystem journal is deleted only after the final database state is
+        known.
+        """
+        for ident, rel, digest, size, journal in reversed(publications):
+            row = self.conn.execute(
+                "SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?",
+                (ident,)).fetchone()
+            path = self.root / rel
+            _safe(path)
+            registered = row == (rel, digest, size)
+            if row is not None and not registered:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED",
+                    "Artifact publication journal conflicts with its database registration")
+            if path.exists():
+                if (rel != "objects/" + digest
+                        or _stable_object_sha256(path, size) != digest):
+                    raise WorkspaceError(
+                        "RECOVERY_REQUIRED",
+                        "Journalled artifact publication changed identity; refusing cleanup")
+                if not registered:
+                    path.unlink()
+                    _sync_directory(self.objects_dir)
+            elif registered:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Registered journalled artifact is missing")
+            self._remove_publication_journal(journal)
+
+    def _publication_descriptor(self, ident, rel, digest, size):
+        return {"id": ident, "relative_path": rel, "sha256": digest,
+                "size_bytes": str(size)}
+
+    def _read_publication_journal(self, path):
+        _safe(path)
+        try:
+            before = path.lstat()
+            if (stat.S_ISLNK(before.st_mode)
+                    or getattr(before, "st_file_attributes", 0) & 0x400
+                    or not stat.S_ISREG(before.st_mode)
+                    or before.st_size > MAX_PUBLICATION_JOURNAL_BYTES):
+                raise ValueError("invalid publication journal file")
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                data = stream.read(MAX_PUBLICATION_JOURNAL_BYTES + 1)
+                after = os.fstat(stream.fileno())
+            if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                    != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                    != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)):
+                raise ValueError("publication journal changed during read")
+            value = json.loads(data)
+            if S.canonical_json(value) != data:
+                raise ValueError("publication journal is not canonical JSON")
+            if (not isinstance(value, dict)
+                    or set(value) != {"id", "relative_path", "sha256", "size_bytes"}):
+                raise ValueError("invalid publication journal descriptor")
+            digest = S.require_hash(value["sha256"])
+            ident = S.require_id(value["id"], "artifact_id")
+            size_text = value["size_bytes"]
+            if (not isinstance(size_text, str) or not size_text.isascii()
+                    or not size_text.isdecimal() or len(size_text) > 16
+                    or str(int(size_text)) != size_text
+                    or int(size_text) > S.MAX_SAFE_INTEGER
+                    or ident != S.make_id("art", digest)
+                    or value["relative_path"] != "objects/" + digest
+                    or path.name != digest + ".json"):
+                raise ValueError("invalid publication journal identity")
+            return ident, value["relative_path"], digest, int(size_text), path
+        except WorkspaceError as exc:
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Artifact publication journal is corrupt") from exc
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise WorkspaceError(
+                "RECOVERY_REQUIRED", "Artifact publication journal is corrupt") from exc
+
+    def _write_publication_journal(self, descriptor):
+        _safe(self.publication_journal_dir)
+        self.publication_journal_dir.mkdir(exist_ok=True)
+        digest = descriptor["sha256"]
+        path = self.publication_journal_dir / (digest + ".json")
+        _safe(path)
+        data = S.canonical_json(descriptor)
+        try:
+            handle = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                             | getattr(os, "O_BINARY", 0), 0o600)
+        except FileExistsError:
+            existing = self._read_publication_journal(path)
+            expected = (descriptor["id"], descriptor["relative_path"], digest,
+                        int(descriptor["size_bytes"]), path)
+            if existing != expected:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Artifact publication journal identity conflicts")
+            return path
+        try:
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _sync_directory(self.publication_journal_dir)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return path
+
+    def _remove_publication_journal(self, path):
+        _safe(path)
+        path.unlink(missing_ok=True)
+        if self.publication_journal_dir.is_dir():
+            _sync_directory(self.publication_journal_dir)
+
+    def _recover_publication_journals(self):
+        """Resolve hardlinks left around a process exit during publication."""
+        with self._mutex:
+            _safe(self.publication_journal_dir)
+            if not self.publication_journal_dir.exists():
+                return 0
+            if not self.publication_journal_dir.is_dir():
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Artifact publication journal directory is invalid")
+            paths = sorted(self.publication_journal_dir.iterdir())
+            if len(paths) > MAX_PUBLICATION_JOURNALS:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Too many artifact publication journals")
+            records = [self._read_publication_journal(path) for path in paths]
+            self._discard_unregistered_publications(records)
+            return len(records)
+
+    @contextmanager
+    def _evidence_publication_scope(self):
+        """Protect prepublished evidence until its business transaction ends.
+
+        The yielded object is an opaque, store-local capability.  It is required
+        by the DB-only binding helper below, so callers cannot accidentally use
+        that helper after the verified publication window has closed.
+        """
+        token = object()
+        with self._mutex:
+            self._active_evidence_publications.add(token)
+        try:
+            yield token
+        finally:
+            with self._mutex:
+                self._active_evidence_publications.discard(token)
+
+    def _bind_preverified_artifact_reference(
+            self, publication_token, artifact, *, owner_kind, owner_id, role,
+            owner_revision="0"):
+        """Bind one registered object without re-reading its bytes.
+
+        This is an internal capability for evidence that `_publish_stream` has
+        just hashed and registered while `_evidence_publication_scope` remains
+        active.  It still validates the complete content-addressed descriptor,
+        the registered database row and the typed owner.  Ordinary callers must
+        use `bind_artifact_reference`, which also verifies the object file.
+        """
+        with self.transaction():
+            if publication_token not in self._active_evidence_publications:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED",
+                    "Preverified artifact binding requires an active evidence publication scope")
+            validate_owner(self.conn, owner_kind, owner_id, owner_revision, role)
+            if (not isinstance(artifact, dict)
+                    or set(artifact) != {"id", "relative_path", "sha256", "size_bytes"}):
+                raise SchemaInvalid(
+                    "SCHEMA_INVALID", "Artifact reference needs an exact immutable descriptor")
+            ident = S.require_id(artifact["id"], "artifact_id")
+            digest = S.require_hash(artifact["sha256"])
+            size_text = artifact["size_bytes"]
+            if (not isinstance(size_text, str) or not size_text.isascii()
+                    or not size_text.isdecimal() or len(size_text) > 16
+                    or str(int(size_text)) != size_text
+                    or int(size_text) > S.MAX_SAFE_INTEGER):
+                raise SchemaInvalid(
+                    "SCHEMA_INVALID", "Artifact size_bytes must be a nonnegative safe integer string")
+            if (ident != S.make_id("art", digest)
+                    or artifact["relative_path"] != "objects/" + digest):
+                raise SchemaInvalid(
+                    "SCHEMA_INVALID", "Artifact descriptor is not a content-addressed object")
+            row = self.conn.execute(
+                "SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?", (ident,)).fetchone()
+            registered = ({"id": ident, "relative_path": row[0], "sha256": row[1],
+                           "size_bytes": str(row[2])} if row is not None else None)
+            if registered != artifact:
+                raise WorkspaceError(
+                    "RECOVERY_REQUIRED", "Pinned artifact is missing or differs from its registration")
+            self.conn.execute(
+                "INSERT OR IGNORE INTO artifact_references VALUES(?,?,?,?,?)",
+                (ident, owner_kind, owner_id, owner_revision, role))
 
     def _init_db(self, *, new):
         migrating = False
@@ -356,7 +632,7 @@ class WorkspaceStore:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Artifact path is invalid")
             path = self.root / rel
             _safe(path)
-            if not path.is_file() or path.stat().st_size != size or stream_sha256(path) != digest:
+            if _stable_object_sha256(path, size) != digest:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Artifact missing or corrupt; writes refused",
                                      details={"artifact_sha256": digest})
         for (body,) in self.conn.execute("SELECT body FROM media"):
@@ -424,15 +700,42 @@ class WorkspaceStore:
                     if self._depth or self.conn.in_transaction:
                         raise Conflict("GC_RECOVERY_REQUIRED", "Finish interrupted cleanup before publishing this object")
                     self._recover_pending_gc()
+                rel = f"objects/{sha}"
+                descriptor = self._publication_descriptor(ident, rel, sha, size)
+                row = self.conn.execute(
+                    "SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?",
+                    (ident,)).fetchone()
+                if row is not None:
+                    if (row != (rel, sha, size)
+                            or _stable_object_sha256(target, size) != sha):
+                        raise WorkspaceError(
+                            "RECOVERY_REQUIRED", "Registered immutable object is corrupt")
+                    return descriptor
+                journal = self._write_publication_journal(descriptor)
+                record = (ident, rel, sha, size, journal)
+                outer_transaction = bool(self._depth)
+                if outer_transaction:
+                    self._transaction_publications[-1].append(record)
                 try:
-                    os.link(temporary, target)
-                    _sync_directory(self.objects_dir)
-                except FileExistsError:
-                    if target.stat().st_size != size or stream_sha256(target) != sha:
-                        raise WorkspaceError("RECOVERY_REQUIRED", "Existing immutable object is corrupt")
-                with self.transaction():
-                    self.conn.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?)", (ident, f"objects/{sha}", sha, size))
-            return {"id": ident, "relative_path": f"objects/{sha}", "sha256": sha, "size_bytes": str(size)}
+                    try:
+                        os.link(temporary, target)
+                        _sync_directory(self.objects_dir)
+                    except FileExistsError:
+                        pass
+                    if _stable_object_sha256(target, size) != sha:
+                        raise WorkspaceError(
+                            "RECOVERY_REQUIRED", "Existing immutable object is corrupt")
+                    with self.transaction():
+                        self.conn.execute(
+                            "INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?)",
+                            (ident, rel, sha, size))
+                except BaseException:
+                    if not outer_transaction:
+                        self._discard_unregistered_publications([record])
+                    raise
+                if not outer_transaction:
+                    self._discard_unregistered_publications([record])
+            return descriptor
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -765,6 +1068,8 @@ class WorkspaceStore:
                 raise Conflict("GC_IN_TRANSACTION", "Cleanup must run outside a workspace transaction")
             if getattr(self, "_active_media_publications", set()):
                 raise Conflict("GC_ACTIVE_WORK", "Finish media admission before collecting unpublished objects")
+            if self._active_evidence_publications:
+                raise Conflict("GC_ACTIVE_WORK", "Finish evidence publication before collecting unpublished objects")
             if getattr(self, "_queue_active_processors", set()):
                 raise Conflict("GC_ACTIVE_WORK", "Wait for active processors to exit before cleanup")
             self._recover_pending_gc()
@@ -779,7 +1084,8 @@ class WorkspaceStore:
                     rel, digest, size = row
                     path = self.root / rel
                     _safe(path)
-                    if rel != "objects/" + digest or not path.is_file() or path.stat().st_size != size or stream_sha256(path) != digest:
+                    if (rel != "objects/" + digest
+                            or _stable_object_sha256(path, size) != digest):
                         raise WorkspaceError("RECOVERY_REQUIRED", "Unbound object identity is corrupt; cleanup refused")
                     conn.execute("INSERT INTO artifact_gc_pending VALUES(?,?,?,?)", (item["id"], rel, digest, size))
                     conn.execute("DELETE FROM artifacts WHERE id=?", (item["id"],))
@@ -804,7 +1110,7 @@ class WorkspaceStore:
                 path = self.root / rel
                 _safe(path)
                 if path.exists():
-                    if not path.is_file() or path.stat().st_size != size or stream_sha256(path) != digest:
+                    if _stable_object_sha256(path, size) != digest:
                         raise WorkspaceError("RECOVERY_REQUIRED", "Cleanup journal object identity changed")
                     path.unlink()
                     _sync_directory(self.objects_dir)
@@ -829,7 +1135,7 @@ class WorkspaceStore:
             raise WorkspaceError("RECOVERY_REQUIRED", "Pinned artifact is missing or differs from its registration")
         path = self.root / row[0]
         _safe(path)
-        if not path.is_file() or path.stat().st_size != row[2] or stream_sha256(path) != row[1]:
+        if _stable_object_sha256(path, row[2]) != row[1]:
             raise WorkspaceError("RECOVERY_REQUIRED", "Pinned artifact is missing or corrupt")
         self.conn.execute("INSERT OR IGNORE INTO artifact_references VALUES(?,?,?,?,?)", (ident, owner_kind, owner_id, owner_revision, role))
 
@@ -979,6 +1285,20 @@ class WorkspaceStore:
         else:
             new_task["annotations"] = self._apply_operation(copy.deepcopy(current["annotations"]), operation, payload)
         new_task["revision"] = current_rev + 1
+        if operation in {"add_annotation", "update_annotation", "replace_annotations", "import_temporal"}:
+            # Classic temporal documents and simple local edits can carry an
+            # unbound historical review flag. It is source history, not a
+            # current approval. Normalize it before the strict saved-task
+            # schema runs; semantic claims still require an explicit binding.
+            for annotation in new_task["annotations"]:
+                if (isinstance(annotation, dict)
+                        and annotation.get("review_status") == "reviewed"
+                        and "review_binding" not in annotation
+                        and not annotation.get("attributes")
+                        and not annotation.get("evidence_ids")
+                        and (not isinstance(annotation.get("provenance"), dict)
+                             or annotation["provenance"].get("origin") in {"manual", "imported"})):
+                    annotation["review_status"] = "unreviewed"
         template = next(value for value in self.list_templates() if value["id"] == current["template_id"] and value["version"] == current["template_version"])
         for annotation in new_task["annotations"]:
             self._validate_annotation(annotation, self.get_media(current["media_id"]), template,
@@ -1166,6 +1486,24 @@ class WorkspaceStore:
         ann.setdefault("review_status", "unreviewed")
         if ann["review_status"] not in {"unreviewed", "reviewed"}:
             raise SchemaInvalid("SCHEMA_INVALID", "review_status must be 'unreviewed' or 'reviewed'")
+        review = ann.get("review_binding")
+        if ann["review_status"] == "reviewed" and review is None:
+            raise SchemaInvalid("SCHEMA_INVALID", "Reviewed annotation requires a current review binding")
+        if review is not None:
+            if ann["review_status"] != "reviewed":
+                raise SchemaInvalid("SCHEMA_INVALID", "Unreviewed annotation cannot carry a review binding")
+            required_review = {
+                "content_sha256", "actor_id", "command_id", "reviewed_at", "task_revision"}
+            if not isinstance(review, dict) or set(review) != required_review:
+                raise SchemaInvalid("SCHEMA_INVALID", "Review binding has an invalid shape")
+            S.require_hash(review["content_sha256"])
+            S.require_id(review["actor_id"], "review actor")
+            S.require_id(review["command_id"], "review command")
+            if not isinstance(review["reviewed_at"], str) or not review["reviewed_at"].strip():
+                raise SchemaInvalid("SCHEMA_INVALID", "Review binding requires a timestamp")
+            if (type(review["task_revision"]) is not int
+                    or not 0 <= review["task_revision"] <= S.MAX_SAFE_INTEGER):
+                raise SchemaInvalid("SCHEMA_INVALID", "Review binding revision is invalid")
         if "legacy_id" in ann and (not isinstance(ann["legacy_id"], str) or not ann["legacy_id"].strip()):
             raise SchemaInvalid("SCHEMA_INVALID", "legacy_id must be a nonempty string")
         if ann["evidence_ids"] != [] or ann["attributes"] != {}:

@@ -208,7 +208,9 @@ def test_normal_vision_entry_finds_fade_in_single_scene_and_exports_unreviewed(a
         claims = [c for a in saved["annotations"] for c in a["attributes"]["semantic"]["claims"]]
         transition = next(c for c in claims if c["method"]["parameters"].get("kind") == "fade_in")
         assert transition["evidence_ids"]
-        assert len(candidate["model_runs"]) == 13
+        assert len(candidate["model_runs"]) == 17
+        assert V._module_run_id(candidate["job_id"], "action_video") in {
+            run["id"] for run in candidate["model_runs"]}
     finally:
         jobs.close()
 
@@ -416,10 +418,11 @@ def test_global_flash_claim_owns_flash_frame_and_attaches_its_recovery_frame(tmp
     def unavailable(thresholds):
         jobs._extractors = {name: None for name in ("face", "person", "ocr", "clip", "vlm")}
 
-    def capture_preview(path):
-        preview_sources.append(path)
-        preview = original_preview(path)
-        preview_hashes_by_sample.setdefault(V.stream_sha256(path), set()).add(V.stream_sha256(preview))
+    def capture_preview(data):
+        source_sha256 = S.sha256_bytes(data)
+        preview_sources.append(source_sha256)
+        preview = original_preview(data)
+        preview_hashes_by_sample.setdefault(source_sha256, set()).add(S.sha256_bytes(preview))
         return preview
 
     try:
@@ -465,7 +468,7 @@ def test_global_flash_claim_owns_flash_frame_and_attaches_its_recovery_frame(tmp
                         for evidence_id in claim["evidence_ids"]}
         assert preview_hashes_by_sample[recovery["evidence_sha256"]] <= claim_hashes
         # Identical decoded images can share a content-addressed evidence file.
-        assert any(V.stream_sha256(path) == recovery["evidence_sha256"] for path in preview_sources)
+        assert recovery["evidence_sha256"] in preview_sources
         assert claim["evidence_ids"]
         assert all(annotation["review_status"] == "unreviewed" for annotation in saved["annotations"])
     finally:

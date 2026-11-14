@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.0.dev2 — unreleased vision-assistance branch
+
+- Add bounded COCO-80 object-box observations, deterministic same-scene sparse
+  association summaries and conservative geometric relation candidates. These
+  are unreviewed observations and do not establish persistent identity,
+  contact, possession, state change or an action.
+- Add an exact local MediaPipe Hand Landmarker adapter in an owned subprocess,
+  with complete 21-point normalized, pixel and world-coordinate observations,
+  bounded uniform sampling and process-tree cancellation. Hand results do not
+  infer touch, grasp, held state, person identity or action.
+- Add an optional, pinned VideoMAE/SSV2 16-frame window helper for a narrow
+  close/open/pick-up/put-down-surface hint mapping. Hints keep participant
+  references null and never become `action-candidate-v3` facts. Missing or
+  unverified weights, protocol errors and inference failures emit no claim.
+- Project a deterministic bounded cross-section of object, relation and hand
+  observations into professional JSON with immutable evidence frames, the raw
+  candidate digest, exact total/projected/omitted counts and explicit loss
+  budgets. Complete raw results remain in the durable vision job and project
+  backup; export/import round trips do not claim the projection is complete.
+- Keep optional VideoMAE weights outside distributions. Runtime code uses the
+  Apache-2.0 `transformers` library, while the pinned checkpoint is
+  CC-BY-NC-4.0 and is not covered by this repository's MIT license or a
+  commercial-use grant.
+
 ## 1.1.0.dev1 — development preview
 
 - Publish the accumulated workspace and general-video features below as an

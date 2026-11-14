@@ -28,7 +28,7 @@ python -m pip install .
 trace-annotate --version
 ```
 
-The version command should match `project.version` in this checkout's `pyproject.toml` (currently `1.1.0.dev1`). If PowerShell policy blocks activation, use `.venv\Scripts\python.exe -m pip install .`. Run the example through `.venv\Scripts\python.exe`, or invoke CLI commands through `.venv\Scripts\trace-annotate.exe`; changing the machine's execution policy is not required.
+The version command should match `project.version` in this checkout's `pyproject.toml` (currently `1.1.0.dev2` on the unreleased vision-assistance branch). If PowerShell policy blocks activation, use `.venv\Scripts\python.exe -m pip install .`. Run the example through `.venv\Scripts\python.exe`, or invoke CLI commands through `.venv\Scripts\trace-annotate.exe`; changing the machine's execution policy is not required.
 
 ### 1a. Optional: local visual assistance
 

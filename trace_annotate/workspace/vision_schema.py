@@ -14,6 +14,8 @@ from .errors import SchemaInvalid
 CANDIDATE_ORIGIN = "model_candidate"
 CANDIDATE_REVIEW = "unreviewed"
 MAX_TAGS = 12
+AUXILIARY_ACTION_HINT_CONTRACT = "videomae-window-hint-v1"
+AUXILIARY_ACTION_HINTS = ("close", "open", "pick_up", "put_down_surface")
 
 
 def _ratio_pair(seconds: Any) -> Dict[str, Any]:
@@ -43,10 +45,12 @@ def _method(method_id: str, version: str, parameters: Dict[str, Any]) -> Dict[st
 def claim(*, claim_type: str, statement: str, method_id: str, method_version: str,
           parameters: Optional[Dict[str, Any]] = None, evidence_ids: Sequence[str] = (),
           subject_ref: Optional[str] = None, start: Any = None, end: Any = None,
+          object_ref: Optional[str] = None, recipient_ref: Optional[str] = None,
           score: Optional[float] = None, score_kind: str = "none",
           measurement: Optional[Dict[str, Any]] = None,
           uncertainty_reason: Optional[str] = None,
           model_run_id: Optional[str] = None, token: Optional[str] = None,
+          model_run_ids: Iterable[str] = (),
           actor_type: str = "tool", version: str = SS.SEMANTIC_VERSION) -> Dict[str, Any]:
     """Build one claim; the caller keeps the token stable for reproducible ids."""
     if claim_type not in SS.CLAIM_TYPES:
@@ -71,7 +75,10 @@ def claim(*, claim_type: str, statement: str, method_id: str, method_version: st
     }
     if version != SS.SEMANTIC_VERSION_V1:
         body["measurement"] = measurement
-    return SS.validate_claim(body, actor_type=actor_type, model_run_ids=(),
+    if version == SS.SEMANTIC_VERSION:
+        body["object_ref"] = object_ref
+        body["recipient_ref"] = recipient_ref
+    return SS.validate_claim(body, actor_type=actor_type, model_run_ids=model_run_ids,
                              evidence_ids=evidence_ids, version=version)
 
 
@@ -81,6 +88,49 @@ def observable(**kwargs: Any) -> Dict[str, Any]:
 
 def measured(**kwargs: Any) -> Dict[str, Any]:
     return claim(claim_type="measured", **kwargs)
+
+
+def auxiliary_action_hint(*, statement: str, semantic_hint: str,
+                          sample_frames: Sequence[Dict[str, Any]],
+                          start: Any, end: Any, score: float,
+                          evidence_ids: Sequence[str], model_run_id: str,
+                          provider: str = "videomae-small-ssv2-aux-v1",
+                          token: Optional[str] = None,
+                          model_run_ids: Iterable[str] = ()) -> Dict[str, Any]:
+    """Build an unreviewed window-semantic hint, never an action fact.
+
+    This deliberately does not set ``action_contract``.  It has no participant
+    references and cannot satisfy the v3 action-candidate contract; a separate
+    provider with subject/object/state evidence must do that work.
+    """
+    if semantic_hint not in AUXILIARY_ACTION_HINTS:
+        raise SchemaInvalid("INVALID_SEMANTIC_CLAIM",
+                            "Auxiliary video action uses an unsupported hint")
+    if not isinstance(sample_frames, (list, tuple)) or len(sample_frames) != 16:
+        raise SchemaInvalid("INVALID_SEMANTIC_CLAIM",
+                            "Auxiliary video action requires exactly sixteen frame identities")
+    if not evidence_ids:
+        raise SchemaInvalid("INVALID_SEMANTIC_CLAIM",
+                            "Auxiliary video action requires immutable preview evidence")
+    parameters = {
+        "auxiliary_hint_contract": AUXILIARY_ACTION_HINT_CONTRACT,
+        "semantic_hint": semantic_hint,
+        "window_pts": {"start": S.rational(start), "end": S.rational(end)},
+        "sample_frames": list(sample_frames),
+        "participant_binding": "none",
+        "authority": "auxiliary_window_semantics_only",
+        "review_status": "unreviewed",
+    }
+    return claim(
+        claim_type="unspecified", statement=statement, method_id=provider,
+        method_version="1", parameters=parameters, evidence_ids=evidence_ids,
+        subject_ref=None, object_ref=None, recipient_ref=None,
+        start=start, end=end, score=score, score_kind="softmax",
+        measurement=None,
+        uncertainty_reason=("Window semantics only; no subject, object, recipient, "
+                            "exact action boundary or completion fact is established."),
+        model_run_id=model_run_id, token=token,
+        model_run_ids=model_run_ids, actor_type="tool")
 
 
 def interpretation(**kwargs: Any) -> Dict[str, Any]:
@@ -93,7 +143,8 @@ def build_annotation(*, annotation_id: str, kind: str, label: str, text: str,
                      start: Any = None, end: Any = None, at: Any = None,
                      actor_id: str = "vision-extractor", job_id: Optional[str] = None,
                      origin: str = CANDIDATE_ORIGIN,
-                     review_status: str = CANDIDATE_REVIEW) -> Dict[str, Any]:
+                     review_status: str = CANDIDATE_REVIEW,
+                     model_run_ids: Iterable[str] = ()) -> Dict[str, Any]:
     """Assemble a candidate annotation whose semantics obey the frozen contract."""
     S.require_id(annotation_id)
     if kind not in ("segment", "event", "whole_clip"):
@@ -104,7 +155,7 @@ def build_annotation(*, annotation_id: str, kind: str, label: str, text: str,
     if not isinstance(text, str):
         raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "Text must be a string")
     semantic = SS.build_semantic(claims, actor_type="tool" if origin != "manual" else "human",
-                                 evidence_ids=evidence_ids)
+                                 model_run_ids=model_run_ids, evidence_ids=evidence_ids)
     if origin == CANDIDATE_ORIGIN and review_status != CANDIDATE_REVIEW:
         raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "Model candidates stay unreviewed")
     if origin == CANDIDATE_ORIGIN:
@@ -132,7 +183,8 @@ def build_annotation(*, annotation_id: str, kind: str, label: str, text: str,
     return annotation
 
 
-def validate_candidate(annotation: Dict[str, Any]) -> Dict[str, Any]:
+def validate_candidate(annotation: Dict[str, Any], *,
+                       model_run_ids: Iterable[str] = ()) -> Dict[str, Any]:
     """Validate the candidate-side rules that matter before a store write."""
     if not isinstance(annotation, dict) or not set(annotation) <= {
             "id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids",
@@ -153,6 +205,7 @@ def validate_candidate(annotation: Dict[str, Any]) -> Dict[str, Any]:
         raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "attributes may only carry semantic")
     actor_type = "human" if origin == "manual" else "tool"
     semantic = SS.validate_semantic(attributes["semantic"], actor_type=actor_type,
+                                    model_run_ids=model_run_ids,
                                     evidence_ids=annotation.get("evidence_ids", []))
     if origin == "model_candidate":
         if any(item["claim_type"] == "interpretation" for item in semantic["claims"]):
@@ -167,11 +220,13 @@ def annotation_claims(annotation: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def replace_claims(annotation: Dict[str, Any], claims: Sequence[Dict[str, Any]],
-                   *, actor_type: str = "human") -> Dict[str, Any]:
+                   *, actor_type: str = "human",
+                   model_run_ids: Iterable[str] = ()) -> Dict[str, Any]:
     """Return a copy with revalidated claims; original evidence set is preserved."""
     updated = dict(annotation)
     attributes = dict(updated.get("attributes") or {})
     attributes["semantic"] = SS.build_semantic(claims, actor_type=actor_type,
+                                               model_run_ids=model_run_ids,
                                                evidence_ids=updated.get("evidence_ids", []))
     updated["attributes"] = attributes
     return updated
