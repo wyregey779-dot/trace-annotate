@@ -71,41 +71,73 @@ def _window(value: Optional[Dict[str, Any]]) -> Optional[Tuple[Any, Any]]:
     return start, end
 
 
-def _rows(store: Any, media_id: str, budget: SamplingBudget) -> Tuple[List[Dict[str, Any]], str, int]:
-    """Read bounded frame-map rows; the map is authoritative for time."""
+def _frame_service(store: Any) -> FrameService:
     service = getattr(store, "_frame_service", None)
     if service is None:
         service = store._frame_service = FrameService(store)
-    total = int(service.page(media_id, 0, 1)["total"])
-    if total > budget.max_frames and total > MAX_PLAN_FRAMES:
-        # Only the sampling planner needs a full scan of the map; cap it and
-        # require the caller to narrow the window instead of scanning silently.
-        pass
-    rows: List[Dict[str, Any]] = []
-    offset = 0
-    chunk = 1000
-    digest = ""
-    while offset < total:
-        page = service.page(media_id, offset, min(chunk, total - offset))
-        digest = page["frame_map_sha256"]
-        rows.extend(page["frames"])
-        offset += len(page["frames"])
-    if not rows:
+    return service
+
+
+def _frame_map_identity(service: FrameService, media_id: str) -> Tuple[str, int]:
+    """Return immutable map identity without materialising every frame row."""
+    page = service.page(media_id, 0, 1)
+    total = int(page["total"])
+    if total < 1 or not page["frames"]:
         raise NotFound("FRAME_NOT_FOUND", "The admitted media has no frame rows")
-    return rows, digest, total
+    return page["frame_map_sha256"], total
 
 
-def _index_of_seconds(rows: List[Dict[str, Any]], seconds: Any) -> int:
-    """First frame whose proxy time is >= seconds (left-closed search)."""
-    target = S.rational_value(seconds)
-    lo, hi = 0, len(rows)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if S.rational_value(rows[mid]["seconds"]) < target:
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo
+def _lookup_index(service: FrameService, media_id: str, seconds: Any, *,
+                  digest: str, total: int) -> int:
+    """Map a playback time to the left-closed insertion index."""
+    result = service.lookup(media_id, seconds, "ceil")
+    try:
+        lookup_total = int(result["total"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Frame lookup returned an invalid map identity") from exc
+    if result.get("frame_map_sha256") != digest or lookup_total != total:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Frame map identity changed during sampling")
+    value = result.get("frame_index")
+    if value is None:
+        return total
+    try:
+        index = int(value)
+    except (TypeError, ValueError) as exc:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Frame lookup returned an invalid index") from exc
+    if index < 0 or index > total:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Frame lookup escaped the admitted frame map")
+    return index
+
+
+def _selected_rows(service: FrameService, media_id: str, indices: Sequence[int], *,
+                   digest: str, total: int) -> Dict[int, Dict[str, Any]]:
+    """Read only selected rows, combining adjacent indices into bounded pages."""
+    if not indices:
+        return {}
+    result: Dict[int, Dict[str, Any]] = {}
+    start = previous = indices[0]
+    ranges: List[Tuple[int, int]] = []
+    for index in indices[1:]:
+        if index != previous + 1:
+            ranges.append((start, previous + 1))
+            start = index
+        previous = index
+    ranges.append((start, previous + 1))
+    for start, end in ranges:
+        offset = start
+        while offset < end:
+            page = service.page(media_id, offset, min(1000, end - offset))
+            if page["frame_map_sha256"] != digest or int(page["total"]) != total:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Frame map identity changed during sampling")
+            rows = page["frames"]
+            if len(rows) != min(1000, end - offset):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Frame map page is incomplete")
+            for position, row in enumerate(rows, start=offset):
+                if row.get("frame_index") != str(position):
+                    raise WorkspaceError("RECOVERY_REQUIRED", "Frame map page is not index aligned")
+                result[position] = row
+            offset += len(rows)
+    return result
 
 
 def boundary_indices(store: Any, media_id: str, seconds: Sequence[Any], *,
@@ -113,10 +145,16 @@ def boundary_indices(store: Any, media_id: str, seconds: Sequence[Any], *,
     """Map scene-start seconds to admitted frame indices (left-closed)."""
     S.require_id(media_id)
     budget = budget or SamplingBudget()
-    rows, _digest, total = _rows(store, media_id, budget)
+    service = _frame_service(store)
+    digest, total = _frame_map_identity(service, media_id)
+    if len(seconds) > MAX_PLAN_FRAMES:
+        raise SchemaInvalid(
+            "INVALID_SEMANTIC_CLAIM",
+            "Boundary lookup exceeds the planner bound; split the request",
+        )
     result = []
     for value in seconds:
-        index = _index_of_seconds(rows, value)
+        index = _lookup_index(service, media_id, value, digest=digest, total=total)
         result.append(min(max(0, index), total - 1))
     return sorted(set(result))
 
@@ -130,7 +168,8 @@ def plan_samples(store: Any, media_id: str, *, window: Optional[Dict[str, Any]] 
     budget = budget or SamplingBudget()
     if type(uniform) is not int or uniform < 0 or uniform > budget.max_uniform:
         raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "uniform count is outside the budget")
-    rows, digest, total = _rows(store, media_id, budget)
+    service = _frame_service(store)
+    digest, total = _frame_map_identity(service, media_id)
     limits = _window(window)
     media = store.get_media(media_id)
     duration = media["duration"]
@@ -140,17 +179,24 @@ def plan_samples(store: Any, media_id: str, *, window: Optional[Dict[str, Any]] 
         start, end = limits
         if S.rational_value(end) > S.rational_value(duration):
             raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "window end exceeds media duration")
-        lo = _index_of_seconds(rows, start)
-        hi = _index_of_seconds(rows, end)
-        while hi < total and S.rational_value(rows[hi]["seconds"]) < S.rational_value(end):
-            hi += 1
+        lo = _lookup_index(service, media_id, start, digest=digest, total=total)
+        hi = _lookup_index(service, media_id, end, digest=digest, total=total)
     if hi <= lo:
         raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "window contains no admitted frame")
     chosen: Dict[int, List[str]] = {}
 
     def add(index: int, role: str) -> None:
-        if 0 <= index < total:
-            chosen.setdefault(index, [])
+        # Boundary hints are absolute frame indices. A caller may provide
+        # neighbours outside a requested window; they are context, not events
+        # in this plan, and must not escape the half-open window.
+        if lo <= index < hi:
+            if index not in chosen:
+                if len(chosen) >= MAX_PLAN_FRAMES:
+                    raise SchemaInvalid(
+                        "INVALID_SEMANTIC_CLAIM",
+                        "Sampling candidates exceed the planner bound; narrow the window or boundary set",
+                    )
+                chosen[index] = []
             if role not in chosen[index]:
                 chosen[index].append(role)
 
@@ -170,8 +216,11 @@ def plan_samples(store: Any, media_id: str, *, window: Optional[Dict[str, Any]] 
         for delta in range(-budget.boundary_radius, budget.boundary_radius + 1):
             add(boundary + delta, "boundary_before" if delta < 0 else ("boundary" if delta == 0 else "boundary_after"))
     ordered = sorted(chosen)
+    if not ordered:
+        raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "Sampling request selected no frames in the window")
     truncated = len(ordered) > budget.max_frames
     selected = ordered[:budget.max_frames]
+    rows = _selected_rows(service, media_id, selected, digest=digest, total=total)
     samples = [{"frame_index": str(index), "source_pts": rows[index]["source_pts"],
                 "proxy_pts": rows[index]["proxy_pts"], "seconds": rows[index]["seconds"],
                 "roles": chosen[index]} for index in selected]

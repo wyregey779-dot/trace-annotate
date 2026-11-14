@@ -32,10 +32,13 @@ def test_unicode_model_uses_complete_buffer_overload_without_writing_files(monke
     monkeypatch.setattr("shutil.copyfile", forbidden)
     extractor = F.FaceExtractor(model_path=str(model))
     assert extractor.detector is detector and extractor.detector_kind == "yunet"
+    assert extractor.code_identity["weights_sha256"] == F.hashlib.sha256(
+        model.read_bytes()).hexdigest()
+    assert extractor.code_identity["weights_load_source"] == "memory_buffer"
     assert len(calls) == 1
 
 
-def test_ascii_model_keeps_the_path_overload(monkeypatch):
+def test_ascii_model_uses_the_same_frozen_bytes_for_hash_and_loading(monkeypatch):
     import builtins
     import io
     model = "C:/models/yunet.onnx"
@@ -45,10 +48,38 @@ def test_ascii_model_keeps_the_path_overload(monkeypatch):
     monkeypatch.setattr(builtins, "open", lambda path, *args, **kwargs:
                         io.BytesIO(b"controlled model") if path == model else original_open(path, *args, **kwargs))
     def create(*args, **kwargs):
-        assert args == () and kwargs["model"] == model and kwargs["config"] == ""
+        assert len(args) == 3 and args[0] == "ONNX"
+        assert args[1].tobytes() == b"controlled model"
         return detector
     install_create(monkeypatch, create)
-    assert F.FaceExtractor(model_path=model).detector is detector
+    extractor = F.FaceExtractor(model_path=model)
+    assert extractor.detector is detector
+    assert extractor.code_identity["weights_sha256"] == F.hashlib.sha256(
+        b"controlled model").hexdigest()
+
+
+def test_source_replacement_after_load_cannot_rewrite_loaded_identity(monkeypatch, tmp_path):
+    model = tmp_path / "yunet.onnx"
+    original = b"A" * 64
+    replacement = b"B" * 64
+    model.write_bytes(original)
+    original_stat = model.stat()
+    loaded = []
+    detector = object()
+
+    def create(*args, **kwargs):
+        loaded.append(args[1].tobytes())
+        return detector
+
+    install_create(monkeypatch, create)
+    extractor = F.FaceExtractor(model_path=str(model))
+    model.write_bytes(replacement)
+    F.os.utime(model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert loaded == [original]
+    assert extractor.code_identity["weights_sha256"] == F.hashlib.sha256(original).hexdigest()
+    assert F.hashlib.sha256(model.read_bytes()).hexdigest() != (
+        extractor.code_identity["weights_sha256"])
 
 
 @pytest.mark.parametrize("cache_loads", [True, False])

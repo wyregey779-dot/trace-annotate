@@ -1,6 +1,7 @@
 """One CPU model per owned process, using bounded JSON and decoded PNG inputs."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import ctypes
 from importlib import metadata, util
@@ -19,6 +20,40 @@ MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_FRAMES = 512
 PROGRESS_REPLACE_ATTEMPTS = 20
 PROGRESS_RETRY_SECONDS = .05
+
+# Formal workspace inference supports only named deployments whose cache
+# repository can be resolved without importing torch/open_clip.  This prevents
+# an unrelated checkpoint elsewhere in a shared cache from making a missing
+# selection look available.
+CLIP_REPOSITORIES = {
+    "ViT-B-32": "timm/vit_base_patch32_clip_224.openai",
+    "ViT-L-14": "timm/vit_large_patch14_clip_224.openai",
+    "RN50": "timm/resnet50_clip.openai",
+}
+CLIP_LEGACY_FILES = {
+    "ViT-B-32": "ViT-B-32.pt",
+    "ViT-L-14": "ViT-L-14.pt",
+    "RN50": "RN50.pt",
+}
+MODEL_IMPLEMENTATION_SOURCE_FILES = (
+    "__init__.py",
+    "config.py",
+    "core/hasher.py",
+    "extractors/__init__.py",
+    "extractors/base.py",
+    "extractors/clip_engine.py",
+    "extractors/faces.py",
+    "extractors/metrics.py",
+    "extractors/model_loading.py",
+    "extractors/ocr.py",
+    "extractors/scene.py",
+    "extractors/vlm.py",
+    "workspace/__init__.py",
+    "workspace/errors.py",
+    "workspace/model_worker.py",
+    "workspace/resource_budget.py",
+    "workspace/slots.py",
+)
 
 
 class ModelLoadFailed(RuntimeError):
@@ -75,6 +110,13 @@ def _digest(path):
     return digest.hexdigest()
 
 
+def _implementation_identity(package_root=None,
+                             relative_files=MODEL_IMPLEMENTATION_SOURCE_FILES):
+    """Hash the local source closure that can change worker execution."""
+    root = Path(package_root) if package_root is not None else Path(__file__).resolve().parents[1]
+    return {relative: _digest(root / Path(relative)) for relative in relative_files}
+
+
 def _inventory(directory):
     directory = Path(directory)
     if not directory.is_dir():
@@ -89,6 +131,29 @@ def _inventory(directory):
     return result
 
 
+def _clip_selection(cache, requested):
+    """Return one selection root and only files that can satisfy it."""
+    path = Path(requested)
+    if path.is_file():
+        return path.parent, True, [{"file": path.name, "bytes": path.stat().st_size,
+                                    "sha256": _digest(path)}]
+    if path.is_dir():
+        return path, True, _inventory(path)
+    repository = CLIP_REPOSITORIES.get(requested)
+    if repository:
+        selected = cache / ("models--" + repository.replace("/", "--"))
+        inventory = []
+        for item in _inventory(selected):
+            inventory.append({**item, "file": selected.name + "/" + item["file"]})
+        legacy = cache / CLIP_LEGACY_FILES[requested]
+        if legacy.is_file():
+            inventory.append({"file": legacy.name, "bytes": legacy.stat().st_size,
+                              "sha256": _digest(legacy)})
+        return cache, True, sorted(inventory, key=lambda item: item["file"])
+    token = hashlib.sha256(requested.encode("utf-8")).hexdigest()[:16]
+    return cache / ".unresolved" / token, False, []
+
+
 def configuration(*, clip_model=None, vlm_model=None):
     """Freeze deployment inputs without importing torch or loading any model."""
     home = Path.home() / ".cache" / "traceannotate"
@@ -96,6 +161,9 @@ def configuration(*, clip_model=None, vlm_model=None):
     vlm_cache = Path(os.environ.get("TRACE_ANNOTATE_VLM_CACHE", str(home / "vlm"))).absolute()
     requested_vlm = vlm_model or "microsoft/Florence-2-base"
     local_vlm = Path(requested_vlm).absolute() if Path(requested_vlm).is_dir() else None
+    requested_clip = clip_model or "ViT-B-32"
+    clip_inventory_root, clip_selection_resolved, clip_inventory = _clip_selection(
+        clip_cache, requested_clip)
     # Only the requested model repository belongs to this VLM deployment.
     vlm_inventory_root = local_vlm or vlm_cache / ("models--" + requested_vlm.replace("/", "--"))
     versions = {}
@@ -105,14 +173,14 @@ def configuration(*, clip_model=None, vlm_model=None):
         except metadata.PackageNotFoundError:
             versions[distribution] = "unavailable"
     package = Path(__file__).resolve().parents[1]
-    sources = [Path(__file__), Path(R.__file__), package / "extractors" / "clip_engine.py",
-               package / "extractors" / "vlm.py", package / "extractors" / "model_loading.py"]
     return {"contract": CONTRACT, "policy": R.policy(), "python": str(Path(sys.executable).absolute()),
             "python_sha256": _digest(sys.executable), "versions": versions,
-            "implementation": {path.relative_to(package).as_posix(): _digest(path) for path in sources},
+            "implementation": _implementation_identity(package),
             "allow_download": os.environ.get("TRACE_ANNOTATE_ALLOW_MODEL_DOWNLOAD", "").strip() == "1",
-            "clip": {"requested": clip_model or "ViT-B-32", "cache": str(clip_cache),
-                     "inventory": _inventory(clip_cache)},
+            "clip": {"requested": requested_clip, "cache": str(clip_cache),
+                     "inventory_root": str(clip_inventory_root),
+                     "selection_resolved": clip_selection_resolved,
+                     "inventory": clip_inventory},
             "vlm": {"requested": str(local_vlm) if local_vlm else vlm_model or "microsoft/Florence-2-base",
                     "revision": os.environ.get("TRACE_ANNOTATE_VLM_REVISION") or None,
                     "cache": str(vlm_cache), "inventory_root": str(vlm_inventory_root),
@@ -124,11 +192,28 @@ def validate_configuration(value):
                 "allow_download", "clip", "vlm"}
     if not isinstance(value, dict) or set(value) != expected or value["contract"] != CONTRACT:
         raise WorkspaceError("SCHEMA_INVALID", "Invalid model process configuration")
+    value = copy.deepcopy(value)
     bounds = {"model_bytes": (2 * R.GIB, 64 * R.GIB), "reserve_bytes": (R.GIB, 64 * R.GIB),
               "wait_seconds": (0, 600), "frame_seconds": (5, 600), "phase_seconds": (60, 86400)}
     resource = value["policy"]
-    if (not isinstance(resource, dict) or set(resource) != {"contract", *bounds}
+    legacy_resource_names = {"contract", *bounds}
+    if isinstance(resource, dict) and set(resource) == legacy_resource_names:
+        resource["host_lock"] = R.policy()["host_lock"]
+    lock = resource.get("host_lock") if isinstance(resource, dict) else None
+    if (not isinstance(resource, dict) or set(resource) != {"contract", "host_lock", *bounds}
             or resource.get("contract") != R.CONTRACT
+            or not isinstance(lock, dict)
+            or set(lock) != {"contract", "kind", "identity"}
+            or lock.get("contract") != R.HOST_SLOT_CONTRACT
+            or lock.get("kind") not in {"file", "windows_named_mutex", "linux_abstract_socket"}
+            or not isinstance(lock.get("identity"), str) or not lock["identity"]
+            or lock["kind"] == "file" and (
+                not Path(lock["identity"]).is_absolute()
+                or Path(lock["identity"]).name != R.HOST_SLOT_FILENAME)
+            or lock["kind"] == "windows_named_mutex"
+            and not lock["identity"].startswith("Local\\TraceAnnotateHostModelSlot-")
+            or lock["kind"] == "linux_abstract_socket"
+            and not lock["identity"].startswith("traceannotate-host-model-slot-")
             or any(type(resource[name]) not in (int, float) or not math.isfinite(resource[name])
                    or not low <= resource[name] <= high for name, (low, high) in bounds.items())):
         raise WorkspaceError("SCHEMA_INVALID", "Invalid model resource policy")
@@ -142,15 +227,22 @@ def validate_configuration(value):
         raise WorkspaceError("SCHEMA_INVALID", "Invalid model runtime identity")
     for module in ("clip", "vlm"):
         settings = value[module]
-        names = {"requested", "cache", "inventory"} | ({"revision", "inventory_root"} if module == "vlm" else set())
-        if (not isinstance(settings, dict) or set(settings) != names
+        current_names = ({"requested", "cache", "inventory", "inventory_root", "selection_resolved"}
+                         if module == "clip" else
+                         {"requested", "cache", "inventory", "revision", "inventory_root"})
+        legacy_names = ({"requested", "cache", "inventory"} if module == "clip" else set())
+        if (not isinstance(settings, dict) or frozenset(settings) not in {frozenset(current_names),
+                                                                         frozenset(legacy_names)}
                 or not isinstance(settings.get("requested"), str) or not settings["requested"]
                 or not isinstance(settings.get("cache"), str) or not isinstance(settings.get("inventory"), list)
                 or not Path(settings["cache"]).is_absolute() or len(settings["inventory"]) > 2048):
             raise WorkspaceError("SCHEMA_INVALID", "Invalid frozen model selection")
-        if module == "vlm" and (not isinstance(settings["inventory_root"], str)
-                or not Path(settings["inventory_root"]).is_absolute()
-                or settings["revision"] is not None and not isinstance(settings["revision"], str)):
+        if ("inventory_root" in settings and
+                (not isinstance(settings["inventory_root"], str)
+                 or not Path(settings["inventory_root"]).is_absolute()
+                 or module == "clip" and type(settings["selection_resolved"]) is not bool)
+                or module == "vlm" and settings["revision"] is not None
+                and not isinstance(settings["revision"], str)):
             raise WorkspaceError("SCHEMA_INVALID", "Invalid frozen model revision")
         seen = set()
         for item in settings["inventory"]:
@@ -162,15 +254,28 @@ def validate_configuration(value):
                     or not 0 <= item["bytes"] <= 8 * R.GIB or not digest(item["sha256"])):
                 raise WorkspaceError("SCHEMA_INVALID", "Invalid frozen checkpoint inventory")
             seen.add(item["file"])
+        if module == "clip" and set(settings) == legacy_names:
+            # Legacy selections did not bind one unambiguous deployment root.
+            # Keep them readable and diagnostically not_run without inferring
+            # a runnable checkpoint from current filesystem contents.
+            settings["inventory_root"] = settings["cache"]
+            settings["selection_resolved"] = False
     return value
 
 
 def _unavailable(module, config):
+    config = validate_configuration(config)
     settings = config[module]
     dependencies = ("torch", "open_clip") if module == "clip" else ("torch", "transformers")
     if any(util.find_spec(name) is None for name in dependencies):
         return "model_runtime_unavailable"
-    if not config["allow_download"] and not any(
+    # Downloads belong to a separate acquisition/import step.  A queued
+    # inference job must never change the frozen cache it is validating.
+    if config["allow_download"]:
+        return "model_acquisition_required"
+    if module == "clip" and not settings["selection_resolved"]:
+        return "model_selection_unresolved"
+    if not any(
             item["file"].endswith((".safetensors", ".bin", ".pt", ".pth"))
             for item in settings["inventory"]):
         return "model_weights_unavailable"
@@ -186,13 +291,29 @@ def _empty_identity(module, config):
             "task_prompt": "<MORE_DETAILED_CAPTION>" if module == "vlm" else None}
 
 
+def requested_identity(module, config):
+    """Describe the frozen request without claiming that any weights loaded.
+
+    A parent process uses this only after an owned worker failed before it could
+    return its loaded identity.  The resulting record preserves the requested
+    deployment while keeping the checkpoint digest unknown.
+    """
+    config = validate_configuration(config)
+    if module not in {"clip", "vlm"}:
+        raise WorkspaceError("SCHEMA_INVALID", "Unknown isolated model module")
+    return _empty_identity(module, config)
+
+
 def _validate_identity(module, config, identity, available):
+    config = validate_configuration(config)
+    if module == "clip" and not config["clip"]["selection_resolved"] and available:
+        raise WorkspaceError("MODEL_WORKER_PROTOCOL", "Unresolved legacy model selection cannot report a loaded model")
     path, digest = identity.get("weights_path"), identity.get("weights_sha256")
     if not path:
         if available or digest is not None:
             raise WorkspaceError("MODEL_WORKER_PROTOCOL", "Loaded model has no verifiable checkpoint identity")
         return
-    root = Path(config[module].get("inventory_root", config[module]["cache"]))
+    root = Path(config[module]["inventory_root"])
     try:
         relative = Path(path).absolute().relative_to(root).as_posix()
     except ValueError as exc:
@@ -213,7 +334,7 @@ def _validate_identity(module, config, identity, available):
 
 def run_phase(module, config, images, work, *, cancelled):
     """Return small results and identity after the owned process has exited."""
-    validate_configuration(config)
+    config = validate_configuration(config)
     if module not in {"clip", "vlm"} or not 0 < len(images) <= MAX_FRAMES:
         raise WorkspaceError("SCHEMA_INVALID", "Invalid isolated model phase")
     reason = _unavailable(module, config)
@@ -284,9 +405,14 @@ def execute(request, output):
     images = request["images"]
     if request.get("contract") != CONTRACT or module not in {"clip", "vlm"} or not 0 < len(images) <= MAX_FRAMES:
         raise ValueError("Invalid model worker request")
+    if config["allow_download"]:
+        raise ValueError("Workspace inference cannot acquire or modify model resources")
     os.environ["TRACE_ANNOTATE_CLIP_CACHE"] = config["clip"]["cache"]
     os.environ["TRACE_ANNOTATE_VLM_CACHE"] = config["vlm"]["cache"]
-    os.environ["TRACE_ANNOTATE_ALLOW_MODEL_DOWNLOAD"] = "1" if config["allow_download"] else "0"
+    os.environ["TRACE_ANNOTATE_ALLOW_MODEL_DOWNLOAD"] = "0"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
     if config["vlm"]["revision"]:
         os.environ["TRACE_ANNOTATE_VLM_REVISION"] = config["vlm"]["revision"]
     before = configuration(clip_model=config["clip"]["requested"], vlm_model=config["vlm"]["requested"])

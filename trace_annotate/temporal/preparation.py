@@ -84,9 +84,17 @@ def _run(command: list, directory: Path, name: str,
     stdout, stderr = directory / f"{name}.stdout", directory / f"{name}.stderr"
     started = time.monotonic()
     was_cancelled = False
+    # Python children otherwise inherit the Windows active code page for pipe
+    # output.  The captured files are a UTF-8 product boundary consumed by the
+    # verifier and audit tools; non-Python media tools safely ignore these
+    # interpreter-specific variables.
+    child_environment = os.environ.copy()
+    child_environment["PYTHONIOENCODING"] = "utf-8"
+    child_environment["PYTHONUTF8"] = "1"
     with stdout.open("xb") as output, stderr.open("xb") as errors:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                   stdout=output, stderr=errors, cwd=cwd)
+                                   stdout=output, stderr=errors, cwd=cwd,
+                                   env=child_environment)
         child = _register_child(process, name, command)
         try:
             while process.poll() is None:

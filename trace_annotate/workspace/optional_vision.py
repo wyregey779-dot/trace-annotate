@@ -169,11 +169,30 @@ def run_landmarks(config: Dict[str, Any], images: List[Dict[str, Any]], work: Pa
         return dict(empty, reason="landmark_worker_python_unavailable")
     if not images:
         return dict(empty, reason="no_sampled_frames")
+    frame_ids = [item.get("frame_index") for item in images if isinstance(item, dict)]
+    if (len(frame_ids) != len(images) or len(set(frame_ids)) != len(frame_ids)
+            or any(not isinstance(item.get("path"), str)
+                   or not isinstance(item.get("input_sha256"), str)
+                   or re.fullmatch("[0-9a-f]{64}", item["input_sha256"]) is None
+                   for item in images)):
+        return dict(empty, status="failed", reason="landmark_input_identity_invalid")
+    current_python = _file(settings["worker_python"])
+    if (current_python["state"] != "available"
+            or current_python["sha256"] != settings["worker_python_sha256"]):
+        return dict(empty, status="failed", reason="landmark_worker_python_changed")
+    current_model = _file(settings["model_path"])
+    if (current_model["state"] != "available"
+            or current_model["sha256"] != settings["weights_sha256"]):
+        return dict(empty, status="failed", reason="landmark_weights_changed")
+    if _worker_runtime(settings["worker_python"]) != settings["runtime"]:
+        return dict(empty, status="failed", reason="landmark_runtime_identity_changed")
     directory = work / "landmarks"
     directory.mkdir(parents=True, exist_ok=False)
     request_path, output_path = directory / "request.json", directory / "output.json"
     request = {"schema": PROTOCOL, "model_path": settings["model_path"],
                "expected_weights_sha256": settings["weights_sha256"], "max_faces": 4,
+               "expected_worker_python_sha256": settings["worker_python_sha256"],
+               "expected_runtime": settings["runtime"],
                "images": images}
     request_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
     bootstrap = ("import sys,runpy;sys.path.insert(0,sys.argv.pop(1));"
@@ -187,13 +206,20 @@ def run_landmarks(config: Dict[str, Any], images: List[Dict[str, Any]], work: Pa
         if not output_path.is_file() or not 0 < output_path.stat().st_size <= config["max_output_bytes"]:
             raise ValueError("landmark_worker_output_missing_or_oversize")
         value = json.loads(output_path.read_text(encoding="utf-8"))
+        worker_identity = ((value.get("worker_identity") or {})
+                           if isinstance(value, dict) else {})
         if (not isinstance(value, dict) or value.get("schema") != PROTOCOL
                 or value.get("status") not in {"success", "not_run", "failed"}
                 or not isinstance(value.get("results"), list)
                 or len(value["results"]) != len(images)
+                or len({result.get("frame_index") for result in value["results"]})
+                   != len(value["results"])
                 or any(result.get("frame_index") != item["frame_index"]
                        or result.get("path") != item["path"]
+                       or result.get("input_sha256") != item["input_sha256"]
                        for item, result in zip(images, value["results"]))
+                or worker_identity.get("python_sha256") != settings["worker_python_sha256"]
+                or worker_identity.get("runtime") != settings["runtime"]
                 or exit_code != (1 if value["status"] == "failed" else 0)):
             raise ValueError("landmark_worker_protocol_mismatch")
         for result in value["results"]:

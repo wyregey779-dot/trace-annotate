@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -107,6 +108,113 @@ def test_invalid_windows_are_refused(store):
                                                    "end": {"n": "3", "d": "1"}})
     with pytest.raises(SchemaInvalid):
         VSmp.plan_samples(store, media_id, uniform=999)
+
+
+class _LargeFrameService:
+    """Large-map double that fails if the planner tries to scan every row."""
+
+    def __init__(self, total=5001, rate=10):
+        self.total = total
+        self.rate = rate
+        self.digest = "f" * 64
+        self.pages = []
+        self.lookups = []
+
+    def _row(self, index):
+        return {"frame_index": str(index), "source_pts": str(index),
+                "proxy_pts": str(index),
+                "seconds": {"n": str(index), "d": str(self.rate)}}
+
+    def page(self, _media_id, offset=0, limit=100):
+        self.pages.append((offset, limit))
+        assert limit <= 1000
+        return {"total": str(self.total), "frame_map_sha256": self.digest,
+                "frames": [self._row(index)
+                           for index in range(offset, min(self.total, offset + limit))]}
+
+    def lookup(self, _media_id, target, mode):
+        assert mode == "ceil"
+        self.lookups.append(target)
+        position = int(math.ceil(float(S.rational_value(target)) * self.rate))
+        position = min(max(0, position), self.total)
+        return {"frame_index": str(position), "frame": None,
+                "total": str(self.total), "frame_map_sha256": self.digest}
+
+
+class _LargeStore:
+    def __init__(self, service):
+        self._frame_service = service
+
+    def get_media(self, _media_id):
+        return {"duration": {"n": str(self._frame_service.total),
+                             "d": str(self._frame_service.rate)}}
+
+
+def test_large_map_window_reads_only_selected_rows_and_clips_boundary_hints():
+    service = _LargeFrameService()
+    store = _LargeStore(service)
+    plan = VSmp.plan_samples(
+        store, "med-large",
+        window={"start": {"n": "1", "d": "1"},
+                "end": {"n": "2", "d": "1"}},
+        uniform=3, boundary_frames=[1, 15, 30],
+        budget=VSmp.SamplingBudget(max_frames=16, boundary_radius=1))
+    indices = [int(sample["frame_index"]) for sample in plan["samples"]]
+    assert indices == [10, 14, 15, 16, 19]
+    assert all(10 <= index < 20 for index in indices)
+    assert sum(limit for _offset, limit in service.pages) == 6
+    assert len(service.lookups) == 2
+
+
+def test_large_map_boundary_lookup_does_not_materialise_frame_table():
+    service = _LargeFrameService(total=100_001)
+    store = _LargeStore(service)
+    assert VSmp.boundary_indices(
+        store, "med-large", [{"n": "1", "d": "1"},
+                             {"n": "99999", "d": "10"}]) == [10, 99_999]
+    assert service.pages == [(0, 1)]
+    assert len(service.lookups) == 2
+
+
+def test_boundary_lookup_rejects_unbounded_requests_and_identity_changes():
+    service = _LargeFrameService()
+    store = _LargeStore(service)
+    with pytest.raises(SchemaInvalid, match="planner bound"):
+        VSmp.boundary_indices(
+            store, "med-large",
+            [{"n": str(index), "d": "10"}
+             for index in range(VSmp.MAX_PLAN_FRAMES + 1)])
+    original_lookup = service.lookup
+
+    def changed_lookup(media_id, target, mode):
+        result = original_lookup(media_id, target, mode)
+        result["frame_map_sha256"] = "0" * 64
+        return result
+
+    service.lookup = changed_lookup
+    with pytest.raises(WorkspaceError, match="identity changed"):
+        VSmp.boundary_indices(store, "med-large", [{"n": "1", "d": "1"}])
+
+
+def test_boundary_only_plan_refuses_hints_outside_window():
+    service = _LargeFrameService()
+    store = _LargeStore(service)
+    with pytest.raises(SchemaInvalid, match="selected no frames"):
+        VSmp.plan_samples(
+            store, "med-large",
+            window={"start": {"n": "1", "d": "1"},
+                    "end": {"n": "2", "d": "1"}},
+            uniform=0, boundary_frames=[100], include_edges=False)
+
+
+def test_large_boundary_set_is_rejected_at_the_planner_bound():
+    service = _LargeFrameService(total=10_000)
+    store = _LargeStore(service)
+    with pytest.raises(SchemaInvalid, match="planner bound"):
+        VSmp.plan_samples(
+            store, "med-large", uniform=0,
+            boundary_frames=range(VSmp.MAX_PLAN_FRAMES + 1), include_edges=False,
+            budget=VSmp.SamplingBudget(max_frames=16, boundary_radius=0))
 
 
 def test_decode_verifies_count_identity_and_bytes(store, tmp_path):

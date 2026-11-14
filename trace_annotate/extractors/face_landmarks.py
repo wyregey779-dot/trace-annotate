@@ -10,7 +10,11 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
+import re
+import stat
+import sys
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -20,6 +24,85 @@ from .base import BaseExtractor
 CODE_VERSION = "face-landmarks-mediapipe-v1"
 PROTOCOL = "traceannotate.face-landmarks.v1"
 OFFICIAL_WEIGHTS_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
+MAX_INPUT_BYTES = 64 * 1024 * 1024
+
+
+def _sha256_file(path: Path, *, limit: Optional[int] = None) -> str:
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            total += len(block)
+            if limit is not None and total > limit:
+                raise ValueError("input_image_oversize")
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _runtime_identity() -> Dict[str, Any]:
+    """Actual interpreter and MediaPipe metadata used by this worker."""
+    python_path = Path(sys.executable).absolute()
+    python_sha256 = _sha256_file(python_path)
+    runtime = {"mediapipe_version": "unavailable", "metadata_sha256": None}
+    try:
+        distribution = importlib.metadata.distribution("mediapipe")
+        metadata_path = next((Path(distribution.locate_file(item))
+                              for item in distribution.files or []
+                              if str(item).replace("\\", "/").endswith(".dist-info/METADATA")), None)
+        metadata_sha256 = _sha256_file(metadata_path) if metadata_path is not None else None
+        runtime = {"mediapipe_version": distribution.version,
+                   "metadata_sha256": metadata_sha256}
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    return {"python_path": str(python_path), "python_sha256": python_sha256,
+            "runtime": runtime}
+
+
+def _verified_image(path_value: str, expected_sha256: str):
+    """Decode the exact verified regular-file bytes and return its file identity."""
+    if not isinstance(expected_sha256, str) or not re.fullmatch("[0-9a-f]{64}", expected_sha256):
+        raise ValueError("invalid_input_sha256")
+    path = Path(path_value).absolute()
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("input_image_not_regular_file")
+    if before.st_size <= 0 or before.st_size > MAX_INPUT_BYTES:
+        raise ValueError("input_image_size_invalid")
+    with path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if ((opened.st_dev, opened.st_ino, opened.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)):
+            raise ValueError("input_image_changed_before_read")
+        data = stream.read(MAX_INPUT_BYTES + 1)
+        after_read = os.fstat(stream.fileno())
+    if len(data) != before.st_size or len(data) > MAX_INPUT_BYTES:
+        raise ValueError("input_image_changed_during_read")
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != expected_sha256:
+        raise ValueError("input_image_sha256_mismatch")
+    if ((after_read.st_dev, after_read.st_ino, after_read.st_size, after_read.st_mtime_ns)
+            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)):
+        raise ValueError("input_image_changed_during_read")
+    try:
+        import cv2
+        image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except ImportError:
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(data)) as source:
+            image = np.array(source.convert("RGB"))[:, :, ::-1].copy()
+    if image is None:
+        raise ValueError("image_decode_failed")
+    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    return image, path, identity
+
+
+def _verify_input_unchanged(path: Path, identity, expected_sha256: str) -> None:
+    current = path.lstat()
+    if (stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != identity
+            or _sha256_file(path, limit=MAX_INPUT_BYTES) != expected_sha256):
+        raise ValueError("input_image_changed_during_inference")
 
 
 def mesh_to_face(points: np.ndarray, width: int, height: int) -> Dict[str, Any]:
@@ -196,7 +279,8 @@ class FaceLandmarkExtractor(BaseExtractor):
 def run_landmark_request(request: Dict[str, Any]) -> Dict[str, Any]:
     """Batch worker protocol; image paths and frame evidence stay caller-owned.
 
-    Request: {schema, model_path, max_faces?, images:[{path, frame_index,
+    Request: {schema, model_path, expected_worker_python_sha256,
+    expected_runtime, max_faces?, images:[{path, frame_index, input_sha256,
     evidence_id?}]}. No network access, implicit model search, or remote code.
     """
     if request.get("schema") != PROTOCOL:
@@ -205,16 +289,27 @@ def run_landmark_request(request: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(images, list) or not 1 <= len(images) <= 512:
         raise ValueError("images must contain 1 to 512 entries")
     if any(not isinstance(item, dict) or not isinstance(item.get("path"), str)
-           or not isinstance(item.get("frame_index"), str) for item in images):
-        raise ValueError("each image needs a string path and frame_index")
+           or not isinstance(item.get("frame_index"), str)
+           or not isinstance(item.get("input_sha256"), str)
+           or re.fullmatch("[0-9a-f]{64}", item["input_sha256"]) is None for item in images):
+        raise ValueError("each image needs path, unique frame_index and input_sha256")
+    if len({item["frame_index"] for item in images}) != len(images):
+        raise ValueError("duplicate frame_index")
+    worker_identity = _runtime_identity()
+    if (request.get("expected_worker_python_sha256") != worker_identity["python_sha256"]
+            or request.get("expected_runtime") != worker_identity["runtime"]):
+        raise ValueError("landmark_worker_identity_changed")
     from .expressive_cues import face_cue_candidates, cues_to_claims
     extractor = FaceLandmarkExtractor(request.get("model_path"), max_faces=request.get("max_faces", 4),
                                       expected_weights_sha256=request.get("expected_weights_sha256"))
     results = []
     try:
         for item in images:
-            result = extractor.extract({}, item["path"])
-            result.update({"path": item["path"], "frame_index": item["frame_index"]})
+            image, path, input_identity = _verified_image(item["path"], item["input_sha256"])
+            result = extractor.detect_landmarks(image)
+            _verify_input_unchanged(path, input_identity, item["input_sha256"])
+            result.update({"path": item["path"], "frame_index": item["frame_index"],
+                           "input_sha256": item["input_sha256"]})
             evaluated = [face_cue_candidates(face, frame_index=item["frame_index"],
                                              evidence_id=item.get("evidence_id"))
                          for face in result["faces_detected"]]
@@ -225,7 +320,8 @@ def run_landmark_request(request: Dict[str, Any]) -> Dict[str, Any]:
         extractor.close()
     statuses = {item["status"] for item in results}
     status = "failed" if "failed" in statuses else "not_run" if "not_run" in statuses else "success"
-    return {"schema": PROTOCOL, "status": status, "results": results}
+    return {"schema": PROTOCOL, "status": status, "worker_identity": worker_identity,
+            "results": results}
 
 
 def main() -> int:

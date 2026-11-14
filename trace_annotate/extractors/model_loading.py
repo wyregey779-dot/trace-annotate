@@ -1,10 +1,10 @@
 """Offline-first model loading policy.
 
 A vision adapter must never reach the network just because a weight path is
-missing or misspelled. Offline mode is the default; an operator can opt into
-downloads explicitly with TRACE_ANNOTATE_ALLOW_MODEL_DOWNLOAD=1, which is
-recorded in the adapter's load metadata so the provenance of the weights stays
-visible.
+missing or misspelled. Offline mode is the default.
+``TRACE_ANNOTATE_ALLOW_MODEL_DOWNLOAD=1`` is an explicit resource-acquisition
+switch for adapters invoked outside the frozen workspace inference worker.
+Formal workspace jobs remain read-only and require a frozen local checkpoint.
 """
 from __future__ import annotations
 
@@ -38,7 +38,15 @@ def enforce_offline_environment() -> Dict[str, str]:
             os.environ[key] = value
             values[key] = value
     else:
-        values["HF_HUB_OFFLINE"] = os.environ.get("HF_HUB_OFFLINE", "0")
+        # A process may have entered the default offline state before an
+        # operator explicitly selected acquisition.  Do not claim online while
+        # leaving either client switch at ``1``.  A fresh process is still
+        # required if a hub library already snapshotted these variables.
+        for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+            os.environ[key] = "0"
+            values[key] = "0"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        values["HF_HUB_DISABLE_TELEMETRY"] = "1"
     return values
 
 

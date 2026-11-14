@@ -13,6 +13,8 @@ merging requires the same subject, the same class and continuous evidence.
 """
 from __future__ import annotations
 
+import copy
+import json
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -63,7 +65,10 @@ def detect_translation_candidates(track: Sequence[Dict[str, Any]], *,
         x1, y1, x2, y2 = [float(value) for value in entry["box"]]
         points.append({"frame_index": str(entry["frame_index"]), "seconds": seconds,
                        "centre": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                       "height": max(1.0, y2 - y1)})
+                       "height": max(1.0, y2 - y1),
+                       "evidence_sha256": entry.get("evidence_sha256"),
+                       "detection_confidence": entry.get("detection_confidence"),
+                       "association": entry.get("association")})
     if len(points) < min_samples:
         return {"status": "not_run", "candidates": [],
                 "reason": "主体框轨迹点不足，无法测量位移"}
@@ -92,6 +97,11 @@ def detect_translation_candidates(track: Sequence[Dict[str, Any]], *,
             "metrics": {"speed_heights_per_s": round(speed, 3),
                         "dx": round(dx, 2), "dy": round(dy, 2),
                         "samples": len(points)},
+            "sample_frames": [
+                {key: point[key] for key in
+                 ("frame_index", "seconds", "evidence_sha256",
+                  "detection_confidence", "association")}
+                for point in points],
             "method": "subject-translation-v1",
             "score": round(min(0.85, 0.4 + speed / 4.0), 3),
             "score_kind": "rule_score",
@@ -128,27 +138,112 @@ def build_candidate(action: str, *, subject_id: Optional[str], start_frame: str,
 
 
 def merge_candidates(candidates: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merge only same subject + same action + continuous window or shared evidence."""
+    """Merge continuous candidates without crossing subject/object/method identity.
+
+    Inputs can arrive from sampled windows in any order.  Shared evidence alone is
+    not proof of temporal continuity, and candidates without a subject identity
+    cannot safely be assumed to describe the same actor.
+    """
+
+    def stable(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), default=str)
+
+    def first(candidate: Dict[str, Any], *names: str) -> Any:
+        for name in names:
+            if name in candidate:
+                return candidate[name]
+        return None
+
+    def identity(candidate: Dict[str, Any]) -> tuple[str, ...]:
+        return (
+            stable(candidate.get("action")),
+            stable(first(candidate, "subject_ref", "subject_id")),
+            stable(first(candidate, "object_ref", "object_id", "object")),
+            stable(first(candidate, "recipient_ref", "recipient_id",
+                         "receiver_ref", "receiver_id")),
+            stable(candidate.get("provider")),
+            stable(candidate.get("method")),
+            stable(candidate.get("score_kind")),
+        )
+
+    def frame_bounds(candidate: Dict[str, Any]) -> Optional[tuple[int, int]]:
+        try:
+            start = int(candidate["start_frame"])
+            end = int(candidate["end_frame"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return (start, end) if end >= start else None
+
+    def evidence(candidate: Dict[str, Any]) -> List[Any]:
+        values = candidate.get("evidence_ids", [])
+        return list(values) if isinstance(values, (list, tuple)) else []
+
+    def append_unique(target: List[Any], additions: Sequence[Any]) -> None:
+        seen = {stable(value) for value in target}
+        for value in additions:
+            marker = stable(value)
+            if marker not in seen:
+                target.append(copy.deepcopy(value))
+                seen.add(marker)
+
+    valid: Dict[tuple[str, ...], List[tuple[int, int, Dict[str, Any]]]] = {}
+    separate: List[Dict[str, Any]] = []
+    for original in candidates:
+        candidate = copy.deepcopy(original)
+        bounds = frame_bounds(candidate)
+        subject = first(candidate, "subject_ref", "subject_id")
+        if bounds is None or subject is None:
+            separate.append(candidate)
+            continue
+        valid.setdefault(identity(candidate), []).append((bounds[0], bounds[1], candidate))
+
     merged: List[Dict[str, Any]] = []
-    for candidate in candidates:
-        for existing in merged:
-            adjacent = False
+    for group_identity in sorted(valid):
+        group = sorted(valid[group_identity], key=lambda item: (
+            item[0], item[1], stable(item[2])))
+        current: Optional[Dict[str, Any]] = None
+        current_end = -1
+        for start, end, candidate in group:
+            if current is None or start > current_end + 1:
+                current = candidate
+                current_end = end
+                merged.append(current)
+                continue
+
+            window = {
+                "start_frame": candidate["start_frame"],
+                "end_frame": candidate["end_frame"],
+            }
+            for key in ("window_seconds", "evidence_ids", "provider", "method",
+                        "score", "score_kind"):
+                if key in candidate:
+                    window[key] = copy.deepcopy(candidate[key])
+            current.setdefault("merged_windows", []).append(window)
+            previous_end = current_end
+            current_end = max(current_end, end)
+            current["end_frame"] = str(current_end)
+            current_evidence = evidence(current)
+            append_unique(current_evidence, evidence(candidate))
+            if current_evidence or "evidence_ids" in current or "evidence_ids" in candidate:
+                current["evidence_ids"] = current_evidence
             try:
-                adjacent = int(candidate["start_frame"]) <= int(existing["end_frame"]) + 1
+                current["score"] = max(float(current["score"]), float(candidate["score"]))
             except (KeyError, TypeError, ValueError):
-                adjacent = False
-            shares_evidence = bool(set(existing.get("evidence_ids", []))
-                                   & set(candidate.get("evidence_ids", [])))
-            if (existing["action"] == candidate["action"]
-                    and existing["subject_id"] == candidate["subject_id"]
-                    and (adjacent or shares_evidence)):
-                existing["end_frame"] = candidate["end_frame"]
-                existing["merged_windows"] = existing.get("merged_windows", []) + [
-                    {"start_frame": candidate["start_frame"], "end_frame": candidate["end_frame"]}]
-                existing["score"] = max(existing["score"], candidate["score"])
-                break
-        else:
-            merged.append(dict(candidate))
+                pass
+            if end > previous_end and isinstance(current.get("window_seconds"), dict) and isinstance(
+                    candidate.get("window_seconds"), dict):
+                if "end" in candidate["window_seconds"]:
+                    current["window_seconds"]["end"] = copy.deepcopy(
+                        candidate["window_seconds"]["end"])
+
+    merged.extend(separate)
+    merged.sort(key=lambda candidate: (
+        frame_bounds(candidate) is None,
+        frame_bounds(candidate) or (0, 0),
+        identity(candidate),
+        stable(candidate),
+    ))
     return merged
 
 

@@ -1,9 +1,12 @@
 """Offline landmark loading, geometry contract and measured failure paths."""
+import hashlib
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image
 
+from trace_annotate.extractors import face_landmarks as FL
 from trace_annotate.extractors.face_landmarks import FaceLandmarkExtractor, mesh_to_face
 from trace_annotate.extractors import expressive_cues as EC
 
@@ -165,3 +168,62 @@ def test_worker_protocol_rejects_untyped_paths_and_wrong_schema():
         run_landmark_request({"schema":"wrong","images":[]})
     with pytest.raises(ValueError):
         run_landmark_request({"schema":PROTOCOL,"images":[{"path":1,"frame_index":"2"}]})
+
+
+def _worker_request(tmp_path, monkeypatch, *, frame_index="2"):
+    model = tmp_path / "worker-face.task"
+    model.write_bytes(b"fixture model")
+    image = tmp_path / "sample.png"
+    Image.fromarray(np.full((24, 32, 3), 120, dtype=np.uint8)).save(image)
+    output = SimpleNamespace(face_landmarks=[])
+    class Runtime:
+        def detect(self, _image):
+            return output
+        def close(self):
+            pass
+    mp = SimpleNamespace(ImageFormat=SimpleNamespace(SRGB=1), Image=lambda **kw: kw)
+    monkeypatch.setattr(FaceLandmarkExtractor, "_create_runtime",
+                        lambda self: (mp, Runtime()))
+    worker = FL._runtime_identity()
+    return {"schema": FL.PROTOCOL, "model_path": str(model),
+            "expected_weights_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+            "expected_worker_python_sha256": worker["python_sha256"],
+            "expected_runtime": worker["runtime"],
+            "images": [{"path": str(image), "frame_index": frame_index,
+                        "input_sha256": hashlib.sha256(image.read_bytes()).hexdigest()}]}, image
+
+
+def test_worker_binds_the_exact_decoded_input_bytes(tmp_path, monkeypatch):
+    request, _image = _worker_request(tmp_path, monkeypatch)
+    result = FL.run_landmark_request(request)
+    assert result["status"] == "success"
+    assert result["worker_identity"]["python_sha256"] == request["expected_worker_python_sha256"]
+    assert result["results"][0]["input_sha256"] == request["images"][0]["input_sha256"]
+
+
+def test_worker_rejects_wrong_input_digest_and_duplicate_frame_ids(tmp_path, monkeypatch):
+    request, _image = _worker_request(tmp_path, monkeypatch)
+    request["images"][0]["input_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="input_image_sha256_mismatch"):
+        FL.run_landmark_request(request)
+    request, _image = _worker_request(tmp_path, monkeypatch)
+    request["images"].append(dict(request["images"][0]))
+    with pytest.raises(ValueError, match="duplicate frame_index"):
+        FL.run_landmark_request(request)
+
+
+def test_worker_rejects_path_mutation_during_inference(tmp_path, monkeypatch):
+    request, image = _worker_request(tmp_path, monkeypatch)
+    def mutate(self, _image):
+        image.write_bytes(b"changed while inference was running")
+        return self._result("success", faces=[])
+    monkeypatch.setattr(FaceLandmarkExtractor, "detect_landmarks", mutate)
+    with pytest.raises(ValueError, match="input_image_changed_during_inference"):
+        FL.run_landmark_request(request)
+
+
+def test_worker_rejects_an_interpreter_identity_other_than_the_actual_process(tmp_path, monkeypatch):
+    request, _image = _worker_request(tmp_path, monkeypatch)
+    request["expected_worker_python_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="landmark_worker_identity_changed"):
+        FL.run_landmark_request(request)

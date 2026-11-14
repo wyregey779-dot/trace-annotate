@@ -7,13 +7,14 @@ Two very different things live here on purpose:
   small, side-facing or occluded face is refused rather than guessed; and a cue is
   never turned into an inner emotional state.
 * acoustic measurements are deterministic signal numbers: window RMS in dBFS,
-  active-speech intervals above the local noise floor, and f0 with its variation
+  energy-active intervals above the local noise floor, and f0 with its variation
   for voiced frames. Units, audio origin and the analysis window are part of the
   result. Timbre, identity or emotion are not measured here.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+import time
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -25,22 +26,56 @@ MIN_FACE_HEIGHT = 48
 MIN_FACE_RATIO = 0.06
 
 
-def _rms_dbfs(samples: np.ndarray) -> float:
-    value = float(np.sqrt(np.mean(np.square(samples.astype(np.float64)))))
+def _analysis_guard(cancelled: Optional[Callable[[], bool]],
+                    deadline_monotonic: Optional[float]) -> None:
+    if cancelled is not None and cancelled():
+        raise InterruptedError("acoustic_analysis_cancelled")
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise TimeoutError("acoustic_analysis_timeout")
+
+
+def _rms_dbfs(samples: np.ndarray, *,
+               cancelled: Optional[Callable[[], bool]] = None,
+               deadline_monotonic: Optional[float] = None) -> float:
+    source = np.asarray(samples).ravel()
+    if source.size == 0:
+        return -240.0
+    # Accumulate in bounded chunks so a memory-mapped long recording is not
+    # copied into one full float64 work array.
+    total = 0.0
+    step = 1_000_000
+    for index in range(0, source.size, step):
+        _analysis_guard(cancelled, deadline_monotonic)
+        chunk = source[index:index + step].astype(np.float64, copy=False)
+        total += float(np.dot(chunk, chunk))
+    value = float(np.sqrt(total / source.size))
     return 20.0 * np.log10(max(value, 1e-12))
 
 
 def measure_acoustic_window(samples: Sequence[float], sample_rate: int, *,
-                            origin_seconds: float = 0.0) -> Dict[str, Any]:
-    """RMS, active-speech intervals and f0 for one analysis window."""
-    audio = np.asarray(samples, dtype=np.float64).ravel()
+                            origin_seconds: float = 0.0,
+                            cancelled: Optional[Callable[[], bool]] = None,
+                            deadline_monotonic: Optional[float] = None) -> Dict[str, Any]:
+    """RMS, energy-active intervals and f0 for one analysis window.
+
+    The adaptive energy threshold is deliberately not called speech activity.
+    Music, machinery and other non-speech sounds can all cross it.
+    """
+    audio = np.asarray(samples).ravel()
     if audio.size == 0 or sample_rate <= 0:
         return {"status": "not_run", "reason": "空窗口或非法采样率"}
+    _analysis_guard(cancelled, deadline_monotonic)
     duration = audio.size / float(sample_rate)
-    rms = _rms_dbfs(audio)
+    rms = _rms_dbfs(audio, cancelled=cancelled,
+                    deadline_monotonic=deadline_monotonic)
     hop = max(1, int(round(FRAME_HOP_SECONDS * sample_rate)))
-    frames = [audio[index:index + hop] for index in range(0, audio.size - hop + 1, hop)]
-    energies = np.array([_rms_dbfs(frame) for frame in frames]) if frames else np.array([rms])
+    energy_values = []
+    for index in range(0, audio.size - hop + 1, hop):
+        _analysis_guard(cancelled, deadline_monotonic)
+        energy_values.append(_rms_dbfs(audio[index:index + hop]))
+    energies = np.asarray(energy_values)
+    if energies.size == 0:
+        energies = np.array([rms])
     floor = float(np.percentile(energies, 10))
     # A window that is loud from end to end has no quieter reference: its
     # percentile floor equals the signal, so a pure relative threshold would
@@ -49,6 +84,7 @@ def measure_acoustic_window(samples: Sequence[float], sample_rate: int, *,
     active = []
     start: Optional[int] = None
     for index, energy in enumerate(energies):
+        _analysis_guard(cancelled, deadline_monotonic)
         loud = energy >= threshold
         if loud and start is None:
             start = index
@@ -57,16 +93,21 @@ def measure_acoustic_window(samples: Sequence[float], sample_rate: int, *,
             start = None
     if start is not None:
         active.append(_interval(start, len(energies) - 1, hop, sample_rate, origin_seconds))
-    f0 = _fundamental(audio, sample_rate)
+    f0 = _fundamental(audio, sample_rate, cancelled=cancelled,
+                      deadline_monotonic=deadline_monotonic)
+    active_ratio = (round(sum(item["end"] - item["start"] for item in active) / duration, 3)
+                    if duration else 0.0)
     return {"status": "success", "window_seconds": {"start": origin_seconds,
                                                     "end": origin_seconds + duration},
             "sample_rate": sample_rate, "samples": int(audio.size),
             "rms_dbfs": round(rms, 3), "noise_floor_dbfs": round(floor, 3),
-            "active_intervals": active,
-            "active_ratio": round(sum(item["end"] - item["start"] for item in active) / duration, 3)
-            if duration else 0.0,
+            "activity_kind": "energy_above_adaptive_threshold",
+            "energy_active_intervals": active, "energy_active_ratio": active_ratio,
+            # Backward-compatible numeric aliases.  Callers must use
+            # ``activity_kind`` and must not describe these as speech.
+            "active_intervals": active, "active_ratio": active_ratio,
             "f0_hz": f0["value"], "f0_variation_hz": f0["variation"],
-            "f0_frames": f0["frames"], "method": "acoustic-window-v1"}
+            "f0_frames": f0["frames"], "method": "acoustic-window-v2"}
 
 
 def _interval(start: int, end: int, hop: int, sample_rate: int, origin: float) -> Dict[str, float]:
@@ -74,11 +115,14 @@ def _interval(start: int, end: int, hop: int, sample_rate: int, origin: float) -
             "end": round(origin + (end + 1) * hop / sample_rate, 3)}
 
 
-def _fundamental(audio: np.ndarray, sample_rate: int) -> Dict[str, Any]:
+def _fundamental(audio: np.ndarray, sample_rate: int, *,
+                 cancelled: Optional[Callable[[], bool]] = None,
+                 deadline_monotonic: Optional[float] = None) -> Dict[str, Any]:
     """Autocorrelation f0 on voiced frames; silence returns no value."""
     frame = int(0.04 * sample_rate)
     values: List[float] = []
     for index in range(0, audio.size - frame + 1, max(1, frame // 2)):
+        _analysis_guard(cancelled, deadline_monotonic)
         chunk = audio[index:index + frame]
         if _rms_dbfs(chunk) < -45.0:
             continue
@@ -197,6 +241,8 @@ def acoustic_claim(measurement: Dict[str, Any], evidence_id: Optional[str]) -> L
                         "window": measurement["window_seconds"]},
              "measurement": {"rms_dbfs": measurement["rms_dbfs"],
                              "f0_hz": measurement["f0_hz"],
-                             "active_ratio": measurement["active_ratio"]},
+                             "active_ratio": measurement["active_ratio"],
+                             "energy_active_ratio": measurement["energy_active_ratio"],
+                             "activity_kind": measurement["activity_kind"]},
              "score": 1.0, "score_kind": "confidence",
              "uncertainty_reason": "仅声学测量，不代表音色、身份或情绪"}]

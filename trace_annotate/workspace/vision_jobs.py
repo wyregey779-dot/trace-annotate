@@ -17,6 +17,8 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
+from importlib import metadata
 from types import SimpleNamespace
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
@@ -75,6 +77,212 @@ MOTION_LABELS = {"static", "pan_left", "pan_right", "tilt_up", "tilt_down",
 BOUNDARY_RADIUS = 8
 TRANSITION_LABELS = {"cut", "fade_in", "fade_out", "dissolve", "flash",
                      "unknown_transition"}
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_DECODE_TIMEOUT_SECONDS = 600.0
+AUDIO_ENCODE_TIMEOUT_SECONDS = 120.0
+AUDIO_MAX_ANALYSIS_SECONDS = 120.0
+AUDIO_ANALYSIS_TIMEOUT_SECONDS = 60.0
+AUDIO_WORKSPACE_RESERVE_BYTES = 256 * 1024 * 1024
+AUDIO_PCM_TOLERANCE_SAMPLES = 1024
+EXECUTION_MANIFEST_VERSION = 1
+ISOLATABLE_MODEL_ERRORS = frozenset({
+    "INSUFFICIENT_MEMORY",
+    "MEMORY_STATUS_UNAVAILABLE",
+    "MODEL_RESOURCE_BUSY",
+    "MODEL_TIMEOUT",
+    "MODEL_LOG_LIMIT",
+    "MODEL_MEMORY_FAILED",
+    "MODEL_LOAD_FAILED",
+    "MODEL_PROGRESS_FAILED",
+    "MODEL_WORKER_FAILED",
+})
+_FILE_DESCRIPTOR_LOCK = threading.Lock()
+_TOOL_VERSION_CACHE: Dict[Tuple[str, str, str], str] = {}
+EXECUTION_SOURCE_FILES = (
+    "__init__.py",
+    "config.py",
+    "core/hasher.py",
+    "extractors/__init__.py",
+    "extractors/base.py",
+    "extractors/metrics.py",
+    "temporal/__init__.py",
+    "temporal/media.py",
+    "temporal/preparation.py",
+    "temporal/schema.py",
+    "workspace/__init__.py",
+    "workspace/artifact_refs.py",
+    "workspace/errors.py",
+    "workspace/http_media.py",
+    "workspace/queue.py",
+    "workspace/schema.py",
+    "workspace/slots.py",
+    "workspace/store.py",
+    "workspace/vision_jobs.py",
+    "workspace/vision_sampling.py",
+    "workspace/transition_discovery.py",
+    "workspace/optional_vision.py",
+    "workspace/model_worker.py",
+    "workspace/resource_budget.py",
+    "workspace/frames.py",
+    "workspace/semantic_schema.py",
+    "workspace/professional_schema.py",
+    "extractors/actions.py",
+    "extractors/camera_motion.py",
+    "extractors/expressive_cues.py",
+    "extractors/shot_attributes.py",
+    "extractors/scene_change.py",
+    "extractors/shot_boundaries.py",
+    "extractors/scene.py",
+    "extractors/faces.py",
+    "extractors/ocr.py",
+    "extractors/persons.py",
+    "extractors/face_landmarks.py",
+    "extractors/clip_engine.py",
+    "extractors/vlm.py",
+    "extractors/model_loading.py",
+)
+
+
+def _path_identity(path: Path) -> str:
+    """Bind a local deployment path without exporting the user's absolute path."""
+    return S.sha256_text({"resolved_path": os.path.normcase(str(path.resolve()))})
+
+
+def _file_descriptor(path: Optional[str], *, literal: Optional[str] = None) -> Dict[str, Any]:
+    """Describe exact regular-file bytes; unavailable resources stay explicit."""
+    if not path:
+        return {"status": "unavailable", "literal": literal}
+    candidate = Path(path)
+    try:
+        info = candidate.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not a regular file")
+        signature = (getattr(info, "st_dev", None), getattr(info, "st_ino", None),
+                     info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        digest = stream_sha256(candidate)
+        after = candidate.stat()
+        after_signature = (getattr(after, "st_dev", None), getattr(after, "st_ino", None),
+                           after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        if after_signature != signature:
+            raise OSError("file changed while its identity was measured")
+        descriptor = {"status": "available", "name": candidate.name,
+                      "path_identity_sha256": _path_identity(candidate),
+                      "sha256": digest, "size_bytes": str(info.st_size)}
+        return descriptor
+    except OSError as exc:
+        return {"status": "unavailable", "name": candidate.name,
+                "path_identity_sha256": _path_identity(candidate),
+                "reason": type(exc).__name__}
+
+
+def _tool_descriptor(name: str, explicit_path: Optional[str] = None) -> Dict[str, Any]:
+    selected = explicit_path or shutil.which(name)
+    descriptor = _file_descriptor(selected)
+    if descriptor["status"] != "available":
+        return descriptor
+    cache_key = (name, descriptor["path_identity_sha256"], descriptor["sha256"])
+    with _FILE_DESCRIPTOR_LOCK:
+        cached_version = _TOOL_VERSION_CACHE.get(cache_key)
+    if cached_version is not None:
+        return {**descriptor, "version": cached_version}
+    version = "unavailable"
+    try:
+        completed = subprocess.run([str(Path(selected)), "-version"], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, encoding="utf-8", errors="replace", timeout=5,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if completed.returncode == 0 and completed.stdout:
+            version = completed.stdout.splitlines()[0][:300]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    with _FILE_DESCRIPTOR_LOCK:
+        _TOOL_VERSION_CACHE[cache_key] = version
+    return {**descriptor, "version": version}
+
+
+def _package_version_or_unavailable(distribution: str) -> str:
+    try:
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        return "unavailable"
+
+
+def _ocr_deployment(model_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Freeze explicit OCR model bytes without importing or loading the engine."""
+    directory = Path(model_dir) if model_dir else None
+    names = {
+        "det": ("PP-OCRv6_det_small.onnx", "ch_PP-OCRv4_det_infer.onnx"),
+        "cls": ("ch_ppocr_mobile_v2.0_cls_mobile.onnx", "ch_ppocr_mobile_v2.0_cls_infer.onnx"),
+        "rec": ("PP-OCRv6_rec_small.onnx", "ch_PP-OCRv4_rec_infer.onnx"),
+    }
+    files: List[Dict[str, Any]] = []
+    selected_runtime = None
+    if directory is not None:
+        for role, alternatives in names.items():
+            selected = next((directory / item for item in alternatives
+                             if (directory / item).is_file()), directory / alternatives[0])
+            files.append({"role": role, **_file_descriptor(str(selected))})
+    else:
+        for distribution in ("rapidocr-onnxruntime", "rapidocr"):
+            try:
+                installed = metadata.distribution(distribution)
+            except metadata.PackageNotFoundError:
+                continue
+            located = {role: next((Path(installed.locate_file(item))
+                                   for item in installed.files or []
+                                   if Path(str(item)).name in alternatives
+                                   and Path(installed.locate_file(item)).is_file()), None)
+                       for role, alternatives in names.items()}
+            if all(located.values()):
+                selected_runtime = distribution
+                files = [{"role": role, **_file_descriptor(str(path))}
+                         for role, path in located.items()]
+                break
+    return {"configured": directory is not None,
+            "model_dir_identity_sha256": _path_identity(directory) if directory is not None else None,
+            "files": files,
+            "selected_runtime": selected_runtime,
+            "runtime_versions": {
+                "rapidocr": _package_version_or_unavailable("rapidocr"),
+                "rapidocr_onnxruntime": _package_version_or_unavailable("rapidocr-onnxruntime"),
+            }}
+
+
+def _implementation_manifest(package_root: Optional[Path] = None,
+                             relative_files: Sequence[str] = EXECUTION_SOURCE_FILES) -> Dict[str, Any]:
+    root = package_root or Path(__file__).resolve().parents[1]
+    files = []
+    for relative in relative_files:
+        path = root / PurePosixPath(relative)
+        descriptor = _file_descriptor(str(path))
+        files.append({"path": relative, "status": descriptor["status"],
+                      "sha256": descriptor.get("sha256"),
+                      "size_bytes": descriptor.get("size_bytes")})
+    return {"files": files, "sha256": S.sha256_text(files)}
+
+
+def _execution_deployment(*, face_model_path: Optional[str] = None,
+                          ocr_model_dir: Optional[str] = None,
+                          ffmpeg_path: Optional[str] = None,
+                          ffprobe_path: Optional[str] = None,
+                          package_root: Optional[Path] = None) -> Dict[str, Any]:
+    face_selected = face_model_path or os.getenv("TRACE_ANNOTATE_FACE_MODEL")
+    face = ({"status": "builtin", "literal": "opencv_haar_builtin"}
+            if face_selected == "haar" else _file_descriptor(face_selected))
+    deployment = {
+        "version": EXECUTION_MANIFEST_VERSION,
+        "implementation": _implementation_manifest(package_root),
+        "ffmpeg": _tool_descriptor("ffmpeg", ffmpeg_path),
+        "ffprobe": _tool_descriptor("ffprobe", ffprobe_path),
+        "face": face,
+        "ocr": _ocr_deployment(ocr_model_dir or os.getenv("TRACE_ANNOTATE_OCR_MODELS")),
+        "runtime_versions": {
+            "python": ".".join(str(item) for item in os.sys.version_info[:3]),
+            "opencv_python": _package_version_or_unavailable("opencv-python"),
+            "numpy": _package_version_or_unavailable("numpy"),
+        },
+    }
+    return {**deployment, "deployment_sha256": S.sha256_text(deployment)}
 
 
 def _finite(value: Any, name: str, *, positive: bool = False) -> float:
@@ -121,6 +329,8 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
                   optional_providers: Optional[Dict[str, Any]] = None,
                   include_optional: bool = True, model_resources: Optional[Dict[str, Any]] = None,
                   include_model_resources: bool = True,
+                  execution_deployment: Optional[Dict[str, Any]] = None,
+                  include_execution_deployment: bool = True,
                   include_transition_discovery: bool = True,
                   transition_configuration: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     thresholds = MetricThresholds()
@@ -149,19 +359,28 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
     if include_model_resources:
         config["model_resources"] = MW.validate_configuration(
             model_resources if model_resources is not None else MW.configuration())
+    if include_execution_deployment:
+        deployment = execution_deployment if execution_deployment is not None else _execution_deployment()
+        if (not isinstance(deployment, dict) or deployment.get("version") != EXECUTION_MANIFEST_VERSION
+                or deployment.get("deployment_sha256") != S.sha256_text({
+                    key: value for key, value in deployment.items() if key != "deployment_sha256"})):
+            raise SchemaInvalid("SCHEMA_INVALID", "Execution deployment identity is invalid")
+        config["execution_deployment"] = deployment
     if include_transition_discovery:
         config["transition_discovery"] = TD.validate_configuration(
             TD.configuration() if transition_configuration is None else transition_configuration)
     return {"pipeline": "vision-assist-v1", "processor_version": VERSION,
             "config_sha256": S.sha256_text(config), "config": config,
-            "model_identity": "declared_at_run_not_at_config_query",
-            "capability_identity": "ffmpeg+local_extractors; weights_sha256_recorded_per_run"}
+            "model_identity": "deployment frozen at submit; loaded bytes recorded per run",
+            "capability_identity": "implementation+ffmpeg+ffprobe+local resources frozen by sha256"}
 
 
 def _parameters(window: Optional[Dict[str, Any]] = None,
                 subject_annotation_id: Optional[str] = None, *,
                 optional_providers: Optional[Dict[str, Any]] = None,
                 model_resources: Optional[Dict[str, Any]] = None,
+                 execution_deployment: Optional[Dict[str, Any]] = None,
+                 include_execution_deployment: bool = True,
                 include_model_resources: bool = True,
                 include_transition_discovery: bool = True,
                 transition_configuration: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -177,6 +396,8 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
     return json.loads(S.canonical_json({"window": window, "subject_annotation_id": subject_annotation_id,
                                         "time_domain": DOMAIN, "job_identity": _job_identity(
                                             optional_providers=optional_providers, model_resources=model_resources,
+                                            execution_deployment=execution_deployment,
+                                            include_execution_deployment=include_execution_deployment,
                                             include_model_resources=include_model_resources,
                                             include_transition_discovery=include_transition_discovery,
                                             transition_configuration=transition_configuration)}))
@@ -195,11 +416,14 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
     optional = identity["config"].get("optional_providers")
     resources = identity["config"].get("model_resources")
+    deployment = identity["config"].get("execution_deployment")
     if resources is not None:
         MW.validate_configuration(resources)
     if optional is not None:
         OV.validate_config(optional)
     resource_options = {"model_resources": resources, "include_model_resources": resources is not None,
+                        "execution_deployment": deployment,
+                        "include_execution_deployment": deployment is not None,
                         "include_transition_discovery": "transition_discovery" in identity["config"],
                         "transition_configuration": identity["config"].get("transition_discovery")}
     current = _parameters(parameters["window"], parameters["subject_annotation_id"],
@@ -212,6 +436,24 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     if optional is None:
         identities.extend([_job_identity(include_optional=False, **resource_options),
                            _job_identity(include_optional=False, content_evidence_contract=None, **resource_options)])
+    # Completed candidates from before execution-deployment freezing remain
+    # readable/applyable.  The processor's strict current comparison below
+    # rejects such queued work and requires an explicit resubmission.
+    legacy_options = {key: value for key, value in resource_options.items()
+                      if key not in {"execution_deployment", "include_execution_deployment"}}
+    identities.extend([
+        _job_identity(optional_providers=optional, include_execution_deployment=False,
+                      **legacy_options),
+        _job_identity(optional_providers=optional, content_evidence_contract=None,
+                      include_execution_deployment=False, **legacy_options),
+    ])
+    if optional is None:
+        identities.extend([
+            _job_identity(include_optional=False, include_execution_deployment=False,
+                          **legacy_options),
+            _job_identity(include_optional=False, content_evidence_contract=None,
+                          include_execution_deployment=False, **legacy_options),
+        ])
     if not any(parameters == dict(current, job_identity=item) for item in identities):
         raise SchemaInvalid("SCHEMA_INVALID", "Invalid frozen vision parameters")
     media, task = job["media_snapshot"], job["task_snapshot"]
@@ -296,15 +538,20 @@ def _subject_tracks(keyframes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for keyframe in sorted(keyframes, key=lambda item: (item["scene_index"], S.rational_value(item["timestamp"]))):
         persons = keyframe.get("person") or {}
         face = keyframe.get("face") or {}
-        boxes = []
+        detections = []
         kind = "person"
         if persons.get("status") == "success" and persons.get("persons_detected"):
-            boxes = [list(map(float, item["box"])) for item in persons["persons_detected"]]
+            detections = [{"box": list(map(float, item["box"])),
+                           "confidence": item.get("confidence")}
+                          for item in persons["persons_detected"]]
         elif face.get("status") == "success":
             kind = "face"
             for item in face.get("faces_detected") or []:
                 x, y, w, h = map(float, item["box"])
-                boxes.append([x, y, x + w, y + h])
+                detections.append({"box": [x, y, x + w, y + h],
+                                   "confidence": item.get("confidence")})
+        detections.sort(key=lambda item: tuple(item["box"]))
+        boxes = [item["box"] for item in detections]
         seconds = float(S.rational_value(keyframe["timestamp"]))
         scene_index = int(keyframe["scene_index"])
         candidates = per_scene.setdefault(scene_index, [])
@@ -313,26 +560,63 @@ def _subject_tracks(keyframes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         pairs = []
         for track_index, track in enumerate(candidates):
             gap = seconds - track["points"][-1]["seconds"]
-            if track["kind"] != kind or not 0 < gap <= 5:
+            if not track.get("active", True) or track["kind"] != kind or not 0 < gap <= 5:
                 continue
             for box_index, box in enumerate(boxes):
                 overlap = _box_iou(track["points"][-1]["box"], box)
                 if overlap >= .2:
                     pairs.append((overlap, track_index, box_index))
+        # Near-tied candidates are an identity ambiguity, not permission to
+        # force an ID through a crossing. Terminate the uncertain old track and
+        # start a new visual track for the current detection.
+        ambiguous_tracks, ambiguous_boxes = set(), set()
+        for track_index in {item[1] for item in pairs}:
+            scores = sorted((item[0] for item in pairs if item[1] == track_index), reverse=True)
+            if len(scores) > 1 and scores[0] - scores[1] <= .05:
+                ambiguous_tracks.add(track_index)
+        for box_index in {item[2] for item in pairs}:
+            scores = sorted((item[0] for item in pairs if item[2] == box_index), reverse=True)
+            if len(scores) > 1 and scores[0] - scores[1] <= .05:
+                ambiguous_boxes.add(box_index)
+        # A tie contaminates its whole overlap component.  Keeping only the
+        # locally tied endpoint can still swap the neighbouring identity.
+        changed = True
+        while changed:
+            before = (len(ambiguous_tracks), len(ambiguous_boxes))
+            ambiguous_boxes.update(box_index for _, track_index, box_index in pairs
+                                   if track_index in ambiguous_tracks)
+            ambiguous_tracks.update(track_index for _, track_index, box_index in pairs
+                                    if box_index in ambiguous_boxes)
+            changed = before != (len(ambiguous_tracks), len(ambiguous_boxes))
+        for track_index in ambiguous_tracks:
+            candidates[track_index]["active"] = False
+            candidates[track_index]["termination_reason"] = "ambiguous_association"
         used_tracks, assigned = set(), {}
-        for _, track_index, box_index in sorted(pairs, reverse=True):
+        for overlap, track_index, box_index in sorted(
+                pairs, key=lambda item: (-item[0], candidates[item[1]]["subject_id"], item[2])):
+            if track_index in ambiguous_tracks or box_index in ambiguous_boxes:
+                continue
             if track_index not in used_tracks and box_index not in assigned:
                 used_tracks.add(track_index)
-                assigned[box_index] = candidates[track_index]
+                assigned[box_index] = (candidates[track_index], overlap)
         for box_index, box in enumerate(boxes):
-            track = assigned.get(box_index)
-            if track is None:
+            assignment = assigned.get(box_index)
+            if assignment is None:
                 track = {"subject_id": f"scene{scene_index}-subject{len(candidates) + 1}",
-                         "scene_index": scene_index, "kind": kind, "points": []}
+                         "scene_index": scene_index, "kind": kind, "points": [], "active": True}
                 candidates.append(track)
                 tracks.append(track)
+                association = {"method": "new_track",
+                               "reason": ("ambiguous_association" if box_index in ambiguous_boxes
+                                          else "no_unambiguous_overlap")}
+            else:
+                track, overlap = assignment
+                association = {"method": "iou", "score": round(float(overlap), 6)}
             track["points"].append({"box": [round(value, 2) for value in box],
-                                    "frame_index": keyframe["frame_index"], "seconds": seconds})
+                                    "frame_index": keyframe["frame_index"], "seconds": seconds,
+                                    "evidence_sha256": keyframe.get("evidence_sha256"),
+                                    "detection_confidence": detections[box_index].get("confidence"),
+                                    "association": association})
     return tracks
 
 def _box_iou(first: Sequence[float], second: Sequence[float]) -> float:
@@ -357,13 +641,18 @@ def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
     track_results = []
     for track in tracks:
         points = track["points"]
-        result = detect_translation_candidates(points, subject_id=track["subject_id"], min_samples=3)
+        if track["kind"] != "person":
+            result = {"status": "not_applicable", "candidates": [],
+                      "reason": "face_box_is_not_a_body_motion_track"}
+        else:
+            result = detect_translation_candidates(points, subject_id=track["subject_id"], min_samples=3)
         track_results.append({"subject_id": track["subject_id"],
                               "scene_index": track["scene_index"],
                               "kind": track["kind"], "samples": len(points),
                               "status": result.get("status"),
                               "reason": result.get("reason"),
                               "metrics": result.get("metrics"),
+                              "termination_reason": track.get("termination_reason"),
                               "candidate_count": len(result.get("candidates") or [])})
         for item in result.get("candidates") or []:
             item["provider"] = "subject-translation-v1"
@@ -373,9 +662,12 @@ def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
         for point in track["points"]:
             point.pop("box", None)
     merged = merge_candidates(candidates)
+    person_tracks = [track for track in tracks if track["kind"] == "person"]
     if not tracks:
         status, reason = "not_run", "no_subject_box_track_in_sampled_frames"
-    elif not any(item["samples"] >= 3 for item in track_results):
+    elif not person_tracks:
+        status, reason = "not_run", "no_person_box_track_in_sampled_frames"
+    elif not any(item["kind"] == "person" and item["samples"] >= 3 for item in track_results):
         status, reason = "not_run", "fewer_than_three_box_samples_per_subject"
     else:
         status, reason = "success", None
@@ -391,60 +683,205 @@ def _action_candidates(keyframes: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _measure_audio(source: Path, ffmpeg: str, work: Path) -> Dict[str, Any]:
-    """Decode the first real audio stream and measure RMS/f0/active intervals."""
-    command = [ffmpeg, "-v", "error", "-nostdin", "-i", str(source),
-               "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
-               "-f", "f32le", "pipe:1"]
-    try:
-        completed = subprocess.run(command, capture_output=True, timeout=600, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"status": "not_run", "reason": f"audio_decode_failed:{type(exc).__name__}",
-                "measurement": None}
-    if completed.returncode != 0 or not completed.stdout:
-        return {"status": "not_run", "reason": "no_decodable_audio_track",
-                "detail": (completed.stderr or b"").decode("utf-8", "replace")[-300:],
-                "measurement": None}
-    import array
-    import wave
+def _audio_window(window: Optional[Dict[str, Any]], media_duration: Any) -> Tuple[float, float]:
+    """Return a finite bounded half-open audio window in playback seconds."""
+    if window is None:
+        start, end = 0.0, S.rational_value(media_duration)
+    else:
+        start = S.rational_value(window["start"])
+        end = S.rational_value(window["end"])
+    if (not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start):
+        raise ValueError("invalid_audio_window")
+    return start, end - start
 
-    samples = array.array("f")
-    samples.frombytes(completed.stdout[: len(completed.stdout) - (len(completed.stdout) % 4)])
-    if not samples:
-        return {"status": "not_run", "reason": "audio_stream_empty", "measurement": None}
-    sample_rate = 16000
-    measurement = measure_acoustic_window(samples, sample_rate, origin_seconds=0.0)
-    if measurement.get("status") != "success":
-        return {"status": "not_run", "reason": measurement.get("reason"),
-                "measurement": measurement}
+
+def _audio_child(command: List[str], output: Optional[Path], diagnostic: Path, *,
+                 cancelled, timeout: float) -> Tuple[int, str]:
+    """Run one owned ffmpeg child without retaining media bytes in pipe memory."""
+    if cancelled():
+        raise WorkspaceError("CANCELLED", "Acoustic analysis cancelled before decode")
+    process = None
+    output_handle = None
+    diagnostic_handle = None
+    try:
+        output_handle = output.open("xb") if output is not None else None
+        diagnostic_handle = diagnostic.open("xb")
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL,
+            stdout=output_handle if output_handle is not None else subprocess.DEVNULL,
+            stderr=diagnostic_handle,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if cancelled():
+                raise WorkspaceError("CANCELLED", "Acoustic analysis cancelled")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("acoustic_ffmpeg_timeout")
+            time.sleep(.05)
+        returncode = int(process.returncode)
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        if output_handle is not None:
+            output_handle.close()
+        if diagnostic_handle is not None:
+            diagnostic_handle.close()
+    detail = diagnostic.read_text("utf-8", errors="replace")[-1000:]
+    return returncode, detail
+
+
+def _measure_audio(source: Path, ffmpeg: str, work: Path, *,
+                   window: Optional[Dict[str, Any]] = None, media_duration: Any = None,
+                   cancelled=lambda: False) -> Dict[str, Any]:
+    """Measure one bounded playback window from the first real audio stream."""
+    if media_duration is None and window is None:
+        return {"status": "not_run", "reason": "audio_media_duration_unavailable",
+                "measurement": None}
+    try:
+        start, requested_duration = _audio_window(window, media_duration)
+    except (TypeError, ValueError, ZeroDivisionError) as exc:
+        return {"status": "failed", "reason": f"audio_window_invalid:{type(exc).__name__}",
+                "measurement": None}
+    import numpy as np
+
     audio_dir = work / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
-    wav_path = audio_dir / "acoustic.wav"
-    pcm = array.array("h")
-    for value in samples:
-        scaled = int(round(float(value) * 32767.0))
-        pcm.append(max(-32768, min(32767, scaled)))
-    with wave.open(str(wav_path), "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(sample_rate)
-        handle.writeframes(pcm.tobytes())
+    raw_path = audio_dir / "acoustic.f32le"
+    decode_log = audio_dir / "decode.stderr"
+    encode_log = audio_dir / "encode.stderr"
     audio_path = audio_dir / "acoustic.m4a"
-    completed = subprocess.run(
-        [ffmpeg, "-v", "error", "-nostdin", "-y", "-i", str(wav_path),
-         "-c:a", "aac", "-b:a", "32k", "-ac", "1", str(audio_path)],
-        capture_output=True, text=True, timeout=120)
-    if completed.returncode != 0 or not audio_path.is_file() or audio_path.stat().st_size == 0:
-        return {"status": "not_run",
-                "reason": "acoustic_evidence_encode_failed:" +
-                          (completed.stderr or "empty output").strip()[:200],
+    analysis_duration = min(requested_duration, AUDIO_MAX_ANALYSIS_SECONDS)
+    expected_pcm_bytes = int(math.ceil(analysis_duration * AUDIO_SAMPLE_RATE)) * 4
+    required_free_bytes = expected_pcm_bytes + AUDIO_WORKSPACE_RESERVE_BYTES
+    try:
+        available_bytes = shutil.disk_usage(audio_dir).free
+    except OSError as exc:
+        return {"status": "failed", "reason": "audio_storage_status_unavailable",
+                "error": type(exc).__name__, "measurement": None}
+    if required_free_bytes > available_bytes:
+        return {"status": "failed", "reason": "insufficient_disk_for_audio_window",
+                "required_bytes": required_free_bytes,
+                "pcm_bytes": expected_pcm_bytes,
+                "reserve_bytes": AUDIO_WORKSPACE_RESERVE_BYTES,
+                "available_bytes": available_bytes,
+                "measurement": None}
+    command = [ffmpeg, "-v", "error", "-nostdin", "-i", str(source)]
+    if start:
+        command.extend(["-ss", _frame_timestamp(start)])
+    command.extend(["-t", _frame_timestamp(analysis_duration), "-map", "0:a:0", "-vn",
+                    "-ac", "1", "-ar", str(AUDIO_SAMPLE_RATE), "-f", "f32le",
+                    "-fs", str(expected_pcm_bytes), "pipe:1"])
+    retain_audio = False
+    try:
+        try:
+            code, detail = _audio_child(command, raw_path, decode_log,
+                                        cancelled=cancelled, timeout=AUDIO_DECODE_TIMEOUT_SECONDS)
+        except OSError as exc:
+            return {"status": "not_run", "reason": f"audio_decoder_unavailable:{type(exc).__name__}",
+                    "measurement": None}
+        except TimeoutError:
+            return {"status": "failed", "reason": "audio_decode_timeout", "measurement": None}
+        no_stream = any(marker in detail.lower() for marker in
+                        ("matches no streams", "does not contain any stream", "stream map '0:a:0'"))
+        if code != 0:
+            return {"status": "not_run" if no_stream else "failed",
+                    "reason": "no_decodable_audio_track" if no_stream else "audio_decode_failed",
+                    "detail": detail[-300:], "measurement": None}
+        if not raw_path.is_file() or raw_path.stat().st_size == 0:
+            return {"status": "failed", "reason": "audio_decode_empty", "measurement": None}
+        if raw_path.stat().st_size % 4:
+            return {"status": "failed", "reason": "audio_decode_invalid_pcm_size",
+                    "measurement": None}
+        maximum_pcm_bytes = expected_pcm_bytes + AUDIO_PCM_TOLERANCE_SAMPLES * 4
+        if raw_path.stat().st_size > maximum_pcm_bytes:
+            return {"status": "failed", "reason": "audio_decode_exceeded_budget",
+                    "expected_pcm_bytes": expected_pcm_bytes,
+                    "actual_pcm_bytes": raw_path.stat().st_size,
+                    "tolerance_samples": AUDIO_PCM_TOLERANCE_SAMPLES,
+                    "measurement": None}
+        samples = np.memmap(raw_path, dtype="<f4", mode="r")
+        analysis_deadline = time.monotonic() + AUDIO_ANALYSIS_TIMEOUT_SECONDS
+        try:
+            measurement = measure_acoustic_window(
+                samples, AUDIO_SAMPLE_RATE, origin_seconds=start,
+                cancelled=cancelled, deadline_monotonic=analysis_deadline)
+        except InterruptedError as exc:
+            raise WorkspaceError("CANCELLED", "Acoustic analysis cancelled") from exc
+        except TimeoutError:
+            return {"status": "failed", "reason": "audio_analysis_timeout",
+                    "measurement": None}
+        if measurement.get("status") != "success":
+            return {"status": "not_run", "reason": measurement.get("reason"),
+                    "measurement": measurement}
+        actual_duration = int(samples.size) / float(AUDIO_SAMPLE_RATE)
+        duration_tolerance = 1.0 / AUDIO_SAMPLE_RATE
+        if requested_duration > AUDIO_MAX_ANALYSIS_SECONDS:
+            coverage_kind = "bounded_prefix"
+        elif actual_duration + duration_tolerance < requested_duration:
+            coverage_kind = "decoded_source_shortfall"
+        else:
+            coverage_kind = "complete"
+        coverage = {
+            "kind": coverage_kind,
+            "requested_seconds": requested_duration,
+            "analysed_seconds": actual_duration,
+            "ratio": min(1.0, actual_duration / requested_duration),
+            "truncated": coverage_kind != "complete",
+            "max_analysis_seconds": AUDIO_MAX_ANALYSIS_SECONDS,
+        }
+        measurement["coverage"] = coverage
+        try:
+            remaining_bytes = shutil.disk_usage(audio_dir).free
+        except OSError as exc:
+            return {"status": "failed", "reason": "audio_storage_status_unavailable",
+                    "error": type(exc).__name__, "measurement": measurement}
+        if remaining_bytes < AUDIO_WORKSPACE_RESERVE_BYTES:
+            return {"status": "failed", "reason": "insufficient_disk_for_audio_evidence",
+                    "reserve_bytes": AUDIO_WORKSPACE_RESERVE_BYTES,
+                    "available_bytes": remaining_bytes,
+                    "measurement": measurement}
+        encode = [ffmpeg, "-v", "error", "-nostdin", "-y", "-f", "f32le",
+                  "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", "-i", str(raw_path),
+                  "-c:a", "aac", "-b:a", "32k", "-ac", "1", str(audio_path)]
+        try:
+            encode_code, encode_detail = _audio_child(
+                encode, None, encode_log, cancelled=cancelled,
+                timeout=AUDIO_ENCODE_TIMEOUT_SECONDS)
+        except OSError as exc:
+            return {"status": "failed", "reason": f"acoustic_evidence_encoder_failed:{type(exc).__name__}",
+                    "measurement": measurement}
+        except TimeoutError:
+            return {"status": "failed", "reason": "acoustic_evidence_encode_timeout",
+                    "measurement": measurement}
+        if encode_code != 0 or not audio_path.is_file() or audio_path.stat().st_size == 0:
+            return {"status": "failed", "reason": "acoustic_evidence_encode_failed",
+                    "detail": encode_detail[-300:], "measurement": measurement}
+        retain_audio = True
+        return {"status": "success", "reason": None,
+                "audio_relative_path": "audio/acoustic.m4a",
+                "audio_sha256": stream_sha256(audio_path),
+                "stream_selection": "0:a:0 (first audio stream; video stream ignored)",
+                "sample_rate": AUDIO_SAMPLE_RATE, "samples": int(samples.size),
+                "requested_window_seconds": {"start": start,
+                                             "end": start + requested_duration},
+                "window_seconds": {"start": start, "end": start + actual_duration},
+                "coverage": coverage,
                 "measurement": measurement}
-    wav_path.unlink()
-    return {"status": "success", "reason": None, "audio_relative_path": "audio/acoustic.m4a",
-            "audio_sha256": stream_sha256(audio_path),
-            "stream_selection": "0:a:0 (first audio stream; video stream ignored)",
-            "sample_rate": sample_rate, "samples": len(samples),
-            "measurement": measurement}
+    finally:
+        if 'samples' in locals():
+            mmap_handle = getattr(samples, "_mmap", None)
+            del samples
+            if mmap_handle is not None:
+                mmap_handle.close()
+        for temporary in (raw_path, decode_log, encode_log):
+            temporary.unlink(missing_ok=True)
+        if not retain_audio:
+            audio_path.unlink(missing_ok=True)
 
 
 def _shot_framing(frame: Any, face_result: Dict[str, Any],
@@ -640,6 +1077,91 @@ def _run_vlm(frame: Any, vlm_extractor: Optional[VLMExtractor]) -> Dict[str, Any
     return result
 
 
+def _validate_loaded_deployment(extractors: Dict[str, Any],
+                                deployment: Dict[str, Any]) -> None:
+    """Bind loaded Face/OCR engines to the bytes frozen at submission."""
+    face = extractors.get("face")
+    face_identity = face.code_identity if face is not None else {}
+    frozen_face = deployment["face"]
+    if frozen_face["status"] == "available":
+        if (face_identity.get("detector_kind") != "yunet"
+                or face_identity.get("weights_sha256") != frozen_face.get("sha256")):
+            raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
+                                 "Loaded face detector bytes differ from the frozen deployment")
+    elif frozen_face["status"] == "builtin":
+        if face_identity.get("detector_kind") != "haar":
+            raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
+                                 "Loaded face detector differs from the frozen built-in detector")
+    elif face_identity.get("detector_kind") is not None:
+        raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
+                             "A face detector loaded although none was frozen")
+
+    ocr = extractors.get("ocr")
+    ocr_identity = ocr.code_identity if ocr is not None else {}
+    frozen_ocr = {item["role"]: item.get("sha256")
+                  for item in deployment["ocr"]["files"]
+                  if item.get("status") == "available"}
+    loaded_ocr = {item["role"]: item.get("sha256")
+                  for item in ocr_identity.get("weights_files") or []}
+    if loaded_ocr != frozen_ocr:
+        raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
+                             "Loaded OCR resources differ from the frozen deployment")
+
+
+def _run_isolated_model_phase(module: str, resources: Dict[str, Any],
+                              images: List[Dict[str, Any]], work: Path,
+                              relative: str, *, cancelled: Any) -> Tuple[Dict[str, Any], Optional[Dict[str, str]]]:
+    """Run one heavy module and retain an honest owned-process receipt.
+
+    Resource and model-runtime failures are local to CLIP or VLM.  Integrity,
+    cancellation, lease and protocol errors are intentionally not caught.
+    """
+    receipt = work / "models" / module / "execution" / "process-receipt.json"
+    try:
+        phase = MW.run_phase(module, resources, images, work, cancelled=cancelled)
+    except WorkspaceError as exc:
+        if exc.code not in ISOLATABLE_MODEL_ERRORS:
+            raise
+        if not receipt.is_file() or not 0 < receipt.stat().st_size <= 256 * 1024:
+            raise WorkspaceError(
+                "MODEL_WORKER_PROTOCOL",
+                "Failed model phase did not retain a bounded process receipt") from exc
+        try:
+            execution = json.loads(receipt.read_text("utf-8"))
+        except (OSError, ValueError) as receipt_error:
+            raise WorkspaceError(
+                "MODEL_WORKER_PROTOCOL",
+                "Failed model process receipt cannot be decoded") from receipt_error
+        if (not isinstance(execution, dict)
+                or execution.get("status") != "failed"
+                or execution.get("error_code") != exc.code):
+            raise WorkspaceError(
+                "MODEL_WORKER_PROTOCOL",
+                "Failed model process receipt does not match the raised error") from exc
+        failure = {"status": "failed", "reason": exc.code,
+                   "message": exc.message[:240], "retryable": exc.retryable}
+        if exc.details:
+            failure["details"] = _jsonable(exc.details)
+        phase = {
+            "identity": MW.requested_identity(module, resources),
+            "available": False,
+            "results": [{"frame_index": image["frame_index"],
+                         "path": image["path"],
+                         "input_sha256": image["sha256"],
+                         "result": dict(failure)}
+                        for image in images],
+            "execution": execution,
+        }
+    descriptor = None
+    if receipt.is_file():
+        descriptor = {
+            "relative_path": relative + "/" + receipt.relative_to(work).as_posix(),
+            "sha256": stream_sha256(receipt, cancelled=cancelled),
+            "size_bytes": str(receipt.stat().st_size),
+        }
+    return phase, descriptor
+
+
 class VisionJobs:
     """One optional drainer sharing durable leases; wrappers never write tasks.
 
@@ -680,7 +1202,13 @@ class VisionJobs:
         self._loaded_optional_config = None
         self._extractors = None
         self._extractor_error = None
-        self._isolated_heavy = False
+        # CLIP/VLM are never constructed in the workspace process.  Keep this
+        # invariant true even when tests or integrations replace the local
+        # Face/OCR loader.
+        self._isolated_heavy = True
+
+    def _execution_config(self) -> Dict[str, Any]:
+        return _execution_deployment(face_model_path=self.face_model_path)
 
     def _model_config(self):
         return MW.configuration(clip_model=self.clip_model_path, vlm_model=self.vlm_model_path)
@@ -738,7 +1266,8 @@ class VisionJobs:
                subject_annotation_id: Optional[str] = None) -> Dict[str, Any]:
         S.require_id(command_id)
         parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config(),
-                                 model_resources=self._model_config())
+                                 model_resources=self._model_config(),
+                                 execution_deployment=self._execution_config())
         items = [{"task_id": task_id, "expected_revision": expected_revision, "expected_sha256": expected_sha256}]
         request = {"kind": "queue.create_batch", "items": items, "operation": OPERATION,
                    "processor_version": VERSION, "parameters": parameters}
@@ -766,7 +1295,8 @@ class VisionJobs:
         """
         S.require_id(command_id)
         parameters = _parameters(window, subject_annotation_id, optional_providers=self._optional_config(),
-                                 model_resources=self._model_config())
+                                 model_resources=self._model_config(),
+                                 execution_deployment=self._execution_config())
         if not isinstance(items, list) or not items:
             raise SchemaInvalid("SCHEMA_INVALID", "Vision batch needs at least one task")
         normalized: List[Dict[str, Any]] = []
@@ -819,13 +1349,16 @@ class VisionJobs:
         if self._extractors is not None and self._loaded_optional_config == optional:
             return
         self._loaded_optional_config = optional
+        # CLIP and VLM always run in owned child processes.  A local Face/OCR
+        # constructor failure must not silently switch those modules back to
+        # the legacy in-process path or omit their execution receipts.
+        self._isolated_heavy = True
         try:
             face = FaceExtractor(model_path=self.face_model_path, thresholds=thresholds)
             ocr = OCRExtractor(thresholds=thresholds)
             person = PersonExtractor(model_path=optional["person"]["model_path"],
                                      expected_sha256=optional["person"]["weights_sha256"])
             self._extractors = {"face": face, "ocr": ocr, "clip": None, "vlm": None, "person": person}
-            self._isolated_heavy = True
         except Exception as exc:
             self._extractor_error = str(exc)
             self._extractors = {"face": None, "ocr": None, "clip": None, "vlm": None, "person": None}
@@ -833,9 +1366,6 @@ class VisionJobs:
     def _processor(self, job: Dict[str, Any], context: Any) -> Dict[str, Any]:
         parameters = _validate_job(job)
         resources = self._model_config()
-        if parameters["job_identity"] != _job_identity(optional_providers=self._optional_config(), model_resources=resources):
-            raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
-                                 "Legacy vision configuration is read/apply-only; resubmit a new vision job")
         self._validate_snapshot(job)
         stop = threading.Event()
         lost = threading.Event()
@@ -885,11 +1415,20 @@ class VisionJobs:
             work.mkdir(parents=True, exist_ok=False)
             try:
                 ffmpeg = _find_ffmpeg()
+                deployment = self._execution_config()
+                if parameters["job_identity"] != _job_identity(
+                        optional_providers=self._optional_config(), model_resources=resources,
+                        execution_deployment=deployment):
+                    raise WorkspaceError("VISION_RESUBMIT_REQUIRED",
+                                         "Legacy or changed execution deployment; resubmit a new vision job")
                 thresholds = MetricThresholds()
                 self._load_extractors(thresholds)
-                if parameters["job_identity"] != _job_identity(optional_providers=self._optional_config(), model_resources=resources):
+                if parameters["job_identity"] != _job_identity(
+                        optional_providers=self._optional_config(), model_resources=resources,
+                        execution_deployment=deployment):
                     raise WorkspaceError("VISION_RESUBMIT_REQUIRED", "Optional provider configuration changed while loading; resubmit")
                 extractors = self._extractors or {"face": None, "ocr": None, "clip": None}
+                _validate_loaded_deployment(extractors, deployment)
                 detector = SceneDetector(thresholds=thresholds)
                 scene_result = _run_scenes(detector, Path(source), thresholds)
                 keyframes: List[Dict[str, Any]] = []
@@ -944,7 +1483,9 @@ class VisionJobs:
                         face_result = _run_face(frame, extractors["face"])
                         person_result = _run_person(frame, extractors.get("person"))
                         framing_result = _shot_framing(frame, face_result, person_result)
-                        landmark_images.append({"path": str(item["path"]), "frame_index": item["frame_index"]})
+                        landmark_images.append({"path": str(item["path"]),
+                                                "frame_index": item["frame_index"],
+                                                "input_sha256": item["sha256"]})
                         ocr_result = _run_ocr(frame, extractors["ocr"])
                         clip_result = _run_clip(frame, extractors["clip"]) if not self._isolated_heavy else {}
                         vlm_result = _run_vlm(frame, extractors["vlm"]) if not self._isolated_heavy else {}
@@ -970,13 +1511,23 @@ class VisionJobs:
                     sampling = None
                 for index in list(scene_frames):
                     flush_scene(index)
+                model_execution: Dict[str, Any] = {}
                 if self._isolated_heavy and keyframes:
                     decoded_by_index = {item["frame_index"]: item for item in decoded["decoded"]}
                     images = [{"frame_index": item["frame_index"],
                                "path": str(decoded_by_index[item["frame_index"]]["path"]),
                                "sha256": item["evidence_sha256"]} for item in keyframes]
                     for module in ("clip", "vlm"):
-                        phase = MW.run_phase(module, resources, images, work, cancelled=cancelled)
+                        phase, receipt_descriptor = _run_isolated_model_phase(
+                            module, resources, images, work, relative, cancelled=cancelled)
+                        model_execution[module] = {
+                            "status": (phase.get("execution") or {}).get("status", "unknown"),
+                            "execution": _jsonable(phase.get("execution")),
+                            "worker": _jsonable({key: phase.get(key) for key in (
+                                "actual_pid", "actual_parent_pid", "peak_working_set_bytes",
+                                "thread_policy", "progress_publish_retries")}),
+                            "receipt": receipt_descriptor,
+                        }
                         for frame, result in zip(keyframes, phase["results"]):
                             frame[module] = result["result"]
                         # Only JSON identity survives. Native model allocations
@@ -1149,7 +1700,14 @@ class VisionJobs:
                                             "message": str(exc)[:240]}
                 actions_sampling = _action_candidates(keyframes)
                 try:
-                    acoustics_sampling = _measure_audio(Path(source), ffmpeg, work)
+                    acoustics_sampling = _measure_audio(
+                        Path(source), ffmpeg, work, window=window,
+                        media_duration=job["media_snapshot"]["duration"], cancelled=cancelled)
+                except WorkspaceError as exc:
+                    if exc.code == "CANCELLED":
+                        raise
+                    acoustics_sampling = {"status": "failed", "reason": exc.code,
+                                          "message": str(exc)[:240], "measurement": None}
                 except Exception as exc:
                     acoustics_sampling = {"status": "failed", "reason": type(exc).__name__,
                                           "message": str(exc)[:240], "measurement": None}
@@ -1339,6 +1897,7 @@ class VisionJobs:
                     "acoustics_sampling": _jsonable(acoustics_sampling),
                     "extractor_status": extractor_status, "module_status": module_status,
                     "model_runs": [],
+                    "model_execution": model_execution,
                     "job_identity": parameters["job_identity"], "evidence": evidence,
                     "semantic_listening": "not_performed", "source_unchanged": True,
                     "scope": "registered_playback_only; original_source_not_measured; candidate_not_applied"}
@@ -1353,7 +1912,7 @@ class VisionJobs:
                     job, extractors, keyframes, scene_result,
                     boundary_sampling, boundary_frames, module_status,
                     digest, window, actions_sampling, acoustics_sampling,
-                    content_sampling, content_frames)
+                    content_sampling, content_frames, model_execution)
                 self._validate_candidate(candidate, job)
                 context.raise_if_cancelled()
                 return candidate
@@ -1459,7 +2018,7 @@ class VisionJobs:
                                  "model_runs", "evidence", "boundary_frames", "boundary_sampling"}
         expected = expected | {"content_sampling", "actions_sampling", "acoustics_sampling"}
         if (not isinstance(value, dict) or not expected <= set(value)
-                or set(value) - expected - {"sampling", "content_frames"}
+                or set(value) - expected - {"sampling", "content_frames", "model_execution"}
                 or any(value[key] != item for key, item in fixed.items())
                 or value["window"] != parameters["window"]
                 or value["job_identity"] != parameters["job_identity"]
@@ -1510,6 +2069,9 @@ class VisionJobs:
                             == CONTENT_EVIDENCE_CONTRACT)
         if requires_content and "content_frames" not in value:
             raise WorkspaceError("RECOVERY_REQUIRED", "Current vision contract requires decoded content frames")
+        requires_execution = "execution_deployment" in parameters["job_identity"]["config"]
+        if requires_execution and "model_execution" not in value:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Current vision contract requires model execution receipts")
         if not isinstance(content_frames, list) or len(content_frames) > MAX_CONTENT_FRAMES:
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision content frame list is inconsistent")
         content_keys = set()
@@ -1577,6 +2139,45 @@ class VisionJobs:
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision evidence path or identity is invalid")
             paths.add(path)
         evidence_hashes = {item["sha256"] for item in value["evidence"]}
+        model_execution = value.get("model_execution", {})
+        if (not isinstance(model_execution, dict)
+                or any(module not in {"clip", "vlm"} for module in model_execution)):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Vision model execution descriptor is inconsistent")
+        for module, execution in model_execution.items():
+            if (not isinstance(execution, dict)
+                    or set(execution) != {"status", "execution", "worker", "receipt"}
+                    or execution["status"] not in {"completed", "failed", "not_run"}
+                    or not isinstance(execution["execution"], dict)
+                    or not isinstance(execution["worker"], dict)):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision model execution receipt is invalid")
+            receipt = execution["receipt"]
+            if receipt is not None:
+                if (not isinstance(receipt, dict)
+                        or set(receipt) != {"relative_path", "sha256", "size_bytes"}
+                        or receipt not in value["evidence"]):
+                    raise WorkspaceError("RECOVERY_REQUIRED", "Vision process receipt is not registered evidence")
+            inner_status = execution["execution"].get("status")
+            if inner_status != execution["status"]:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision model execution status is inconsistent")
+            if execution["status"] == "not_run" and receipt is not None:
+                raise WorkspaceError("RECOVERY_REQUIRED", "A not-run model phase cannot have a process receipt")
+            if execution["status"] in {"completed", "failed"} and receipt is None:
+                raise WorkspaceError("RECOVERY_REQUIRED", "An executed model phase requires a process receipt")
+            if (execution["status"] == "failed"
+                    and not isinstance(execution["execution"].get("error_code"), str)):
+                raise WorkspaceError("RECOVERY_REQUIRED", "A failed model phase requires a stable error code")
+        if requires_execution and value["keyframes"] and set(model_execution) != {"clip", "vlm"}:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Current vision contract requires both model phase outcomes")
+        for module in ("clip", "vlm"):
+            run = next((item for item in model_runs
+                        if item["id"] == _module_run_id(job["id"], module)), None)
+            descriptor = model_execution.get(module)
+            expected_execution = S.sha256_text(descriptor) if descriptor is not None else None
+            if run is not None and run["parameters"].get("execution_sha256") != expected_execution:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision model run execution binding is inconsistent")
+            expected_receipt = ((descriptor or {}).get("receipt") or {}).get("sha256")
+            if run is not None and run["parameters"].get("process_receipt_sha256") != expected_receipt:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Vision model run receipt binding is inconsistent")
         discovery = (value.get("boundary_sampling") or {}).get("global_discovery")
         if "transition_discovery" in parameters["job_identity"]["config"]:
             if not isinstance(discovery, dict) or discovery.get("status") not in {"success", "failed", "not_run"}:
@@ -1822,7 +2423,11 @@ def _first_module_reason(keyframes: List[Dict[str, Any]], module: str) -> Option
 
 
 def _run_status(value: str) -> str:
-    if value == "success":
+    # The frozen semantic contract has execution states only.  A completed
+    # algorithm may legitimately refuse a judgement or report incomplete
+    # coverage; the detailed outcome remains in the digest-bound output.
+    if value in {"success", "partial", "insufficient_samples",
+                 "insufficient_evidence", "not_applicable"}:
         return "success"
     if value == "not_run" or value == "skipped":
         return "not_run"
@@ -1835,7 +2440,12 @@ def _model_run_record(job_id: str, module: str, *, provider: str, model_name: st
                       input_value: Any, output_value: Any, status: str,
                       failure_reason: Optional[str], code_version: str,
                       score_kind: str = "none") -> Dict[str, Any]:
-    normalized = _run_status(status)
+    reported_status = str(status)
+    normalized = _run_status(reported_status)
+    recorded_parameters = _jsonable(parameters)
+    if reported_status != normalized:
+        recorded_parameters = dict(recorded_parameters,
+                                   reported_outcome_status=reported_status)
     reason = None if normalized == "success" else (str(failure_reason)[:500]
                                                   if failure_reason else "module did not report success")
     output_sha = None
@@ -1851,7 +2461,7 @@ def _model_run_record(job_id: str, module: str, *, provider: str, model_name: st
         "weights_sha256": weights_sha256,
         "license": str(license)[:200],
         "preprocessing": _jsonable(preprocessing),
-        "parameters": _jsonable(parameters),
+        "parameters": recorded_parameters,
         "input_sha256": S.sha256_text(_jsonable(input_value)),
         "output_sha256": output_sha,
         "code_version": str(code_version)[:120],
@@ -1896,7 +2506,8 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
                       actions_sampling: Optional[Dict[str, Any]] = None,
                       acoustics_sampling: Optional[Dict[str, Any]] = None,
                       content_sampling: Optional[Dict[str, Any]] = None,
-                      content_frames: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+                      content_frames: Optional[List[Dict[str, Any]]] = None,
+                      model_execution: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Record one real run per executed module, including honest non-success.
 
     Weights are hashed only when a local file exists. A failed or not-run
@@ -1907,6 +2518,7 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
     job_id = job["id"]
     thresholds = MetricThresholds()
     frame_input = _keyframe_input(keyframes)
+    model_execution = model_execution or {}
     runs: List[Dict[str, Any]] = []
 
     def extractor_identity(module: str, fallback: str) -> Dict[str, Any]:
@@ -1918,7 +2530,11 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         return instance.code_identity
 
     face_identity = extractor_identity("face", "YuNet")
-    face_weights = _weights_digest(face_identity.get("weights_path"))
+    # FaceExtractor records the digest of the exact bytes supplied to OpenCV.
+    # Re-reading the source path after inference could record replacement bytes.
+    face_weights = face_identity.get("weights_sha256")
+    if face_weights is None and face_identity.get("detector_kind") != "yunet":
+        face_weights = _weights_digest(face_identity.get("weights_path"))
     known_yunet = face_weights == "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
     runs.append(_model_run_record(
         job_id, "face", provider=face_identity.get("provider", "opencv"),
@@ -2025,7 +2641,11 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
         parameters={"clip_binary_confidence": thresholds.clip_binary_confidence,
                     "clip_multiclass_confidence": thresholds.clip_multiclass_confidence,
                     "clip_entity_mismatch_cutoff": thresholds.clip_entity_mismatch_cutoff,
-                    "force_quick_gelu": clip_identity.get("force_quick_gelu")},
+                    "force_quick_gelu": clip_identity.get("force_quick_gelu"),
+                    "execution_sha256": (S.sha256_text(model_execution["clip"])
+                                         if "clip" in model_execution else None),
+                    "process_receipt_sha256": ((model_execution.get("clip", {}).get("receipt") or {})
+                                               .get("sha256"))},
         input_value=frame_input, output_value=_frame_output(keyframes, "clip"),
         status=module_status.get("clip", "not_run"),
         failure_reason=_first_module_reason(keyframes, "clip")
@@ -2051,7 +2671,11 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
                        "model_code_license": vlm_identity.get("model_code_license")},
         parameters={"task_prompt": getattr(extractors.get("vlm"), "task_prompt", CAPTION_TASK), "max_new_tokens": 192,
                     "num_beams": 3, "do_sample": False,
-                    "requested_revision": vlm_identity.get("revision")},
+                    "requested_revision": vlm_identity.get("revision"),
+                    "execution_sha256": (S.sha256_text(model_execution["vlm"])
+                                         if "vlm" in model_execution else None),
+                    "process_receipt_sha256": ((model_execution.get("vlm", {}).get("receipt") or {})
+                                               .get("sha256"))},
         input_value=frame_input, output_value=_frame_output(keyframes, "vlm"),
         status=module_status.get("vlm", "not_run"),
         failure_reason=_first_module_reason(keyframes, "vlm")
@@ -2138,20 +2762,28 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
 
     acoustics = acoustics_sampling or {}
     runs.append(_model_run_record(
-        job_id, "acoustics", provider="trace-annotate", model_name="acoustic-window-v1",
-        model_version="1", weights_sha256=None, license="Project source",
+        job_id, "acoustics", provider="trace-annotate", model_name="acoustic-window-v2",
+        model_version="2", weights_sha256=None, license="Project source",
         preprocessing={"stream": acoustics.get("stream_selection"),
                        "sample_rate": acoustics.get("sample_rate"),
-                       "channels": 1, "sample_format": "float32 decoded to PCM16 evidence"},
+                       "channels": 1,
+                       "sample_format": "float32 analysis; mono AAC evidence",
+                       "requested_window": acoustics.get("requested_window_seconds"),
+                       "analysed_window": acoustics.get("window_seconds"),
+                       "coverage": acoustics.get("coverage")},
         parameters={"f0_min_hz": 60.0, "f0_max_hz": 500.0,
-                    "frame_hop_seconds": 0.02, "silence_dbfs": -45.0},
-        input_value={"file_sha256": digest, "module": "acoustics"},
+                    "frame_hop_seconds": 0.02, "silence_dbfs": -45.0,
+                    "max_analysis_seconds": AUDIO_MAX_ANALYSIS_SECONDS,
+                    "analysis_timeout_seconds": AUDIO_ANALYSIS_TIMEOUT_SECONDS,
+                    "workspace_reserve_bytes": AUDIO_WORKSPACE_RESERVE_BYTES},
+        input_value={"file_sha256": digest, "module": "acoustics",
+                     "analysis_window": (acoustics.get("measurement") or {}).get("window_seconds")},
         output_value={"module": "acoustics",
                       "measurement": _jsonable(acoustics.get("measurement")),
                       "audio_sha256": acoustics.get("audio_sha256")},
         status=module_status.get("acoustics", "not_run"),
         failure_reason=acoustics.get("reason"),
-        code_version=f"vision_jobs={VERSION}; expressive_cues=1; ffmpeg={_package_version('static-ffmpeg')}",
+        code_version=f"vision_jobs={VERSION}; expressive_cues=2; acoustic_window=2; ffmpeg={_package_version('static-ffmpeg')}",
         score_kind="rule_score"))
 
     runs.append(_model_run_record(
@@ -2273,6 +2905,21 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
                            and frame["evidence_sha256"] == match["evidence_sha256"]
                            for frame in selected):
                     selected.append(match)
+        for claim in annotation["attributes"]["semantic"]["claims"]:
+            if claim["method"]["id"] != "subject-translation-v1":
+                continue
+            for sample in claim["method"]["parameters"].get("sample_frames", []):
+                match = next((frame for frame in keyframes
+                              if frame["scene_index"] == index
+                              and str(frame["frame_index"]) == str(sample.get("frame_index"))
+                              and frame.get("evidence_sha256") == sample.get("evidence_sha256")), None)
+                if match is None:
+                    raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
+                                         "Action candidate has no matching decoded subject sample")
+                if not any(str(frame["frame_index"]) == str(match["frame_index"])
+                           and frame["evidence_sha256"] == match["evidence_sha256"]
+                           for frame in selected):
+                    selected.append(match)
         for frame in selected:
             digest = frame.get("evidence_sha256")
             descriptor = samples.get(digest)
@@ -2303,7 +2950,7 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
             frame_artifacts.setdefault(str(frame["frame_index"]), artifact["id"])
             sample_artifacts[(str(frame["frame_index"]), digest)] = artifact["id"]
         acoustic_claims = [claim for claim in annotation["attributes"]["semantic"]["claims"]
-                           if claim["method"]["id"] == "acoustic-window-v1"]
+                           if claim["method"]["id"] in {"acoustic-window-v1", "acoustic-window-v2"}]
         if acoustic_claims:
             descriptor = next((item for item in candidate.get("evidence") or []
                                if item["relative_path"].endswith("/audio/acoustic.m4a")), None)
@@ -2351,6 +2998,10 @@ def _attach_candidate_evidence(store, candidate: Dict[str, Any],
             elif claim["method"]["id"] == "scene-change-v1":
                 claim["evidence_ids"] = list(dict.fromkeys(
                     sample_artifacts[(sample["frame_index"], sample["evidence_sha256"])]
+                    for sample in claim["method"]["parameters"].get("sample_frames", [])))
+            elif claim["method"]["id"] == "subject-translation-v1":
+                claim["evidence_ids"] = list(dict.fromkeys(
+                    sample_artifacts[(str(sample["frame_index"]), sample["evidence_sha256"])]
                     for sample in claim["method"]["parameters"].get("sample_frames", [])))
 
 
@@ -2614,6 +3265,7 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 "method": {"id": "subject-translation-v1", "version": "1",
                            "parameters": {"action": action.get("action"),
                                           "subject_id": action.get("subject_id"),
+                                          "sample_frames": action.get("sample_frames") or [],
                                           "metrics": action.get("metrics"),
                                           "walk_band": [0.15, 1.2],
                                           "run_band": [1.2, 6.0]}},
@@ -2634,21 +3286,25 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                 "id": S.make_id("clm", f"{job_id}:0:acoustics"),
                 "claim_type": "measured",
                 "statement": (f"首条音轨测量：RMS {measurement.get('rms_dbfs')} dBFS，"
-                              f"语音活动占比 {measurement.get('active_ratio')}，"
+                              f"声能活动占比 {measurement.get('energy_active_ratio')}，"
                               "仅声学测量，不代表音色、身份或情绪。"),
                 "subject_ref": None,
                 "time_window": {"start": {"seconds": _seconds_ratio(float((measurement.get("window_seconds") or {}).get("start", 0.0)))},
                                 "end": {"seconds": _seconds_ratio(float((measurement.get("window_seconds") or {}).get("end", 0.0)))}},
                 "evidence_ids": [],
-                "method": {"id": "acoustic-window-v1", "version": "1",
+                "method": {"id": "acoustic-window-v2", "version": "2",
                            "parameters": {"stream_selection": acoustics.get("stream_selection"),
                                           "sample_rate": acoustics.get("sample_rate"),
                                           "f0_min_hz": 60.0, "f0_max_hz": 500.0,
                                           "frame_hop_seconds": 0.02,
                                           "f0_hz": measurement.get("f0_hz"),
                                           "f0_variation_hz": measurement.get("f0_variation_hz"),
+                                          "activity_kind": measurement.get("activity_kind"),
                                           "active_ratio": measurement.get("active_ratio"),
-                                          "active_intervals": measurement.get("active_intervals")}},
+                                          "active_intervals": measurement.get("active_intervals"),
+                                          "energy_active_ratio": measurement.get("energy_active_ratio"),
+                                          "energy_active_intervals": measurement.get("energy_active_intervals"),
+                                          "coverage": acoustics.get("coverage")}},
                 "model_run_id": _module_run_id(job_id, "acoustics"),
                 "score": 1.0,
                 "score_kind": "confidence",
@@ -2656,7 +3312,11 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                                 "unit": "dBFS", "basis": "measured",
                                 "analysis_window": {"start": {"seconds": _seconds_ratio(float((measurement.get("window_seconds") or {}).get("start", 0.0)))},
                                                     "end": {"seconds": _seconds_ratio(float((measurement.get("window_seconds") or {}).get("end", 0.0)))}}},
-                "uncertainty_reason": "仅声学测量，不代表音色、身份或情绪；语音区间由能量阈值推出",
+                "uncertainty_reason": (
+                    "仅声学测量，不代表语音、音色、身份或情绪；活动区间只表示能量高于自适应阈值；"
+                    + ("请求窗口超过计算预算，仅测量并绑定已声明的前缀窗口"
+                       if (acoustics.get("coverage") or {}).get("truncated")
+                       else "已测量完整请求窗口")),
             })
         for event in keyframe.get("boundary_events") or []:
             kind = event.get("kind")

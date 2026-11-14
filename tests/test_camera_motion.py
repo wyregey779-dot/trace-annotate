@@ -71,6 +71,55 @@ def test_speed_uses_real_seconds_not_average_fps():
     assert result["pairs"][0]["speed_px_s"] == pytest.approx(5.0, abs=1.0)
 
 
+def test_low_global_fit_is_unknown_not_a_handheld_claim():
+    classified = CM.classify_pair({
+        "status": "success", "tx": 8.0, "ty": 1.0, "scale": 1.0,
+        "rotation": 0.0, "inlier_ratio": 0.25, "residual": 2.0,
+    }, 1.0)
+    assert classified["class"] == "unknown_motion"
+    assert "不能据此判断手持" in classified["reason"]
+    assert classified["uncertainty"]
+
+
+def test_competing_static_tracks_refuse_subject_motion_as_camera_motion():
+    classified = CM.classify_pair({
+        "status": "success", "tx": 10.0, "ty": 0.0, "scale": 1.0,
+        "rotation": 0.0, "inlier_ratio": 0.9, "residual": 0.3,
+        "static_track_ratio": 0.4, "static_track_cells": 5,
+    }, 1.0)
+    assert classified["class"] == "unknown_motion"
+    assert classified["uncertainty"]
+
+
+def test_fixed_camera_with_moving_subject_stays_static():
+    rng = np.random.default_rng(42)
+    background = cv2.GaussianBlur(
+        rng.integers(0, 256, (120, 160, 3), dtype=np.uint8), (5, 5), 0)
+    subject = cv2.GaussianBlur(
+        rng.integers(0, 256, (60, 50, 3), dtype=np.uint8), (3, 3), 0)
+    left, right = background.copy(), background.copy()
+    left[30:90, 25:75] = subject
+    right[30:90, 65:115] = subject
+
+    result = CM.analyse_motion(_samples([left, right]))
+
+    assert result["status"] == "success"
+    assert result["summary"]["class"] == "static"
+
+
+def test_unknown_summary_preserves_the_pair_refusal_reason(monkeypatch):
+    monkeypatch.setattr(CM, "measure_pair", lambda _left, _right: {
+        "status": "success", "tx": 8.0, "ty": 1.0, "scale": 1.0,
+        "rotation": 0.0, "inlier_ratio": 0.25, "residual": 2.0,
+    })
+    frame = _scene()
+    result = CM.analyse_motion(_samples([frame, frame]))
+    assert result["summary"]["class"] == "unknown_motion"
+    assert result["summary"]["uncertainty"]
+    claims = CM.motion_to_claims(result, lambda name: f"art-{name}", "0", "1")
+    assert claims[0]["uncertainty_reason"]
+
+
 def test_motion_maps_to_a_measured_claim():
     frame = _scene()
     shifted = np.roll(frame, 10, axis=1)

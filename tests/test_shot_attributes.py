@@ -48,6 +48,29 @@ def test_no_subject_is_not_applicable_not_a_guess():
     assert result["uncertainty"]
 
 
+def test_screen_person_and_statue_are_not_live_person_framing():
+    for kind in ("screen_person", "screen_face", "statue", "illustration",
+                 "statue_face", "artifact_face"):
+        result = SA.classify_framing([_box(0.8)], FRAME, subject_kind=kind)
+        assert result["framing"] == "不适用"
+        assert result["uncertainty"]
+
+
+def test_unknown_subject_kind_and_invalid_boxes_are_refused():
+    unknown = SA.classify_framing([_box(0.8)], FRAME, subject_kind="unknown_detector")
+    assert unknown["framing"] == "不确定"
+    invalid = SA.classify_framing([[10, 10, 5, 5], [float("nan"), 0, 1, 1]], FRAME)
+    assert invalid["framing"] == "不确定"
+
+
+def test_partly_outside_box_uses_visible_height_and_carries_uncertainty():
+    result = SA.classify_framing([[100, -540, 400, 540]], FRAME)
+    assert result["framing"] == "近景"
+    assert result["measurements"][0]["height_ratio"] == 0.5
+    assert result["confidence"] <= 0.5
+    assert result["uncertainty"]
+
+
 def test_different_subjects_report_disagreement():
     result = SA.classify_framing([_box(0.06), _box(0.6)], FRAME)
     assert result["framing"] == "多主体不一致"

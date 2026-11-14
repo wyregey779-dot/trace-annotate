@@ -109,7 +109,7 @@ def _retain(events, proposal):
         if previous["kind"] != proposal["kind"] or end < left or start > right:
             continue
         if proposal["kind"] == "flash":
-            return
+            return False
         earlier = previous if left <= start else proposal
         later = previous if right >= end else proposal
         previous["interval"] = {
@@ -148,8 +148,9 @@ def _retain(events, proposal):
         previous["metrics"]["merged_interval"] = True
         if previous["metrics"]["window_clipped"] and "窗口" not in previous["uncertainty"]:
             previous["uncertainty"] += "；跨分析窗口的完整区间边界待复核"
-        return
+        return False
     events.append(proposal)
+    return True
 
 
 def _photometric_metrics(first, last):
@@ -232,6 +233,10 @@ def discover_events(samples: Iterable[Dict[str, Any]], *, max_events=MAX_EVENTS,
     if type(max_events) is not int or not 1 <= max_events <= MAX_EVENTS:
         raise SchemaInvalid("SCHEMA_INVALID", "Transition event budget is invalid")
     retained, buffer = [], deque()
+    # Once the public event budget is full, adjacent overlapping windows may
+    # rediscover the same omitted proposal. Keep a small bounded dedupe ledger
+    # so ``dropped_events`` counts omitted events, not window appearances.
+    dropped_recent = []
     windows = unknown = observed = dropped = 0
     first_index = last_index = None
     long_run, long_previous = [], None
@@ -255,10 +260,15 @@ def discover_events(samples: Iterable[Dict[str, Any]], *, max_events=MAX_EVENTS,
 
     def retain(event):
         nonlocal dropped
-        _retain(retained, event)
+        appended = _retain(retained, event)
+        if not appended:
+            return
         if len(retained) > max_events:
-            retained.pop()
-            dropped += 1
+            omitted = retained.pop()
+            if _retain(dropped_recent, omitted):
+                dropped += 1
+                if len(dropped_recent) > WINDOW_FRAMES:
+                    dropped_recent.pop(0)
 
     def finish_long(clipped_right=False):
         nonlocal long_run, long_last_change, long_left_clipped
@@ -533,6 +543,11 @@ def scan_transitions(store, media_id, output: Path, *, window=None, cancelled=No
             interval["end_seconds"] = float(S.rational_value(endpoint))
             event["time_window"] = {"start": {"seconds": initial_row["seconds"]},
                                     "end": {"seconds": endpoint}}
+            if (start > 0 and int(interval["start_frame"]) == start
+                    and event.get("previous_frame") is None):
+                event["metrics"]["window_clipped"] = True
+                if "所选范围" not in event["uncertainty"]:
+                    event["uncertainty"] += "；所选范围从转场候选起点开始，左侧完整边界待复核"
             if final_index == end - 1 and end < total:
                 event["metrics"]["window_clipped"] = True
                 event["uncertainty"] += "；所选范围或字节预算在转场中结束，完整终点待复核"

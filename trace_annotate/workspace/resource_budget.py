@@ -8,12 +8,16 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import ctypes
+import errno
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
+import sys
 import time
 import uuid
 
@@ -22,6 +26,9 @@ from .slots import get_prepare_slot, SlotClosed, SlotTimeout
 
 GIB = 1024 ** 3
 CONTRACT = "isolated-model-memory-v1"
+HOST_SLOT_CONTRACT = "traceannotate-host-model-slot-v1"
+HOST_SLOT_FILENAME = "model-resource-v1.lock"
+HOST_SLOT_POLL_SECONDS = .05
 
 
 def memory_available():
@@ -55,12 +62,28 @@ def policy():
         if not math.isfinite(value) or not minimum <= value <= maximum:
             raise WorkspaceError("INVALID_MODEL_RESOURCE_POLICY", name + " is outside its supported range")
         return value
+    configured_lock_root = os.environ.get("TRACE_ANNOTATE_MODEL_LOCK_ROOT")
+    if configured_lock_root:
+        lock_root = Path(configured_lock_root).expanduser().absolute()
+        host_lock = {"contract": HOST_SLOT_CONTRACT, "kind": "file",
+                     "identity": str(lock_root / HOST_SLOT_FILENAME)}
+    elif os.name == "nt":
+        host_lock = {"contract": HOST_SLOT_CONTRACT, "kind": "windows_named_mutex",
+                     "identity": "Local\\TraceAnnotateHostModelSlot-v1"}
+    elif sys.platform.startswith("linux"):
+        host_lock = {"contract": HOST_SLOT_CONTRACT, "kind": "linux_abstract_socket",
+                     "identity": "traceannotate-host-model-slot-v1-" + str(os.getuid())}
+    else:
+        raise WorkspaceError(
+            "INVALID_MODEL_RESOURCE_POLICY",
+            "TRACE_ANNOTATE_MODEL_LOCK_ROOT must name an application-owned project path on this platform")
     return {"contract": CONTRACT,
             "model_bytes": int(amount("TRACE_ANNOTATE_MODEL_BUDGET_MIB", 2048, 2048, 65536) * 1024 ** 2),
             "reserve_bytes": int(amount("TRACE_ANNOTATE_MODEL_RESERVE_MIB", 1024, 1024, 65536) * 1024 ** 2),
             "wait_seconds": amount("TRACE_ANNOTATE_MODEL_WAIT_SECONDS", 60, 0, 600),
             "frame_seconds": amount("TRACE_ANNOTATE_MODEL_FRAME_SECONDS", 60, 5, 600),
-            "phase_seconds": amount("TRACE_ANNOTATE_MODEL_PHASE_SECONDS", 3600, 60, 86400)}
+            "phase_seconds": amount("TRACE_ANNOTATE_MODEL_PHASE_SECONDS", 3600, 60, 86400),
+            "host_lock": host_lock}
 
 
 def _available():
@@ -74,28 +97,207 @@ def _available():
     return value
 
 
-@contextmanager
-def admit(settings, *, cancelled):
-    """Serialise heavy models across workspaces in this interpreter, then admit."""
-    started = time.monotonic()
-    try:
-        with get_prepare_slot().hold(cancelled=cancelled, timeout=settings["wait_seconds"]):
-            required = settings["model_bytes"] + settings["reserve_bytes"]
+class HostSlotTimeout(Exception):
+    """The OS-backed host slot remained owned for the complete wait budget."""
+
+    def __init__(self, waited_seconds):
+        super().__init__("host model slot wait budget exhausted")
+        self.waited_seconds = waited_seconds
+
+
+class HostModelSlot:
+    """One auto-released cross-process slot backed by an OS primitive.
+
+    Windows uses a named mutex and Linux uses an abstract Unix socket, neither
+    of which creates a filesystem artifact. Other POSIX platforms require an
+    explicit project-local lock root and use ``flock``. In every case the open
+    kernel handle is the owner, so a process crash releases the slot.
+    """
+
+    def __init__(self, specification):
+        if (not isinstance(specification, dict)
+                or set(specification) != {"contract", "kind", "identity"}
+                or specification.get("contract") != HOST_SLOT_CONTRACT
+                or specification.get("kind") not in {"file", "windows_named_mutex", "linux_abstract_socket"}
+                or not isinstance(specification.get("identity"), str)
+                or not specification["identity"]):
+            raise WorkspaceError("INVALID_MODEL_RESOURCE_POLICY", "Invalid host model lock specification")
+        self.specification = dict(specification)
+        self.kind = specification["kind"]
+        self.identity = specification["identity"]
+        self.path = Path(self.identity).absolute() if self.kind == "file" else None
+        self.handle = None
+        self.kernel = None
+        self.acquired = False
+        self.recovered_abandoned_owner = False
+
+    @property
+    def scope_sha256(self):
+        value = self.kind + ":" + self.identity
+        if self.kind == "file" and os.name == "nt":
+            value = value.lower()
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def _open(self):
+        if self.kind == "windows_named_mutex":
+            if os.name != "nt" or not self.identity.startswith("Local\\TraceAnnotateHostModelSlot-"):
+                raise WorkspaceError("INVALID_MODEL_RESOURCE_POLICY", "Invalid Windows host model mutex")
+            from ctypes import wintypes
+            self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            self.kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+            self.kernel.CreateMutexW.restype = wintypes.HANDLE
+            self.kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            self.kernel.WaitForSingleObject.restype = wintypes.DWORD
+            self.kernel.ReleaseMutex.argtypes = [wintypes.HANDLE]
+            self.kernel.ReleaseMutex.restype = wintypes.BOOL
+            self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            self.handle = self.kernel.CreateMutexW(None, False, self.identity)
+            if not self.handle:
+                raise OSError(ctypes.get_last_error(), "Cannot create host model mutex")
+            return
+        if self.kind == "linux_abstract_socket":
+            if not sys.platform.startswith("linux") or not self.identity.startswith("traceannotate-host-model-slot-"):
+                raise WorkspaceError("INVALID_MODEL_RESOURCE_POLICY", "Invalid Linux host model socket")
+            self.handle = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            return
+        if self.path is None or not self.path.is_absolute() or self.path.name != HOST_SLOT_FILENAME:
+            raise WorkspaceError("INVALID_MODEL_RESOURCE_POLICY", "Invalid host model lock path")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.is_symlink():
+            raise WorkspaceError("INVALID_MODEL_RESOURCE_POLICY", "Host model lock must not be a symbolic link")
+        self.handle = self.path.open("a+b")
+        self.handle.seek(0, os.SEEK_END)
+        if self.handle.tell() == 0:
+            self.handle.write(b"\0")
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+
+    def _try_acquire(self):
+        if self.kind == "windows_named_mutex":
+            result = self.kernel.WaitForSingleObject(self.handle, 0)
+            if result == 0:  # WAIT_OBJECT_0
+                return True
+            if result == 0x80:  # WAIT_ABANDONED
+                self.recovered_abandoned_owner = True
+                return True
+            if result == 0x102:  # WAIT_TIMEOUT
+                return False
+            raise OSError(ctypes.get_last_error(), "Cannot wait for host model mutex")
+        if self.kind == "linux_abstract_socket":
+            try:
+                self.handle.bind("\0" + self.identity)
+                return True
+            except OSError as exc:
+                if exc.errno == errno.EADDRINUSE:
+                    return False
+                raise
+        self.handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError as exc:
+                if getattr(exc, "winerror", None) in {33, 36} or exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    return False
+                raise
+        import fcntl
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                return False
+            raise
+
+    def acquire(self, *, cancelled, timeout):
+        self._open()
+        started = time.monotonic()
+        try:
             while True:
                 if cancelled():
-                    raise WorkspaceError("CANCELLED", "Model admission cancelled")
-                available = _available()
-                if available >= required:
-                    yield {"available_at_admission": available, "required_bytes": required,
-                           "wait_seconds": time.monotonic() - started}
-                    return
-                if time.monotonic() - started >= settings["wait_seconds"]:
-                    raise WorkspaceError("INSUFFICIENT_MEMORY", "Insufficient available host memory for the model",
-                        retryable=True, details={"available_bytes": available, "required_bytes": required})
-                time.sleep(.05)
-    except (SlotClosed, SlotTimeout) as exc:
+                    raise InterruptedError("host model slot wait was cancelled")
+                if self._try_acquire():
+                    self.acquired = True
+                    return time.monotonic() - started
+                elapsed = time.monotonic() - started
+                if elapsed >= timeout:
+                    raise HostSlotTimeout(elapsed)
+                time.sleep(min(HOST_SLOT_POLL_SECONDS, max(0, timeout - elapsed)))
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.handle is None:
+            return
+        try:
+            if self.acquired:
+                if self.kind == "windows_named_mutex":
+                    if not self.kernel.ReleaseMutex(self.handle):
+                        raise OSError(ctypes.get_last_error(), "Cannot release host model mutex")
+                elif self.kind == "file":
+                    self.handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.acquired = False
+            if self.kind == "windows_named_mutex":
+                self.kernel.CloseHandle(self.handle)
+            else:
+                self.handle.close()
+            self.handle = None
+            self.kernel = None
+
+    @contextmanager
+    def hold(self, *, cancelled, timeout):
+        waited = self.acquire(cancelled=cancelled, timeout=timeout)
+        try:
+            yield {"contract": HOST_SLOT_CONTRACT, "kind": self.kind,
+                   "identity": self.identity, "scope_sha256": self.scope_sha256,
+                   "owner_pid": os.getpid(), "wait_seconds": waited,
+                   "recovered_abandoned_owner": self.recovered_abandoned_owner}
+        finally:
+            self.close()
+
+
+@contextmanager
+def admit(settings, *, cancelled):
+    """Serialise heavy models across processes and admit against real memory."""
+    started = time.monotonic()
+    try:
+        deadline = started + settings["wait_seconds"]
+        with get_prepare_slot().hold(cancelled=cancelled, timeout=max(0, deadline - time.monotonic())):
+            host_slot = HostModelSlot(settings["host_lock"])
+            with host_slot.hold(cancelled=cancelled,
+                                timeout=max(0, deadline - time.monotonic())) as lock_record:
+                required = settings["model_bytes"] + settings["reserve_bytes"]
+                while True:
+                    if cancelled():
+                        raise WorkspaceError("CANCELLED", "Model admission cancelled")
+                    available = _available()
+                    if available >= required:
+                        yield {"available_at_admission": available, "required_bytes": required,
+                               "wait_seconds": time.monotonic() - started,
+                               "host_lock": lock_record}
+                        return
+                    if time.monotonic() >= deadline:
+                        raise WorkspaceError("INSUFFICIENT_MEMORY", "Insufficient available host memory for the model",
+                            retryable=True, details={"available_bytes": available, "required_bytes": required,
+                                                     "host_lock": lock_record})
+                    time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    except (SlotClosed, SlotTimeout, HostSlotTimeout) as exc:
+        details = {"waited_seconds": getattr(exc, "waited_seconds", time.monotonic() - started)}
+        if isinstance(exc, HostSlotTimeout):
+            lock = HostModelSlot(settings["host_lock"])
+            details["host_lock"] = {"contract": HOST_SLOT_CONTRACT, "kind": lock.kind,
+                                    "identity": lock.identity, "scope_sha256": lock.scope_sha256}
         raise WorkspaceError("MODEL_RESOURCE_BUSY", "Another local model is using the resource slot",
-                             retryable=True) from exc
+                             retryable=True, details=details) from exc
     except InterruptedError as exc:
         raise WorkspaceError("CANCELLED", "Model resource wait cancelled") from exc
 
@@ -188,9 +390,10 @@ def run_owned(command, directory, *, settings, cancelled, timeout, progress_path
     receipt = {"argv": command, "parent_pid": os.getpid(), "worker_group": None,
                "started_at": time.time(), "status": "starting"}
     process = None
-    tree = ProcessTree()
+    tree = None
     started = time.monotonic()
     try:
+        tree = ProcessTree()
         with admit(settings, cancelled=cancelled) as admitted:
             receipt.update(admitted)
             env = os.environ.copy()
@@ -238,12 +441,16 @@ def run_owned(command, directory, *, settings, cancelled, timeout, progress_path
                 receipt["status"] = "completed"
     except BaseException as exc:
         receipt.update(status="failed", error_code=getattr(exc, "code", type(exc).__name__), error=str(exc))
+        details = getattr(exc, "details", None)
+        if details:
+            receipt["error_details"] = details
         raise
     finally:
         # Termination includes descendants even if a Windows venv launcher has
         # already exited. Closing the last Job handle is also a safety barrier.
-        tree.terminate(process)
-        tree.close()
+        if tree is not None:
+            tree.terminate(process)
+            tree.close()
         receipt.update(actual_exit_code=None if process is None else process.returncode,
                        elapsed_seconds=time.monotonic() - started, finished_at=time.time())
         (directory / "process-receipt.json").write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")

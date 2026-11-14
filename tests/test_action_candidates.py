@@ -82,6 +82,74 @@ def test_merge_keeps_windows_and_requires_same_subject_and_class():
     merged = AC.merge_candidates([first, second, other])
     assert len(merged) == 2
     assert merged[0]["merged_windows"][0]["start_frame"] == "5"
+    assert merged[0]["evidence_ids"] == ["art-4", "art-9"]
+
+
+def test_merge_is_order_independent_and_never_shortens_a_containing_window():
+    outer = AC.build_candidate("走", subject_id="s1", start_frame="1", end_frame="10",
+                               evidence_ids=["outer"], score=0.5, score_kind="rule_score",
+                               provider="subject-translation-v1")
+    inner = AC.build_candidate("走", subject_id="s1", start_frame="3", end_frame="4",
+                               evidence_ids=["inner"], score=0.7, score_kind="rule_score",
+                               provider="subject-translation-v1")
+    forward = AC.merge_candidates([outer, inner])
+    reverse = AC.merge_candidates([inner, outer])
+    assert forward == reverse
+    assert forward[0]["start_frame"] == "1"
+    assert forward[0]["end_frame"] == "10"
+    assert forward[0]["evidence_ids"] == ["outer", "inner"]
+    assert forward[0]["score"] == 0.7
+
+
+def test_merge_never_crosses_object_identity_or_an_unknown_subject():
+    box = AC.build_candidate("走", subject_id="s1", start_frame="1", end_frame="2",
+                             evidence_ids=["box"], score=0.5, score_kind="rule_score",
+                             provider="subject-translation-v1", object_label="box")
+    door = AC.build_candidate("走", subject_id="s1", start_frame="3", end_frame="4",
+                              evidence_ids=["door"], score=0.5, score_kind="rule_score",
+                              provider="subject-translation-v1", object_label="door")
+    unknown_a = AC.build_candidate("走", subject_id=None, start_frame="5", end_frame="6",
+                                   evidence_ids=["a"], score=0.5, score_kind="rule_score",
+                                   provider="subject-translation-v1")
+    unknown_b = AC.build_candidate("走", subject_id=None, start_frame="7", end_frame="8",
+                                   evidence_ids=["b"], score=0.5, score_kind="rule_score",
+                                   provider="subject-translation-v1")
+    assert len(AC.merge_candidates([box, door])) == 2
+    assert len(AC.merge_candidates([unknown_a, unknown_b])) == 2
+
+
+def test_shared_evidence_does_not_bridge_a_real_temporal_gap():
+    first = AC.build_candidate("走", subject_id="s1", start_frame="1", end_frame="2",
+                               evidence_ids=["shared"], score=0.5, score_kind="rule_score",
+                               provider="subject-translation-v1")
+    later = AC.build_candidate("走", subject_id="s1", start_frame="20", end_frame="21",
+                               evidence_ids=["shared"], score=0.6, score_kind="rule_score",
+                               provider="subject-translation-v1")
+    assert len(AC.merge_candidates([first, later])) == 2
+
+
+def test_merge_never_crosses_provider_method_identity():
+    first = AC.build_candidate("走", subject_id="s1", start_frame="1", end_frame="2",
+                               evidence_ids=["one"], score=0.5, score_kind="rule_score",
+                               provider="subject-translation-v1")
+    second = AC.build_candidate("走", subject_id="s1", start_frame="3", end_frame="4",
+                                evidence_ids=["two"], score=0.6, score_kind="rule_score",
+                                provider="subject-translation-v1")
+    first["method"] = "track-displacement-v1"
+    second["method"] = "background-compensated-v2"
+    assert len(AC.merge_candidates([first, second])) == 2
+
+
+def test_merge_does_not_mutate_inputs():
+    first = AC.build_candidate("走", subject_id="s1", start_frame="1", end_frame="2",
+                               evidence_ids=["one"], score=0.5, score_kind="rule_score",
+                               provider="subject-translation-v1")
+    second = AC.build_candidate("走", subject_id="s1", start_frame="3", end_frame="4",
+                                evidence_ids=["two"], score=0.6, score_kind="rule_score",
+                                provider="subject-translation-v1")
+    expected = [dict(first), dict(second)]
+    AC.merge_candidates([first, second])
+    assert [first, second] == expected
 
 
 def test_candidates_map_to_observable_claims():

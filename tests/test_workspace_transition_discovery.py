@@ -42,6 +42,16 @@ def test_overlap_produces_one_flash_and_reports_bounded_event_output():
     assert result["dropped_events"] >= 1
 
 
+def test_omitted_flash_repeated_in_overlap_counts_as_one_dropped_event():
+    values = [120] * 400
+    values[10] = values[200] = 255
+    result = discovery().discover_events(samples(values), max_events=1)
+    assert [(event["kind"], event["anchor_frame"]) for event in result["events"]] == [
+        ("flash", "10")]
+    assert result["events_truncated"] is True
+    assert result["dropped_events"] == 1
+
+
 def test_global_scan_cancellation_is_observed_in_feature_windows():
     calls = []
     def cancelled():
@@ -134,6 +144,18 @@ def test_byte_cap_marks_an_active_fade_interval_as_clipped(admitted, tmp_path):
     assert event["interval"]["end_frame"] == "14"
     assert event["metrics"]["window_clipped"] is True
     assert "字节预算" in event["uncertainty"]
+
+
+def test_selected_range_starting_on_fade_marks_the_left_boundary_as_clipped(admitted, tmp_path):
+    store, item = admitted
+    result = discovery().scan_transitions(
+        store, item["media_id"], tmp_path / "selected-fade-start",
+        window={"start": S.rational("1/2"), "end": S.rational(3)})
+    event = next(event for event in result["events"] if event["kind"] == "fade_in")
+    assert event["interval"]["start_frame"] == result["coverage"]["first_frame"] == "5"
+    assert event["previous_frame"] is None
+    assert event["metrics"]["window_clipped"] is True
+    assert "所选范围" in event["uncertainty"]
 
 
 def test_full_global_interval_is_retained_beside_a_short_local_candidate(admitted, tmp_path):

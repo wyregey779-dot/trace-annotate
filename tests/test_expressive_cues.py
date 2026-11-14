@@ -23,13 +23,13 @@ def test_f0_matches_the_known_pure_tone_within_one_percent():
     assert measurement["f0_hz"] == pytest.approx(440, rel=0.01)
 
 
-def test_silence_has_no_f0_and_no_active_speech():
+def test_silence_has_no_f0_and_no_energy_activity():
     measurement = EC.measure_acoustic_window(np.zeros(22050), 22050)
     assert measurement["f0_hz"] is None
     assert measurement["active_ratio"] == 0.0
 
 
-def test_speech_interval_is_detected_between_silences():
+def test_energy_active_interval_is_detected_between_silences():
     sample_rate = 22050
     quiet = np.zeros(int(0.4 * sample_rate))
     tone = _sine(300, 0.5, sample_rate, amplitude=0.4)
@@ -52,6 +52,27 @@ def test_window_reports_origin_and_units():
     assert measurement["window_seconds"]["start"] == 12.5
     assert measurement["sample_rate"] == 22050
     assert "db" in "dbfs"
+    assert measurement["activity_kind"] == "energy_above_adaptive_threshold"
+    assert measurement["energy_active_ratio"] == measurement["active_ratio"]
+    assert measurement["energy_active_intervals"] == measurement["active_intervals"]
+
+
+def test_acoustic_analysis_checks_cancellation_inside_signal_loops():
+    checks = 0
+
+    def cancelled():
+        nonlocal checks
+        checks += 1
+        return checks >= 5
+
+    with pytest.raises(InterruptedError, match="acoustic_analysis_cancelled"):
+        EC.measure_acoustic_window(_sine(220, 5.0), 22050, cancelled=cancelled)
+
+
+def test_acoustic_analysis_honours_expired_cpu_deadline():
+    with pytest.raises(TimeoutError, match="acoustic_analysis_timeout"):
+        EC.measure_acoustic_window(_sine(220, 0.1), 22050,
+                                   deadline_monotonic=0.0)
 
 
 def test_face_without_landmarks_is_not_run():
@@ -91,4 +112,5 @@ def test_acoustic_claim_is_measured_and_refuses_interpretation():
     claims = EC.acoustic_claim(measurement, "art-audio")
     assert claims[0]["claim_type"] == "measured"
     assert claims[0]["measurement"]["f0_hz"] == pytest.approx(440, rel=0.01)
+    assert claims[0]["measurement"]["activity_kind"] == "energy_above_adaptive_threshold"
     assert "情绪" in claims[0]["uncertainty_reason"]

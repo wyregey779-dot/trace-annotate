@@ -57,6 +57,7 @@ v2 在 v1 的 11 个字段上增加一个必填键 `measurement`(可为 null):
 - `time_window` 是事件有效区间,例如硬切两帧之间的区间、渐变的真实渐变区间。
 - `measurement.analysis_window` 是计算窗口,例如 RMS 统计的 1 秒窗。
 - claim 的 `method.parameters` 中的 scene/context window 是上下文窗口,不能替代事件区间。
+- 声学测量必须记录请求窗口、实际分析窗口与覆盖率；超出冻结预算时只允许生成明确标注 `bounded_prefix` 的有界前缀测量,不得把部分窗口写成整段统计。取消、截止时间或磁盘安全余量失败必须保留为失败/未运行状态,不能发布部分结果。
 - 三者在 UI、导出、证据包和评测中读取同一份 `time_window`,禁止各自解释。
 - 帧身份统一使用 `frame_index` + `source_pts` + `proxy_pts`;时间统一左闭右开。
 
@@ -74,6 +75,7 @@ v2 摘要与 v1 分离,防止同一内容在两个版本下产生相同摘要:
 - Claim 摘要:`{"digest_version":"visual-semantics-v2","claim":<去掉 id 的 v2 投影>}`,投影包含 `measurement`。
 - 语义摘要:`{"digest_version":"visual-semantics-v2","version":"visual-semantics-v2","claims":[...按 id 排序...]}`。
 - 模型运行摘要与 annotation 审核绑定摘要沿用 v1 规则,不随 Claim 版本改变。
+- 模型运行的 `status` 仍是冻结的执行三态:`success` 表示算法完整执行并生成可校验输出,`failed` 表示执行故障,`not_run` 表示未执行。`partial`、`insufficient_samples`、`insufficient_evidence`、`not_applicable` 是输出结论而不是执行失败;它们保留在候选/模块输出中并由 `output_sha256` 绑定,必要时同时记录在 `parameters.reported_outcome_status`。
 - 固定样例见 `visual-semantics-v2.examples.json`;投影定义见 `visual-semantics-v2.digest-projections.json`。
 
 ## 8 迁移

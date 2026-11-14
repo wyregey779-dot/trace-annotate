@@ -1,6 +1,6 @@
 """
 Face Detection Extractor with OpenCV 5.0 compatibility and explicit execution status.
-Supports YuNet ONNX face detection loaded via memory buffers,
+Supports YuNet ONNX face detection loaded from frozen memory buffers,
 calculating face count, crowd density, and bounding boxes.
 """
 from __future__ import annotations
@@ -63,6 +63,8 @@ class FaceExtractor(BaseExtractor):
         self.detector_kind = None
         self._input_size = None
         self.load_error = None
+        self.weights_sha256 = None
+        self.weights_load_source = None
         self._init_detector()
 
     @property
@@ -73,8 +75,9 @@ class FaceExtractor(BaseExtractor):
     def code_identity(self) -> Dict[str, Any]:
         """Detector and runtime identity for a model-run record.
 
-        YuNet weights are an external file, so their hash is computed by the
-        caller from ``model_path``; this property never invents a digest.
+        ``weights_sha256`` is captured from the exact bytes supplied to the
+        detector.  It is deliberately not re-read from ``model_path`` after
+        inference, because that path may have been replaced meanwhile.
         """
         return {"provider": "opencv",
                 "model_name": ("YuNet" if self.detector_kind == "yunet"
@@ -82,6 +85,8 @@ class FaceExtractor(BaseExtractor):
                                else "unavailable"),
                 "model_version": getattr(cv2, "__version__", "unknown") if HAS_CV2 else "unavailable",
                 "weights_path": self.model_path,
+                "weights_sha256": self.weights_sha256,
+                "weights_load_source": self.weights_load_source,
                 "detector_kind": self.detector_kind,
                 "load_error": self.load_error,
                 "license": "OpenCV Apache-2.0; detector weights license not bundled locally"}
@@ -114,45 +119,52 @@ class FaceExtractor(BaseExtractor):
         try:
             if not hasattr(cv2, "FaceDetectorYN"):
                 return
-            model_path = self.model_path
+            with open(self.model_path, "rb") as incoming:
+                model_buf = incoming.read()
+            digest = hashlib.sha256(model_buf).hexdigest()
             options = {"input_size": (320, 320),
                        "score_threshold": self.thresholds.face_min_confidence,
                        "nms_threshold": 0.3, "top_k": 50}
-            if not model_path.isascii():
+            try:
+                # Use the same frozen byte string for hashing and loading even
+                # when the source path is ASCII.  This closes the path-replace
+                # gap between a pre-load hash and OpenCV opening the file.
+                self.detector = cv2.FaceDetectorYN.create(
+                    "ONNX", np.frombuffer(model_buf, dtype=np.uint8),
+                    np.empty(0, dtype=np.uint8), **options)
+                load_source = "memory_buffer"
+            except Exception:
+                # Older OpenCV versions expose only the file overload.  They
+                # receive a content-addressed snapshot made from the already
+                # hashed bytes, never the mutable source pathname.
+                cache_dir = os.environ.get("TRACE_ANNOTATE_FACE_CACHE")
+                if not cache_dir:
+                    cache_dir = os.path.join(_ascii_temp_root(), "traceannotate", "yunet")
+                os.makedirs(cache_dir, exist_ok=True)
+                model_path = os.path.join(cache_dir, "yunet-" + digest + ".onnx")
+                cached = None
+                if os.path.isfile(model_path):
+                    with open(model_path, "rb") as incoming:
+                        cached = hashlib.sha256(incoming.read()).hexdigest()
+                if cached != digest:
+                    descriptor, temporary = tempfile.mkstemp(
+                        prefix="yunet-", suffix=".onnx", dir=cache_dir)
+                    try:
+                        with os.fdopen(descriptor, "wb") as outgoing:
+                            outgoing.write(model_buf)
+                        os.replace(temporary, model_path)
+                    finally:
+                        if os.path.exists(temporary):
+                            os.unlink(temporary)
+                self.detector = cv2.FaceDetectorYN.create(
+                    model=model_path, config="", **options)
                 with open(model_path, "rb") as incoming:
-                    model_buf = incoming.read()
-                try:
-                    # The official overload requires an empty config buffer
-                    # for ONNX, including when the model already contains it.
-                    self.detector = cv2.FaceDetectorYN.create(
-                        "ONNX", np.frombuffer(model_buf, dtype=np.uint8),
-                        np.empty(0, dtype=np.uint8), **options)
-                    self.detector_kind = "yunet"
-                    return
-                except Exception:
-                    # Older OpenCV versions expose only the file overload.
-                    # An explicit project cache is authoritative for fallback.
-                    cache_dir = os.environ.get("TRACE_ANNOTATE_FACE_CACHE")
-                    if not cache_dir:
-                        cache_dir = os.path.join(_ascii_temp_root(), "traceannotate", "yunet")
-                    os.makedirs(cache_dir, exist_ok=True)
-                    digest = hashlib.sha256(model_buf).hexdigest()
-                    model_path = os.path.join(cache_dir, "yunet-" + digest + ".onnx")
-                    cached = None
-                    if os.path.isfile(model_path):
-                        with open(model_path, "rb") as incoming:
-                            cached = hashlib.sha256(incoming.read()).hexdigest()
-                    if cached != digest:
-                        descriptor, temporary = tempfile.mkstemp(prefix="yunet-", suffix=".onnx", dir=cache_dir)
-                        try:
-                            with os.fdopen(descriptor, "wb") as outgoing:
-                                outgoing.write(model_buf)
-                            os.replace(temporary, model_path)
-                        finally:
-                            if os.path.exists(temporary):
-                                os.unlink(temporary)
-            self.detector = cv2.FaceDetectorYN.create(model=model_path, config="", **options)
+                    if hashlib.sha256(incoming.read()).hexdigest() != digest:
+                        raise RuntimeError("YuNet content-addressed snapshot changed during load")
+                load_source = "content_addressed_snapshot"
             self.detector_kind = "yunet"
+            self.weights_sha256 = digest
+            self.weights_load_source = load_source
         except Exception as exc:
             self.load_error = str(exc)
             self.detector = None

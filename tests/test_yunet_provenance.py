@@ -25,7 +25,8 @@ def face_record(identity):
 
 def test_yunet_model_record_describes_per_frame_sizing_and_separate_licenses():
     record = face_record({"provider": "opencv", "model_name": "YuNet", "detector_kind": "yunet",
-                          "weights_path": str(MODEL), "license": "legacy combined description"})
+                          "weights_path": str(MODEL), "weights_sha256": WEIGHT_SHA,
+                          "license": "legacy combined description"})
     assert record["weights_sha256"] == WEIGHT_SHA
     assert record["license"] == "MIT"
     assert record["preprocessing"]["runtime_license"] == "Apache-2.0 (OpenCV)"

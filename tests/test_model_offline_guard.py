@@ -23,6 +23,17 @@ def test_policy_is_offline_by_default_and_opt_in_is_explicit(monkeypatch):
     assert model_loading.offline_mode() is False
 
 
+def test_explicit_acquisition_opt_in_clears_stale_offline_switches(monkeypatch):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    monkeypatch.setenv(model_loading.ALLOW_DOWNLOAD_ENV, "1")
+    effective = model_loading.enforce_offline_environment()
+    assert effective["HF_HUB_OFFLINE"] == "0"
+    assert effective["TRANSFORMERS_OFFLINE"] == "0"
+    assert os.environ["HF_HUB_OFFLINE"] == "0"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "0"
+
+
 def test_vlm_missing_weight_is_not_run_without_network_delay():
     started = time.monotonic()
     extractor = VLMExtractor(model_path="traceannotate-definitely-not-a-model")

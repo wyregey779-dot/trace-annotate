@@ -249,6 +249,19 @@ def test_vlm_model_run_records_the_actual_adapter_task_prompt(prompt):
     assert vlm["parameters"]["task_prompt"] == (prompt or "<MORE_DETAILED_CAPTION>")
 
 
+@pytest.mark.parametrize("reported", [
+    "success", "partial", "insufficient_samples", "insufficient_evidence", "not_applicable"])
+def test_completed_model_outcomes_are_not_misreported_as_execution_failures(reported):
+    assert V._run_status(reported) == "success"
+
+
+@pytest.mark.parametrize("reported,expected", [
+    ("not_run", "not_run"), ("skipped", "not_run"),
+    ("failed", "failed"), ("unknown", "failed")])
+def test_nonexecution_and_real_failures_keep_distinct_execution_status(reported, expected):
+    assert V._run_status(reported) == expected
+
+
 @pytest.mark.parametrize("status", ["failed", "not_run", None])
 @pytest.mark.parametrize("engine_loaded", [True, False])
 def test_run_ocr_preserves_explicit_adapter_status(status, engine_loaded):
@@ -332,8 +345,10 @@ def test_vision_job_is_hash_bound_candidate_and_does_not_edit_task(store):
                for claim in annotation["attributes"]["semantic"]["claims"])
     content_run = next(run for run in runs if run["id"] == V._module_run_id(queued["id"], "content"))
     assert (content_run["provider"], content_run["model_name"]) == ("trace-annotate", "scene-change-v1")
-    assert content_run["status"] == "failed"
-    assert "insufficient_samples" in content_run["failure_reason"]
+    assert content_run["status"] == "success"
+    assert content_run["failure_reason"] is None
+    assert content_run["output_sha256"]
+    assert content_run["parameters"]["reported_outcome_status"] == "insufficient_samples"
     for run in runs:
         assert SS.validate_model_run(run) == run
     for module in ("person", "landmarks", "expressive"):

@@ -102,10 +102,24 @@ def _measure_pair(cv2, left: np.ndarray, right: np.ndarray) -> Dict[str, Any]:
     predicted = cv2.transform(source.reshape(-1, 1, 2).astype(np.float32), matrix).reshape(-1, 2)
     residual = float(np.abs(predicted - target).mean())
     inlier_ratio = float(inliers.mean())
+    displacement = np.linalg.norm(target - source, axis=1)
+    static_tracks = displacement < 1.0
+    static_track_ratio = float(static_tracks.mean())
+    static_cells = 0
+    if static_tracks.any():
+        height, width = right.shape[:2]
+        cells = {
+            (min(2, int(point[0] * 3 / max(1, width))),
+             min(2, int(point[1] * 3 / max(1, height))))
+            for point in source[static_tracks]
+        }
+        static_cells = len(cells)
     return {"status": "success", "tx": float(tx), "ty": float(ty),
             "scale": scale, "rotation": rotation, "residual": residual,
             "inlier_ratio": inlier_ratio, "points": int(len(source)),
-            "frame_width": int(right.shape[1])}
+            "frame_width": int(right.shape[1]),
+            "static_track_ratio": static_track_ratio,
+            "static_track_cells": static_cells}
 
 
 def classify_pair(metrics: Dict[str, Any], seconds: Optional[float]) -> Dict[str, Any]:
@@ -118,9 +132,17 @@ def classify_pair(metrics: Dict[str, Any], seconds: Optional[float]) -> Dict[str
     magnitude = float(np.hypot(tx, ty))
     speed = None if not seconds or seconds <= 0 else magnitude / seconds
     if metrics["inlier_ratio"] < 0.4 or metrics["residual"] > 1.5:
-        return {"class": "handheld_like",
-                "reason": "全局拟合内点率低或残差高",
-                "speed_px_s": speed, "confidence": round(metrics["inlier_ratio"], 3)}
+        return {"class": "unknown_motion",
+                "reason": "全局拟合质量不足，不能据此判断手持运镜",
+                "speed_px_s": speed, "confidence": round(metrics["inlier_ratio"], 3),
+                "uncertainty": "全局模型不足以区分相机运动、主体运动或跟踪误差"}
+    if (magnitude >= STATIC_PIXELS
+            and metrics.get("static_track_ratio", 0.0) >= 0.30
+            and metrics.get("static_track_cells", 0) >= 3):
+        return {"class": "unknown_motion",
+                "reason": "静止背景与移动区域同时存在，无法区分主体运动和相机运动",
+                "speed_px_s": speed, "confidence": 0.0,
+                "uncertainty": "需要主体遮罩或更长背景轨迹复核"}
     if abs(scale - 1.0) >= SCALE_THRESHOLD and abs(rotation) < ROTATION_THRESHOLD:
         direction = "zoom_in" if scale > 1.0 else "zoom_out"
         return {"class": direction, "reason": "尺度变化主导",
@@ -161,7 +183,8 @@ def analyse_motion(samples: Sequence[Dict[str, Any]], *,
                            "seconds": seconds,
                            "metrics": {key: measured.get(key)
                                        for key in ("tx", "ty", "scale", "rotation",
-                                                   "residual", "inlier_ratio", "points")}})
+                                                   "residual", "inlier_ratio", "points",
+                                                   "static_track_ratio", "static_track_cells")}})
         pairs.append(classified)
     classes = [pair["class"] for pair in pairs if pair["class"] != "not_run"]
     if not classes:
@@ -173,12 +196,20 @@ def analyse_motion(samples: Sequence[Dict[str, Any]], *,
     pool = moving or classes
     stable = max(set(pool), key=pool.count)
     agreement = pool.count(stable) / max(1, len(pairs))
-    summary = {"class": stable if agreement >= min_pair_confidence else "unknown_motion",
+    summary_class = stable if agreement >= min_pair_confidence else "unknown_motion"
+    uncertainty = None if agreement >= 0.8 else (
+        "相邻帧分类不一致或存在无法测量的帧对，需人工复核")
+    if summary_class == "unknown_motion":
+        stable_uncertainty = next((pair.get("uncertainty") or pair.get("reason")
+                                   for pair in pairs
+                                   if pair.get("class") == stable and
+                                   (pair.get("uncertainty") or pair.get("reason"))), None)
+        uncertainty = stable_uncertainty or uncertainty or "全局运动类型无法可靠区分"
+    summary = {"class": summary_class,
                "agreement": round(agreement, 3),
                "pairs": len(classes),
                "mean_speed_px_s": _mean_speed(pairs),
-               "uncertainty": None if agreement >= 0.8
-               else "相邻帧分类不一致或存在无法测量的帧对，需人工复核"}
+               "uncertainty": uncertainty}
     return {"status": "success", "pairs": pairs, "summary": summary}
 
 

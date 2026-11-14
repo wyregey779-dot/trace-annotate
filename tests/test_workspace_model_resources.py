@@ -1,4 +1,6 @@
 """Admission, owned descendants and historical model-job compatibility."""
+import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,6 +35,20 @@ def test_low_memory_never_launches_a_worker(tmp_path, monkeypatch):
     assert error.value.code == 'INSUFFICIENT_MEMORY' and error.value.retryable
     receipt=json.loads((tmp_path/'execution/process-receipt.json').read_text('utf-8'))
     assert 'wrapper_pid' not in receipt
+
+
+def test_process_tree_construction_failure_still_writes_a_failure_receipt(tmp_path,monkeypatch):
+    class BrokenTree:
+        def __init__(self):
+            raise OSError('owned process tree unavailable')
+    monkeypatch.setattr(R,'ProcessTree',BrokenTree)
+    with pytest.raises(OSError,match='owned process tree unavailable'):
+        R.run_owned([sys.executable,'-c','pass'],tmp_path/'tree-failure',
+                    settings=settings(),cancelled=lambda:False,timeout=5)
+    receipt=json.loads((tmp_path/'tree-failure/process-receipt.json').read_text('utf-8'))
+    assert receipt['status']=='failed'
+    assert receipt['error_code']=='OSError'
+    assert receipt['actual_exit_code'] is None
 
 
 def test_unreadable_memory_is_explicit_retryable(tmp_path,monkeypatch):
@@ -75,6 +91,123 @@ def test_cross_workspace_model_gate_is_process_wide(monkeypatch):
         thread.join(2)
     with R.admit(settings(),cancelled=lambda:False):
         pass
+
+
+def test_default_cross_process_slot_creates_no_filesystem_artifact(monkeypatch):
+    monkeypatch.delenv('TRACE_ANNOTATE_MODEL_LOCK_ROOT',raising=False)
+    specification=R.policy()['host_lock']
+    assert specification['contract']==R.HOST_SLOT_CONTRACT
+    if os.name=='nt':
+        assert specification['kind']=='windows_named_mutex'
+        assert specification['identity'].startswith('Local\\TraceAnnotateHostModelSlot-')
+    elif sys.platform.startswith('linux'):
+        assert specification['kind']=='linux_abstract_socket'
+        assert specification['identity'].startswith('traceannotate-host-model-slot-')
+    else:
+        pytest.fail('This platform must require an explicit project-local lock root')
+
+
+def host_slot_settings(tmp_path, wait_seconds=1.0):
+    token=hashlib.sha256(str(tmp_path).encode('utf-8')).hexdigest()[:20]
+    if os.name=='nt':
+        host_lock={'contract':R.HOST_SLOT_CONTRACT,'kind':'windows_named_mutex',
+                   'identity':'Local\\TraceAnnotateHostModelSlot-test-'+token}
+    elif sys.platform.startswith('linux'):
+        host_lock={'contract':R.HOST_SLOT_CONTRACT,'kind':'linux_abstract_socket',
+                   'identity':'traceannotate-host-model-slot-test-'+token}
+    else:
+        host_lock={'contract':R.HOST_SLOT_CONTRACT,'kind':'file',
+                   'identity':str((tmp_path/'host-locks'/R.HOST_SLOT_FILENAME).absolute())}
+    return dict(settings(),wait_seconds=wait_seconds,host_lock=host_lock)
+
+
+def start_host_slot_owner(tmp_path, resource, mode):
+    configuration=tmp_path/('settings-'+mode+'.json')
+    configuration.write_text(json.dumps(resource),encoding='utf-8')
+    acquired=tmp_path/('acquired-'+mode+'.json')
+    release=tmp_path/('release-'+mode)
+    package=str(Path(__file__).parents[1])
+    program=("import json,os,sys,time;from pathlib import Path;"
+             "sys.path.insert(0,sys.argv.pop(1));"
+             "from trace_annotate.workspace import resource_budget as R;"
+             "settings=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'));"
+             "acquired=Path(sys.argv[2]);release=Path(sys.argv[3]);mode=sys.argv[4];"
+             "R.memory_available=lambda:10*R.GIB;"
+             "\nwith R.admit(settings,cancelled=lambda:False) as evidence:"
+             "\n acquired.write_text(json.dumps(evidence),encoding='utf-8')"
+             "\n while not release.exists():time.sleep(.02)"
+             "\n if mode=='crash':os._exit(73)")
+    process=subprocess.Popen([sys.executable,'-I','-B','-c',program,package,
+                              str(configuration),str(acquired),str(release),mode],
+                             stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    deadline=time.monotonic()+5
+    while not acquired.is_file() and process.poll() is None and time.monotonic()<deadline:
+        time.sleep(.02)
+    if not acquired.is_file():
+        stdout,stderr=process.communicate(timeout=2)
+        pytest.fail('Host-slot owner did not acquire the lock: '+
+                    (stdout+stderr).decode('utf-8',errors='replace'))
+    return process,acquired,release
+
+
+def test_host_model_slot_serialises_real_processes_and_releases_normally(tmp_path,monkeypatch):
+    resource=host_slot_settings(tmp_path,wait_seconds=2)
+    process,acquired,release=start_host_slot_owner(tmp_path,resource,'normal')
+    monkeypatch.setattr(R,'memory_available',lambda:10*R.GIB)
+    try:
+        with pytest.raises(WorkspaceError) as error:
+            with R.admit(dict(resource,wait_seconds=.1),cancelled=lambda:False):
+                pytest.fail('A second process must not enter the host model slot')
+        assert error.value.code=='MODEL_RESOURCE_BUSY' and error.value.retryable
+        lock=error.value.details['host_lock']
+        assert lock['contract']==R.HOST_SLOT_CONTRACT
+        assert lock['kind']==resource['host_lock']['kind']
+        assert lock['identity']==resource['host_lock']['identity']
+        assert len(lock['scope_sha256'])==64
+    finally:
+        release.touch()
+        stdout,stderr=process.communicate(timeout=5)
+        assert process.returncode==0,(stdout+stderr).decode('utf-8',errors='replace')
+    with R.admit(resource,cancelled=lambda:False) as evidence:
+        assert evidence['host_lock']['kind']==resource['host_lock']['kind']
+        assert evidence['host_lock']['identity']==resource['host_lock']['identity']
+        assert evidence['host_lock']['owner_pid']==os.getpid()
+        assert evidence['host_lock']['recovered_abandoned_owner'] is False
+
+
+def test_host_model_slot_wait_is_cancellable_while_other_process_owns_it(tmp_path,monkeypatch):
+    resource=host_slot_settings(tmp_path,wait_seconds=2)
+    process,acquired,release=start_host_slot_owner(tmp_path,resource,'cancel')
+    monkeypatch.setattr(R,'memory_available',lambda:10*R.GIB)
+    started=time.monotonic()
+    try:
+        with pytest.raises(WorkspaceError) as error:
+            with R.admit(resource,cancelled=lambda:time.monotonic()-started>.1):
+                pytest.fail('Cancelled host-slot wait must not enter')
+        assert error.value.code=='CANCELLED' and time.monotonic()-started<1
+    finally:
+        release.touch()
+        stdout,stderr=process.communicate(timeout=5)
+        assert process.returncode==0,(stdout+stderr).decode('utf-8',errors='replace')
+
+
+def test_host_model_slot_is_released_by_os_after_owner_crash(tmp_path,monkeypatch):
+    resource=host_slot_settings(tmp_path,wait_seconds=2)
+    process,acquired,crash=start_host_slot_owner(tmp_path,resource,'crash')
+    monkeypatch.setattr(R,'memory_available',lambda:10*R.GIB)
+    with pytest.raises(WorkspaceError) as busy:
+        with R.admit(dict(resource,wait_seconds=.1),cancelled=lambda:False):
+            pytest.fail('Owner still holds the slot before its injected crash')
+    assert busy.value.code=='MODEL_RESOURCE_BUSY'
+    crash.touch()
+    stdout,stderr=process.communicate(timeout=5)
+    assert process.returncode==73,(stdout+stderr).decode('utf-8',errors='replace')
+    with R.admit(resource,cancelled=lambda:False) as evidence:
+        assert evidence['host_lock']['owner_pid']==os.getpid()
+        # The kernel can destroy the mutex after the crashed owner's last
+        # handle closes, so a later CreateMutex may observe a fresh object
+        # instead of WAIT_ABANDONED. Either path is automatic OS recovery.
+        assert type(evidence['host_lock']['recovered_abandoned_owner']) is bool
 
 
 def worker_command(script,marker):
@@ -155,7 +288,11 @@ def test_invalid_resource_policy_cannot_silently_lower_reserve(monkeypatch):
 
 def fake_phase(module,config,images,work,*,cancelled):
     return {'identity':M._empty_identity(module,config),'available':False,
-            'results':[{'result':{'status':'not_run','reason':'deterministic missing model'}} for image in images]}
+            'results':[{'frame_index':image['frame_index'],'path':image['path'],
+                        'input_sha256':image['sha256'],
+                        'result':{'status':'not_run','reason':'deterministic missing model'}}
+                       for image in images],
+            'execution':{'status':'not_run','reason':'deterministic missing model'}}
 
 
 def test_normal_pipeline_uses_separate_phases_and_releases_models(store,monkeypatch):
@@ -182,25 +319,69 @@ def test_normal_pipeline_uses_separate_phases_and_releases_models(store,monkeypa
     assert jobs._extractors is None
 
 
-def test_resource_failure_has_no_candidate_and_explicit_retry_preserves_attempts(store,monkeypatch):
+def test_one_resource_failure_keeps_receipt_and_other_model_phase_continues(store,monkeypatch):
     before=task(store)
-    def unavailable(*args,**kwargs):
-        raise WorkspaceError('INSUFFICIENT_MEMORY','Measured memory reserve unavailable',retryable=True)
-    monkeypatch.setattr(M,'run_phase',unavailable)
+    calls=[]
+    def phase(module,config,images,work,*,cancelled):
+        calls.append(module)
+        if module!='clip':
+            return fake_phase(module,config,images,work,cancelled=cancelled)
+        receipt=work/'models'/module/'execution'/'process-receipt.json'
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({'status':'failed','error_code':'INSUFFICIENT_MEMORY',
+            'error':'Measured memory reserve unavailable','actual_exit_code':None}),encoding='utf-8')
+        raise WorkspaceError('INSUFFICIENT_MEMORY','Measured memory reserve unavailable',retryable=True,
+                             details={'available_bytes':1,'required_bytes':2})
+    monkeypatch.setattr(M,'run_phase',phase)
     jobs=V.VisionJobs(store,clip_model_path='missing-clip',vlm_model_path='missing-vlm')
     queued=submit(jobs)['jobs'][0]
     try:
-        failed=jobs.run_pending()[0]
-        assert failed['state']=='failed' and failed['error_code']=='INSUFFICIENT_MEMORY'
-        assert failed['commit'] is None and task(store)==before
-        monkeypatch.setattr(M,'run_phase',fake_phase)
-        jobs.queue.control_job(queued['id'],'retry_failed',command_id='retry-low-memory')
         done=jobs.run_pending()[0]
-        assert done['state']=='succeeded' and done['attempt']==2
-        assert jobs.result(queued['id'])
+        assert done['state']=='succeeded' and done['attempt']==1
+        result=jobs.result(queued['id'])
+        assert calls==['clip','vlm']
+        assert result['model_execution']['clip']['status']=='failed'
+        assert result['model_execution']['vlm']['status']=='not_run'
+        descriptor=result['model_execution']['clip']['receipt']
+        assert descriptor in result['evidence']
+        clip_run=next(item for item in result['model_runs']
+                      if item['id']==V._module_run_id(queued['id'],'clip'))
+        assert clip_run['status']=='failed'
+        assert clip_run['failure_reason']=='INSUFFICIENT_MEMORY'
+        assert clip_run['parameters']['process_receipt_sha256']==descriptor['sha256']
+        assert clip_run['parameters']['execution_sha256']==V.S.sha256_text(
+            result['model_execution']['clip'])
+        tampered=copy.deepcopy(result)
+        tampered['model_execution']['clip']['status']='completed'
+        with pytest.raises(WorkspaceError) as status_error:
+            jobs._validate_candidate(tampered,queued)
+        assert status_error.value.code=='RECOVERY_REQUIRED'
+        tampered=copy.deepcopy(result)
+        run=next(item for item in tampered['model_runs']
+                 if item['id']==V._module_run_id(queued['id'],'clip'))
+        run['parameters']['process_receipt_sha256']='f'*64
+        with pytest.raises(WorkspaceError) as digest_error:
+            jobs._validate_candidate(tampered,queued)
+        assert digest_error.value.code=='RECOVERY_REQUIRED'
         assert task(store)==before
     finally:
         jobs.close()
+
+
+@pytest.mark.parametrize('code',['CANCELLED','LEASE_LOST','MEDIA_CHANGED','RECOVERY_REQUIRED',
+                                  'VISION_RESUBMIT_REQUIRED','MODEL_WORKER_PROTOCOL','SCHEMA_INVALID',
+                                  'MODEL_IDENTITY_LIMIT'])
+def test_integrity_and_control_errors_are_never_isolated(tmp_path,monkeypatch,code):
+    monkeypatch.setenv('TRACE_ANNOTATE_CLIP_CACHE',str(tmp_path/'empty-clip'))
+    monkeypatch.setenv('TRACE_ANNOTATE_VLM_CACHE',str(tmp_path/'empty-vlm'))
+    config=M.configuration()
+    images=[{'frame_index':'0','path':'frame.png','sha256':'a'*64}]
+    def fatal(*args,**kwargs):
+        raise WorkspaceError(code,'fatal boundary')
+    monkeypatch.setattr(M,'run_phase',fatal)
+    with pytest.raises(WorkspaceError) as failure:
+        V._run_isolated_model_phase('clip',config,images,tmp_path,'tmp/vision/test',cancelled=lambda:False)
+    assert failure.value.code==code
 
 
 def test_old_frozen_jobs_validate_but_cannot_silently_execute_new_policy(store):
@@ -249,7 +430,8 @@ def test_completed_pre_resource_candidate_keeps_read_and_apply_paths(store,monke
 def test_parent_checks_exact_worker_checkpoint_and_revision(tmp_path,monkeypatch):
     monkeypatch.setenv('TRACE_ANNOTATE_CLIP_CACHE',str(tmp_path/'clip'))
     monkeypatch.setenv('TRACE_ANNOTATE_VLM_CACHE',str(tmp_path/'vlm'))
-    checkpoint=tmp_path/'clip/models--example/snapshots/exact/weights.bin'
+    checkpoint=tmp_path/(
+        'clip/models--timm--vit_base_patch32_clip_224.openai/snapshots/exact/weights.bin')
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b'exact immutable checkpoint')
     config=M.configuration()
@@ -335,6 +517,7 @@ def test_server_close_reports_vision_owner_and_preserves_store_until_actual_exit
     # no optional model construction is needed for this lifecycle boundary.
     monkeypatch.setattr(V.VisionJobs,'start',lambda self:self)
     monkeypatch.setattr(V.VisionJobs,'_load_extractors',lambda self,thresholds:None)
+    monkeypatch.setattr(V,'_validate_loaded_deployment',lambda extractors,deployment:None)
     server=HTTP.make_server(store)
     assert server.analysis_jobs.close(timeout=5)["stopped"]
     assert server.render_jobs.close(timeout=5)["stopped"]

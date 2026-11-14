@@ -138,6 +138,8 @@ def test_model_run_status_semantics():
         SS.validate_model_run(dict(base, failure_reason="boom"))
     assert SS.validate_model_run(dict(base, status="not_run", output_sha256=None,
                                       failure_reason="weights missing"))["status"] == "not_run"
+    with pytest.raises(SchemaInvalid):
+        SS.validate_model_run(dict(base, status="partial"))
 
 
 def test_review_decision_binds_its_content_hash():

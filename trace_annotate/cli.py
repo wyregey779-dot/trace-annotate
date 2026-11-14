@@ -37,6 +37,21 @@ from trace_annotate.embodied.quality_io import (
 from trace_annotate.embodied.validator import validate_embodied_doc
 
 
+def _configure_standard_streams() -> None:
+    """Make the CLI byte contract independent of the Windows active code page.
+
+    Installed entry points and ``python -c`` invocations can inherit a legacy
+    console encoding (for example CP936).  Machine-readable JSON and paths are
+    part of the public CLI output, so emit UTF-8 whenever the interpreter owns
+    a reconfigurable text stream.  Test/application supplied streams such as
+    ``io.StringIO`` intentionally remain untouched.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+
+
 def cmd_asset_verify(args: argparse.Namespace) -> None:
     """Verify an asset annotation file."""
     if not os.path.exists(args.file):
@@ -209,6 +224,7 @@ def cmd_embodied_motion(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    _configure_standard_streams()
     parser = argparse.ArgumentParser(
         prog="trace-annotate",
         description="Local media review and temporal video annotation tools."

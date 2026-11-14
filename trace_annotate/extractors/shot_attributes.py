@@ -13,6 +13,7 @@ Geometry rule (subject extent divided by frame height):
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional, Sequence
 
 FRAMING_CLASSES = ("远景", "全景", "中景", "近景", "特写",
@@ -39,19 +40,45 @@ def classify_framing(boxes: Sequence[Sequence[float]], frame_size: Sequence[int]
     if len(frame_size) < 2:
         raise ValueError("frame_size must be (width, height)")
     frame_width, frame_height = int(frame_size[0]), int(frame_size[1])
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError("frame_size must contain positive dimensions")
+    non_live_kinds = {"screen_person", "screen_face", "statue", "illustration",
+                      "statue_face", "artifact_face"}
+    if subject_kind in non_live_kinds:
+        return {"framing": "不适用", "reason": f"{subject_kind}不是现场人物景别主体",
+                "confidence": 0.0, "subjects": len(boxes),
+                "uncertainty": "可按素材内容另行标注，但不能作为现场人物景别"}
+    if subject_kind not in {"person", "face"}:
+        return {"framing": "不确定", "reason": "主体类型未登记，不能套用人物景别规则",
+                "confidence": 0.0, "subjects": len(boxes),
+                "uncertainty": f"unsupported subject_kind={subject_kind}"}
     if not boxes:
         return {"framing": "不适用", "reason": "画面内没有可用主体框",
                 "confidence": 0.0, "subjects": 0,
                 "uncertainty": "未检测到主体不等于画面中不存在主体"}
     measured: List[Dict[str, Any]] = []
     for box in boxes:
+        if len(box) != 4:
+            continue
         x1, y1, x2, y2 = [float(value) for value in box]
-        height = max(0.0, y2 - y1)
+        if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+            continue
+        if x2 <= x1 or y2 <= y1 or x2 <= 0 or y2 <= 0 or x1 >= frame_width or y1 >= frame_height:
+            continue
+        visible = (max(0.0, x1), max(0.0, y1),
+                   min(float(frame_width), x2), min(float(frame_height), y2))
+        height = max(0.0, visible[3] - visible[1])
         ratio = height / float(frame_height) if frame_height else 0.0
         measured.append({"box": [round(value, 1) for value in (x1, y1, x2, y2)],
+                         "visible_box": [round(value, 1) for value in visible],
                          "height_ratio": round(ratio, 3),
                          "framing": _band(ratio),
                          "clipped": _clipped((x1, y1, x2, y2), frame_width, frame_height)})
+    if not measured:
+        return {"framing": "不确定", "reason": "主体框无效或完全位于画面外",
+                "confidence": 0.0, "subjects": len(boxes),
+                "uncertainty": "无可用于人物景别测量的有效可见框",
+                "subject_kind": subject_kind}
     distinct = sorted({item["framing"] for item in measured})
     if len(distinct) > 1:
         return {"framing": "多主体不一致", "subjects": len(measured),
