@@ -28,9 +28,11 @@ An action claim identifies this contract with `method.parameters.action_contract
 The built-in `subject-translation-v1` provider covers only `走` and `跑`. It measures sampled person-box translation and produces review candidates, not confirmed actions or persistent human identities. The five object-interaction classes have no local provider and therefore return `status=not_run`, `reason=provider_unavailable`, and no candidate. A supported class that ran but did not cross its declared threshold returns `status=unknown`, `reason=no_candidate_met_threshold`.
 
 The optional pinned `videomae-small-ssv2-aux-v1` provider is a different
-contract. For each scene with at least sixteen registered decoded content
-samples, it classifies one canonical uniformly selected sixteen-frame window in
-an owned, cancellable subprocess. Only `close`, `open`, `pick_up` and
+contract. Under the default v1 sampling policy, each scene with at least
+sixteen registered decoded content samples has one canonical uniformly selected
+sixteen-frame window classified in an owned, cancellable subprocess. The opt-in
+v2 local-window policy below has a separate bounded coverage contract. Under
+either policy, only `close`, `open`, `pick_up` and
 `put_down_surface` may be projected, and only as an `unspecified`, unreviewed
 `videomae-window-hint-v1` claim. The claim keeps `subject_ref`, `object_ref` and
 `recipient_ref` null and does not set `action_contract`; therefore it cannot
@@ -45,6 +47,40 @@ three durable preview artifacts, the pinned model/config/preprocessor hashes,
 implementation fingerprint and a path-redacted owned-process receipt. Legacy
 candidates whose frozen job configuration predates this module remain readable,
 but they may not carry an undeclared auxiliary sampling object or model run.
+
+The default `videomae-window-sampling-v1` policy above is unchanged. New jobs may
+opt into the experimental `videomae-window-sampling-v2` policy by setting
+`TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY=per_scene_local_decoded_content_windows_v2`
+before submission. The policy is frozen into the job identity and the model-run
+record. It partitions existing decoded content samples into local sixteen-frame
+windows, admits only windows whose adjacent sampled PTS are at most 0.5 seconds
+apart and whose endpoint span is at most 8 seconds, and executes at most eight
+windows across the job within a 300-second phase budget. These are conservative
+engineering limits, **not** evidence that the windows match VideoMAE's training
+distribution or that action recognition accuracy is known. It does not decode
+additional frames; an event absent from the upstream content samples cannot be
+recovered. A long single shot with sparse samples can have zero eligible windows.
+The v2 staging gate admits at most 128 MiB of decoded input per window and
+512 MiB across worker calls, while preserving at least 512 MiB of free disk
+before each call; an exhausted gate is reported as `not_run` for that window.
+`verified_success_input_bytes` counts only successful worker results. The
+validator recalculates every such result from its sixteen verified uint8 BGR
+frame shapes and requires equality with the worker's `total_input_bytes` and
+the aggregate success count. A failed worker may have staged input without a
+successful window receipt; the runtime still charges those bytes to the
+512 MiB staging gate, but they are not misreported as verified successes.
+The 300-second phase deadline is checked around each frame load and passed into
+the owned worker's cancellation callback. A single blocking frame read cannot
+be interrupted in the middle; the next frame is not read after the deadline.
+The result records exact selected frame/PTS/hash identities, omitted window
+envelopes with reasons, and intervals outside successful window envelopes.
+An envelope is only the first-to-last sampled PTS, never continuous observation:
+the time between decoded frames remains unobserved. A failed, cancelled,
+unavailable, over-budget or skipped window yields no successful hint. The v2
+sampling contract leaves the `videomae-window-hint-v1` authority and its
+`unspecified`/unreviewed export unchanged; it never produces an
+`action-candidate-v3` interaction fact. Historic v1 results retain their exact
+original validation and projection behavior.
 
 Every vision action candidate binds its source frames, reduced PTS values, exact decoded-sample SHA-256 values, provider id and action model-run id. On import, each referenced sample is rehashed before a compact immutable preview is projected. The complete semantic document is validated against the projected content-addressed artifact ids before those objects are published.
 

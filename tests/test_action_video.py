@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -18,7 +19,9 @@ import pytest
 
 from trace_annotate.extractors import action_video as A
 from trace_annotate.workspace import vision_jobs as V
+from trace_annotate.workspace import schema as S
 from trace_annotate.workspace.errors import WorkspaceError
+from trace_annotate.workspace.store import WorkspaceStore
 
 
 def labels():
@@ -46,6 +49,15 @@ def samples():
     return values
 
 
+def long_scene_samples(scene_index=0, *, count=96, step=Fraction(1, 4)):
+    return [{"scene_index": scene_index, "frame_index": str(index),
+             "pts": S.rational(Fraction(index) * step),
+             "seconds": S.rational(Fraction(index) * step),
+             "evidence_sha256": f"{scene_index * 1000 + index:064x}",
+             "path": f"unused-{scene_index}-{index}.npy"}
+            for index in range(count)]
+
+
 def test_workspace_model_deployment_distinguishes_missing_from_tampered(tmp_path):
     missing_root = tmp_path / "missing-model"
     missing = V._action_video_configuration(str(missing_root))
@@ -61,6 +73,423 @@ def test_workspace_model_deployment_distinguishes_missing_from_tampered(tmp_path
     assert invalid["status"] == "invalid"
     assert invalid["reason"] == "unverified_video_action_model_identity"
     assert V._validate_action_video_configuration(invalid) == invalid
+
+
+def test_local_window_policy_is_explicit_opt_in_and_versioned(monkeypatch, tmp_path):
+    monkeypatch.delenv("TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY", raising=False)
+    root = str(tmp_path / "missing")
+    default = V._action_video_configuration(root)
+    assert default["contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT
+    assert default["window_policy"] == V.ACTION_VIDEO_WINDOW_POLICY_V1
+    monkeypatch.setenv("TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY",
+                       V.ACTION_VIDEO_WINDOW_POLICY_V2)
+    v2 = V._action_video_configuration(root)
+    assert v2["contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V2
+    assert v2["window_policy"] == V.ACTION_VIDEO_WINDOW_POLICY_V2
+    assert V._validate_action_video_configuration(v2) == v2
+    incompatible = dict(v2, contract=V.ACTION_VIDEO_EVIDENCE_CONTRACT)
+    with pytest.raises(Exception):
+        V._validate_action_video_configuration(incompatible)
+    monkeypatch.setenv("TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY", "unsupported")
+    with pytest.raises(Exception):
+        V._action_video_configuration(root)
+
+
+def test_local_windows_find_sampled_short_interval_that_uniform_v1_skips():
+    scene = {"start": 0.0, "end": 24.0, "duration": 24.0}
+    frames = long_scene_samples()
+    old_frames = {int(item["frame_index"])
+                  for item in V._select_action_video_frames(frames)}
+    assert {17, 18}.isdisjoint(old_frames)
+    plan = V._action_video_v2_plan({0: frames}, [scene], None)
+    selected_frames = {int(item["frame_index"])
+                       for _, selected, _ in plan["planned"] for item in selected}
+    assert {17, 18} <= selected_frames
+    assert len(plan["planned"]) == 6
+    windows = [{"scene_index": index, "input": descriptor,
+                "status": "success", "result": {}}
+               for index, _, descriptor in plan["planned"]]
+    coverage = V._action_video_v2_coverage(plan, windows, {0: frames})[0]
+    assert coverage["successful_windows"] == 6
+    assert coverage["observation_scope"].endswith("envelopes_not_continuous")
+    assert coverage["uncovered_intervals"][-1]["window_pts"]["end"] == S.rational(24)
+
+
+def test_sparse_frames_are_an_explicit_unknown_not_an_action_absence():
+    scene = {"start": 0.0, "end": 480.0, "duration": 480.0}
+    frames = long_scene_samples(step=5)
+    plan = V._action_video_v2_plan({0: frames}, [scene], None)
+    assert plan["planned"] == []
+    assert plan["ineligible_scenes"] == [0]
+    assert {item["reason"] for item in plan["omitted"][0]} == {
+        "decoded_sample_gap_exceeds_limit"}
+    coverage = V._action_video_v2_coverage(plan, [], {0: frames})[0]
+    assert coverage["successful_windows"] == 0
+    assert coverage["uncovered_intervals"] == [{
+        "window_pts": {"start": S.rational(0), "end": S.rational(480)},
+        "reason": "outside_successful_window_envelopes"}]
+
+
+def test_two_minute_single_shot_is_not_claimed_from_ninety_six_sparse_frames():
+    scene = {"start": 0.0, "end": 120.0, "duration": 120.0}
+    frames = long_scene_samples(step=Fraction(5, 4))
+    plan = V._action_video_v2_plan({0: frames}, [scene], None)
+    assert plan["planned"] == []
+    assert plan["ineligible_scenes"] == [0]
+    assert all(item["reason"] == "decoded_sample_gap_exceeds_limit"
+               for item in plan["omitted"][0])
+
+
+def test_global_window_budget_spreads_work_and_discloses_omitted_intervals():
+    scenes = [{"start": float(index * 24), "end": float((index + 1) * 24),
+               "duration": 24.0} for index in range(3)]
+    inputs = {index: [{**item,
+                      "pts": S.rational(Fraction(index * 24) + Fraction(int(item["frame_index"]), 4)),
+                      "seconds": S.rational(Fraction(index * 24) + Fraction(int(item["frame_index"]), 4))}
+                      for item in long_scene_samples(index)] for index in range(3)}
+    plan = V._action_video_v2_plan(inputs, scenes, None)
+    assert len(plan["planned"]) == V.ACTION_VIDEO_V2_MAX_WINDOWS
+    assert {index for index, _, _ in plan["planned"]} == {0, 1, 2}
+    assert sum(len(items) for items in plan["omitted"].values()) == 10
+    assert {item["reason"] for items in plan["omitted"].values()
+            for item in items} == {"global_window_budget"}
+
+
+def test_v2_unavailable_and_v1_legacy_model_runs_are_bound_and_tamper_rejected(tmp_path):
+    scenes = [{"start": 0.0, "end": 100.0, "duration": 100.0}]
+    frames = long_scene_samples()
+    digest = "a" * 64
+    for policy, expected_contract in ((V.ACTION_VIDEO_WINDOW_POLICY_V1,
+                                       V.ACTION_VIDEO_EVIDENCE_CONTRACT),
+                                      (V.ACTION_VIDEO_WINDOW_POLICY_V2,
+                                       V.ACTION_VIDEO_EVIDENCE_CONTRACT_V2)):
+        config = V._action_video_configuration(
+            str(tmp_path / "missing"), window_policy=policy)
+        sampling = V._run_action_video_sampling(
+            config, None, {0: frames}, tmp_path / policy,
+            scenes=scenes, requested=None, cancelled=lambda: False)
+        run = V._action_video_model_run("job-action-test", digest, None, sampling, config)
+        assert run["parameters"]["contract"] == expected_contract
+        assert sampling["contract"] == expected_contract
+        V._validate_action_video_sampling(
+            sampling, configuration=config, scenes=scenes, content_frames=frames,
+            evidence_hashes={item["evidence_sha256"] for item in frames},
+            model_runs=[run], job_id="job-action-test", digest=digest, window=None)
+        if policy == V.ACTION_VIDEO_WINDOW_POLICY_V2:
+            changed = json.loads(json.dumps(sampling))
+            changed["coverage"][0]["uncovered_intervals"] = []
+            with pytest.raises(WorkspaceError) as exc:
+                V._validate_action_video_sampling(
+                    changed, configuration=config, scenes=scenes, content_frames=frames,
+                    evidence_hashes={item["evidence_sha256"] for item in frames},
+                    model_runs=[run], job_id="job-action-test", digest=digest,
+                    window=None)
+            assert exc.value.code == "RECOVERY_REQUIRED"
+
+
+def test_v2_export_is_only_an_unreviewed_unspecified_window_hint():
+    frames = long_scene_samples(count=16)
+    descriptor = V._action_video_input(frames)
+    candidate = {
+        "job_id": "job-action-export", "processor_version": V.VERSION,
+        "action_video_sampling": {
+            "contract": V.ACTION_VIDEO_EVIDENCE_CONTRACT_V2,
+            "supported_hints": ["close", "open", "pick_up", "put_down_surface"],
+            "unsupported_actions": list(A.UNSUPPORTED_ACTIONS),
+            "windows": [{"scene_index": 0, "input": descriptor,
+                         "status": "success", "result": {
+                             "decision": "auxiliary_candidate",
+                             "authority": "auxiliary_window_semantics_only",
+                             "subject_ref": None, "object_ref": None,
+                             "recipient_ref": None,
+                             "semantic_hints": ["pick_up"],
+                             "ranked": [{"score": 0.7, "class_id": 47,
+                                         "label": "Picking something up"}],
+                             "score_kind": "softmax_score_uncalibrated",
+                             "review_status": "unreviewed",
+                             "uncertainty": "Only a sampled window hint."}}],
+        },
+    }
+    scene = {"start": 0.0, "end": 16.0, "duration": 16.0}
+    keyframe = {"frame_index": "0", "source_pts": S.rational(0), "roles": []}
+    exported = V._candidate_claims(candidate, 0, scene, S.rational(0),
+                                   S.rational(16), keyframe)
+    hint = next(claim for claim in exported["claims"]
+                if claim["method"]["id"] == A.PROVIDER)
+    params = hint["method"]["parameters"]
+    assert hint["claim_type"] == "unspecified"
+    assert hint["subject_ref"] is None and hint["object_ref"] is None
+    assert hint["recipient_ref"] is None
+    assert "action_contract" not in params
+    assert params["sampling_contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V2
+    assert params["window_policy"] == V.ACTION_VIDEO_WINDOW_POLICY_V2
+    assert hint["model_run_id"] == V._module_run_id(candidate["job_id"], "action_video")
+
+
+def test_v2_cancel_after_one_window_does_not_publish_partial_result(
+        monkeypatch, tmp_path):
+    from trace_annotate.workspace import resource_budget
+    config = V._action_video_configuration(
+        str(tmp_path / "missing"), window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V2)
+    config["status"], config["reason"] = "available", None
+    monkeypatch.setattr(V, "_validate_action_video_configuration", lambda value: value)
+    monkeypatch.setattr(resource_budget, "policy", lambda: {"phase_seconds": 30.0})
+    monkeypatch.setattr(V, "_load_frame", lambda path: np.zeros((8, 12, 3), dtype=np.uint8))
+    calls = {"count": 0}
+
+    def one_window(*args, **kwargs):
+        calls["count"] += 1
+        return {"status": "success", "reason": "top_class_outside_supported_auxiliary_mapping",
+                "decision": "unknown", "semantic_hints": [], "ranked": [],
+                "review_status": "unreviewed", "authority": "auxiliary_window_semantics_only"}
+
+    monkeypatch.setattr(A, "analyze_window_isolated", one_window)
+    with pytest.raises(WorkspaceError) as exc:
+        V._run_action_video_sampling(
+            config, str(tmp_path / "fake-model"), {0: long_scene_samples()},
+            tmp_path / "cancel", scenes=[{"start": 0.0, "end": 100.0,
+                                           "duration": 100.0}], requested=None,
+            cancelled=lambda: calls["count"] > 0)
+    assert exc.value.code == "CANCELLED"
+    assert calls["count"] == 1
+
+
+def test_v2_phase_budget_skips_remaining_windows_without_running_a_model(
+        monkeypatch, tmp_path):
+    from trace_annotate.workspace import resource_budget
+    config = V._action_video_configuration(
+        str(tmp_path / "missing"), window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V2)
+    config["status"], config["reason"] = "available", None
+    monkeypatch.setattr(V, "_validate_action_video_configuration", lambda value: value)
+    monkeypatch.setattr(resource_budget, "policy", lambda: {"phase_seconds": 30.0})
+    clock = {"first": True}
+
+    def now():
+        if clock["first"]:
+            clock["first"] = False
+            return 0.0
+        return 301.0
+
+    monkeypatch.setattr(V, "time", types.SimpleNamespace(monotonic=now))
+    monkeypatch.setattr(V, "_load_frame", lambda path: pytest.fail("frame loaded after deadline"))
+    monkeypatch.setattr(A, "analyze_window_isolated",
+                        lambda *args, **kwargs: pytest.fail("model run after deadline"))
+    result = V._run_action_video_sampling(
+        config, str(tmp_path / "fake-model"), {0: long_scene_samples()},
+        tmp_path / "phase-budget", scenes=[{"start": 0.0, "end": 24.0,
+                                             "duration": 24.0}], requested=None,
+        cancelled=lambda: False)
+    assert result["status"] == "not_run"
+    assert result["reason"] == "video_action_phase_budget_exhausted"
+    assert result["processed_windows"] == 0
+    assert all(item["status"] == "not_run" and item["result"] is None
+               for item in result["windows"])
+    assert result["coverage"][0]["uncovered_intervals"]
+
+
+def test_v2_phase_deadline_reaches_owned_worker_cancellation(monkeypatch, tmp_path):
+    from trace_annotate.workspace import resource_budget
+    config = V._action_video_configuration(
+        str(tmp_path / "missing"), window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V2)
+    config["status"], config["reason"] = "available", None
+    monkeypatch.setattr(V, "_validate_action_video_configuration", lambda value: value)
+    monkeypatch.setattr(resource_budget, "policy", lambda: {"phase_seconds": 30.0})
+    monkeypatch.setattr(V, "_load_frame", lambda path: np.zeros((8, 12, 3), dtype=np.uint8))
+    clock = {"now": 0.0, "calls": 0}
+    monkeypatch.setattr(V, "time", types.SimpleNamespace(monotonic=lambda: clock["now"]))
+
+    def fake_owned(*args, **kwargs):
+        clock["calls"] += 1
+        clock["now"] = 301.0
+        assert kwargs["cancelled"]() is True
+        raise WorkspaceError("CANCELLED", "phase deadline reached")
+
+    monkeypatch.setattr(A, "analyze_window_isolated", fake_owned)
+    result = V._run_action_video_sampling(
+        config, str(tmp_path / "fake-model"), {0: long_scene_samples()},
+        tmp_path / "deadline-inside-worker", scenes=[{"start": 0.0, "end": 24.0,
+                                                        "duration": 24.0}], requested=None,
+        cancelled=lambda: False)
+    assert clock["calls"] == 1
+    assert result["status"] == "not_run"
+    assert all(item["reason"] == "video_action_phase_budget_exhausted"
+               for item in result["windows"])
+
+
+def test_v2_slow_frame_load_stops_before_reading_another_frame(monkeypatch, tmp_path):
+    from trace_annotate.workspace import resource_budget
+    config = V._action_video_configuration(
+        str(tmp_path / "missing"), window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V2)
+    config["status"], config["reason"] = "available", None
+    monkeypatch.setattr(V, "_validate_action_video_configuration", lambda value: value)
+    monkeypatch.setattr(resource_budget, "policy", lambda: {"phase_seconds": 30.0})
+    clock = {"now": 0.0, "reads": 0}
+    monkeypatch.setattr(V, "time", types.SimpleNamespace(monotonic=lambda: clock["now"]))
+
+    def slow_load(path):
+        clock["reads"] += 1
+        clock["now"] = 301.0
+        return np.zeros((8, 12, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(V, "_load_frame", slow_load)
+    monkeypatch.setattr(A, "analyze_window_isolated",
+                        lambda *args, **kwargs: pytest.fail("expired load reached model"))
+    result = V._run_action_video_sampling(
+        config, str(tmp_path / "fake-model"), {0: long_scene_samples()},
+        tmp_path / "slow-frame", scenes=[{"start": 0.0, "end": 24.0,
+                                           "duration": 24.0}], requested=None,
+        cancelled=lambda: False)
+    assert clock["reads"] == 1
+    assert result["status"] == "not_run"
+    assert all(item["reason"] == "video_action_phase_budget_exhausted"
+               for item in result["windows"])
+
+
+@pytest.mark.parametrize("limit", ["window_bytes", "disk_reserve"])
+def test_v2_resource_gate_skips_without_staging_or_model_execution(
+        monkeypatch, tmp_path, limit):
+    from trace_annotate.workspace import resource_budget
+    config = V._action_video_configuration(
+        str(tmp_path / "missing"), window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V2)
+    config["status"], config["reason"] = "available", None
+    monkeypatch.setattr(V, "_validate_action_video_configuration", lambda value: value)
+    monkeypatch.setattr(resource_budget, "policy", lambda: {"phase_seconds": 30.0})
+    if limit == "window_bytes":
+        monkeypatch.setattr(V, "_load_frame", lambda path:
+                            types.SimpleNamespace(nbytes=V.ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES + 1))
+        reason = "video_action_window_byte_budget_exhausted"
+    else:
+        monkeypatch.setattr(V, "_load_frame", lambda path: np.zeros((8, 12, 3), dtype=np.uint8))
+        monkeypatch.setattr(V.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=0))
+        reason = "video_action_disk_reserve_unavailable"
+    monkeypatch.setattr(A, "analyze_window_isolated",
+                        lambda *args, **kwargs: pytest.fail("resource gate reached model"))
+    result = V._run_action_video_sampling(
+        config, str(tmp_path / "fake-model"), {0: long_scene_samples()},
+        tmp_path / limit, scenes=[{"start": 0.0, "end": 24.0,
+                                   "duration": 24.0}], requested=None,
+        cancelled=lambda: False)
+    assert result["status"] == "not_run" and result["reason"] == reason
+    assert result["verified_success_input_bytes"] == 0
+    assert all(item["reason"] == reason and item["result"] is None
+               for item in result["windows"])
+
+
+@pytest.mark.parametrize("mutation", ["global_bytes", "worker_bytes", "channels",
+                                      "window_limit"])
+def test_v2_recomputes_success_byte_receipts_before_accepting_model_run(
+        monkeypatch, tmp_path, mutation):
+    from trace_annotate.workspace import resource_budget
+    config = V._action_video_configuration(
+        str(tmp_path / "missing"), window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V2)
+    config["status"], config["reason"] = "available", None
+    monkeypatch.setattr(V, "_validate_action_video_configuration", lambda value: value)
+    monkeypatch.setattr(resource_budget, "policy", lambda: {"phase_seconds": 30.0})
+    monkeypatch.setattr(V, "_load_frame", lambda path: np.zeros((8, 12, 3), dtype=np.uint8))
+
+    def fake_owned(model_path, worker_samples, work, **kwargs):
+        _, identity = A._window(worker_samples, cancelled=None)
+        request = {"window": {key: identity[key] for key in (
+                       "start_frame", "end_frame", "window_pts", "scene_index",
+                       "total_input_bytes")}, "frames": identity["frames"]}
+        result = _worker_success(request, actual_pid=222, actual_parent_pid=111)["result"]
+        result["execution"] = {
+            "contract": A.ISOLATED_CONTRACT, "status": "completed",
+            "request_sha256": "b" * 64, "parent_pid": 111, "wrapper_pid": 222,
+            "actual_pid": 222, "actual_parent_pid": 111,
+            "peak_working_set_bytes": 1024, "actual_exit_code": 0,
+            "elapsed_seconds": 0.1, "error_code": None,
+        }
+        return result
+
+    monkeypatch.setattr(A, "analyze_window_isolated", fake_owned)
+    frames = long_scene_samples()
+    scenes = [{"start": 0.0, "end": 24.0, "duration": 24.0}]
+    sampling = V._run_action_video_sampling(
+        config, str(tmp_path / "fake-model"), {0: frames}, tmp_path / "success",
+        scenes=scenes, requested=None, cancelled=lambda: False)
+    assert sampling["status"] == "success"
+    assert sampling["verified_success_input_bytes"] == 6 * 16 * 8 * 12 * 3
+    digest = "a" * 64
+    run = V._action_video_model_run("job-byte-proof", digest, None, sampling, config)
+
+    def validate(value):
+        current_run = V._action_video_model_run(
+            "job-byte-proof", digest, None, value, config)
+        V._validate_action_video_sampling(
+            value, configuration=config, scenes=scenes, content_frames=frames,
+            evidence_hashes={item["evidence_sha256"] for item in frames},
+            model_runs=[current_run], job_id="job-byte-proof", digest=digest,
+            window=None)
+
+    assert run["parameters"]["contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V2
+    validate(sampling)
+    changed = json.loads(json.dumps(sampling))
+    if mutation == "global_bytes":
+        changed["verified_success_input_bytes"] += 1
+    elif mutation == "worker_bytes":
+        changed["windows"][0]["result"]["window"]["total_input_bytes"] += 1
+    elif mutation == "channels":
+        changed["windows"][0]["result"]["window"]["frames"][0]["shape"][2] = 4
+    else:
+        for frame in changed["windows"][0]["result"]["window"]["frames"]:
+            frame["shape"] = [2000, 2000, 3]
+        changed["windows"][0]["result"]["window"]["total_input_bytes"] = 16 * 2000 * 2000 * 3
+        changed["verified_success_input_bytes"] += (16 * 2000 * 2000 * 3) - (16 * 8 * 12 * 3)
+    with pytest.raises(WorkspaceError) as exc:
+        validate(changed)
+    assert exc.value.code == "RECOVERY_REQUIRED"
+
+
+def test_v2_real_video_job_preserves_unreviewed_contract_without_model(
+        monkeypatch, tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for the real media boundary")
+    source = tmp_path / "dense-single-shot.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi",
+                    "-i", "color=blue:s=64x64:r=30:d=6", "-an", "-c:v",
+                    "libx264", "-pix_fmt", "yuv420p", str(source)],
+                   check=True, capture_output=True, timeout=60)
+    store = WorkspaceStore(tmp_path / "workspace")
+    store.create()
+    store.import_source(source)
+    monkeypatch.setenv("TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY",
+                       V.ACTION_VIDEO_WINDOW_POLICY_V2)
+    jobs = V.VisionJobs(store, person_model_path="", landmark_model_path="",
+                        landmark_python="", face_model_path="missing",
+                        clip_model_path="missing", vlm_model_path="missing",
+                        action_video_model_path=str(tmp_path / "missing-videomae"))
+
+    def unavailable(thresholds):
+        jobs._extractors = {name: None for name in
+                            ("face", "person", "ocr", "clip", "vlm")}
+
+    monkeypatch.setattr(jobs, "_load_extractors", unavailable)
+    try:
+        task = store.get_task(store.list_tasks()[0]["task_id"])
+        batch = jobs.submit(task["id"], command_id="v2-real-media",
+                            expected_revision=task["revision"],
+                            expected_sha256=task["content_sha256"])
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        candidate = jobs.result(batch["jobs"][0]["id"])
+        sampling = candidate["action_video_sampling"]
+        assert sampling["contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V2
+        assert sampling["status"] == "not_run"
+        assert sampling["windows"]
+        assert sampling["processed_windows"] == 0
+        assert sampling["coverage"][0]["uncovered_intervals"]
+        run = next(item for item in candidate["model_runs"]
+                   if item["id"] == V._module_run_id(candidate["job_id"], "action_video"))
+        assert run["parameters"]["contract"] == sampling["contract"]
+        saved = jobs.apply(batch["jobs"][0]["id"], command_id="v2-apply",
+                           expected_revision=task["revision"],
+                           expected_sha256=task["content_sha256"], request_body=b"{}")
+        assert saved["applied"] is True
+        assert all(item["review_status"] == "unreviewed"
+                   for item in store.get_task(task["id"])["annotations"])
+    finally:
+        jobs.close()
+        store.close()
 
 
 def test_workspace_window_input_accepts_persisted_content_pts_name():

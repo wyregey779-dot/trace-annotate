@@ -100,8 +100,18 @@ CONTENT_EVIDENCE_CONTRACT = "decoded-content-adaptive-v2"
 OBJECT_EVIDENCE_CONTRACT = "sparse-object-relations-v1"
 HAND_EVIDENCE_CONTRACT = "hand-landmark-observation-v1"
 ACTION_VIDEO_EVIDENCE_CONTRACT = "videomae-window-sampling-v1"
+ACTION_VIDEO_EVIDENCE_CONTRACT_V2 = "videomae-window-sampling-v2"
 ACTION_VIDEO_HINT_CONTRACT = "videomae-window-hint-v1"
 ACTION_VIDEO_TOP_K = 5
+ACTION_VIDEO_WINDOW_POLICY_V1 = "per_scene_uniform_decoded_content_samples_v1"
+ACTION_VIDEO_WINDOW_POLICY_V2 = "per_scene_local_decoded_content_windows_v2"
+ACTION_VIDEO_V2_MAX_WINDOWS = 8
+ACTION_VIDEO_V2_MAX_WINDOW_SECONDS = 8.0
+ACTION_VIDEO_V2_MAX_SAMPLE_GAP_SECONDS = 0.5
+ACTION_VIDEO_V2_PHASE_SECONDS = 300.0
+ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES = 128 * 1024 * 1024
+ACTION_VIDEO_V2_STAGING_BUDGET_BYTES = 512 * 1024 * 1024
+ACTION_VIDEO_V2_DISK_RESERVE_BYTES = 512 * 1024 * 1024
 HAND_UNSUPPORTED_ASSERTIONS = (
     "touch", "grasp", "held_by", "pick_up", "put_down", "open", "close", "hand_over")
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -263,13 +273,18 @@ def _hand_configuration(model_path: Optional[str]) -> Dict[str, Any]:
     }
 
 
-def _action_video_configuration(model_path: Optional[str]) -> Dict[str, Any]:
+def _action_video_configuration(model_path: Optional[str], *,
+                                window_policy: Optional[str] = None) -> Dict[str, Any]:
     """Freeze the exact optional VideoMAE directory without loading a runtime.
 
     The path itself never leaves the local job identity.  Its identity hash and
     the three immutable files are enough to detect path replacement, model
     replacement and config/label-table replacement before a worker is started.
     """
+    policy = (window_policy or os.getenv("TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY")
+              or ACTION_VIDEO_WINDOW_POLICY_V1)
+    if policy not in {ACTION_VIDEO_WINDOW_POLICY_V1, ACTION_VIDEO_WINDOW_POLICY_V2}:
+        raise SchemaInvalid("SCHEMA_INVALID", "Unsupported video-action window policy")
     root = Path(model_path).resolve(strict=False) if model_path else None
     files = []
     for role, name in (("weights", AV.WEIGHTS_FILE), ("config", "config.json"),
@@ -302,7 +317,9 @@ def _action_video_configuration(model_path: Optional[str]) -> Dict[str, Any]:
     reason = (None if exact else "video_action_weights_unavailable" if missing
               else "unverified_video_action_model_identity")
     return {
-        "contract": ACTION_VIDEO_EVIDENCE_CONTRACT,
+        "contract": (ACTION_VIDEO_EVIDENCE_CONTRACT_V2
+                     if policy == ACTION_VIDEO_WINDOW_POLICY_V2
+                     else ACTION_VIDEO_EVIDENCE_CONTRACT),
         "provider": AV.PROVIDER,
         "status": status,
         "reason": reason,
@@ -320,7 +337,7 @@ def _action_video_configuration(model_path: Optional[str]) -> Dict[str, Any]:
         "local_files_only": True,
         "num_frames": AV.NUM_FRAMES,
         "top_k": ACTION_VIDEO_TOP_K,
-        "window_policy": "per_scene_uniform_decoded_content_samples_v1",
+        "window_policy": policy,
         "authority": "auxiliary_window_semantics_only",
         "review_status": "unreviewed",
         "score_kind": "softmax_score_uncalibrated",
@@ -339,7 +356,9 @@ def _validate_action_video_configuration(value: Any) -> Dict[str, Any]:
         "supported_hints", "unsupported_actions",
     }
     if (not isinstance(value, dict) or set(value) != expected_fields
-            or value["contract"] != ACTION_VIDEO_EVIDENCE_CONTRACT
+            or (value["contract"], value["window_policy"]) not in {
+                (ACTION_VIDEO_EVIDENCE_CONTRACT, ACTION_VIDEO_WINDOW_POLICY_V1),
+                (ACTION_VIDEO_EVIDENCE_CONTRACT_V2, ACTION_VIDEO_WINDOW_POLICY_V2)}
             or value["provider"] != AV.PROVIDER
             or value["status"] not in {"available", "unavailable", "invalid"}
             or value["reason"] not in {None, "video_action_weights_unavailable",
@@ -347,7 +366,6 @@ def _validate_action_video_configuration(value: Any) -> Dict[str, Any]:
             or value["local_files_only"] is not True
             or value["num_frames"] != AV.NUM_FRAMES
             or value["top_k"] != ACTION_VIDEO_TOP_K
-            or value["window_policy"] != "per_scene_uniform_decoded_content_samples_v1"
             or value["authority"] != "auxiliary_window_semantics_only"
             or value["review_status"] != "unreviewed"
             or value["score_kind"] != "softmax_score_uncalibrated"
@@ -1178,6 +1196,109 @@ def _action_video_input(selected: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "frames": frames}
 
 
+def _action_video_v2_scene_window(scene: Dict[str, Any],
+                                  requested: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    start = S.rational_value(_seconds_ratio(float(scene["start"])))
+    end = S.rational_value(_seconds_ratio(float(scene["end"])))
+    if requested is not None:
+        start = max(start, S.rational_value(requested["start"]))
+        end = min(end, S.rational_value(requested["end"]))
+    if start >= end:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Video-action scene has no requested interval")
+    return {"start": S.rational(start), "end": S.rational(end)}
+
+
+def _action_video_v2_plan(scene_samples: Dict[int, List[Dict[str, Any]]],
+                          scenes: Sequence[Dict[str, Any]],
+                          requested: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Plan bounded local windows from exact decoded samples, without new seeks."""
+    candidates = []
+    omitted: Dict[int, List[Dict[str, Any]]] = {index: [] for index in range(len(scenes))}
+    eligible = []
+    ineligible = []
+    scene_windows = [_action_video_v2_scene_window(scene, requested) for scene in scenes]
+    for scene_index in range(len(scenes)):
+        ordered = sorted(scene_samples.get(scene_index, []),
+                         key=lambda item: int(item["frame_index"]))
+        if len(ordered) < AV.NUM_FRAMES:
+            omitted[scene_index].append({"window_pts": scene_windows[scene_index],
+                                         "reason": "fewer_than_16_decoded_samples"})
+            ineligible.append(scene_index)
+            continue
+        starts = list(range(0, len(ordered) - AV.NUM_FRAMES + 1, AV.NUM_FRAMES))
+        tail = len(ordered) - AV.NUM_FRAMES
+        if tail - starts[-1] >= AV.NUM_FRAMES // 2:
+            starts.append(tail)
+        found = False
+        for start in starts:
+            selected = ordered[start:start + AV.NUM_FRAMES]
+            descriptor = _action_video_input(selected)
+            pts = [S.rational_value(item["pts"]) for item in descriptor["frames"]]
+            gaps = [right - left for left, right in zip(pts, pts[1:])]
+            if any(gap <= 0 for gap in gaps):
+                reason = "non_monotonic_decoded_pts"
+            elif any(gap > ACTION_VIDEO_V2_MAX_SAMPLE_GAP_SECONDS for gap in gaps):
+                reason = "decoded_sample_gap_exceeds_limit"
+            elif pts[-1] - pts[0] > ACTION_VIDEO_V2_MAX_WINDOW_SECONDS:
+                reason = "window_span_exceeds_limit"
+            else:
+                reason = None
+            if reason is not None:
+                omitted[scene_index].append({"window_pts": descriptor["window_pts"],
+                                             "reason": reason})
+                continue
+            candidates.append((scene_index, selected, descriptor))
+            found = True
+        (eligible if found else ineligible).append(scene_index)
+    planned = _spread(candidates, ACTION_VIDEO_V2_MAX_WINDOWS)
+    selected_keys = {(scene_index, descriptor["start_frame"], descriptor["end_frame"])
+                     for scene_index, _, descriptor in planned}
+    for scene_index, _, descriptor in candidates:
+        if (scene_index, descriptor["start_frame"], descriptor["end_frame"]) not in selected_keys:
+            omitted[scene_index].append({"window_pts": descriptor["window_pts"],
+                                         "reason": "global_window_budget"})
+    return {"planned": planned, "eligible_scenes": eligible,
+            "ineligible_scenes": ineligible, "omitted": omitted,
+            "scene_windows": scene_windows}
+
+
+def _action_video_v2_coverage(plan: Dict[str, Any],
+                              windows: Sequence[Dict[str, Any]],
+                              scene_samples: Dict[int, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    coverage = []
+    for scene_index, scene_window in enumerate(plan["scene_windows"]):
+        chosen = [item for item in windows if item["scene_index"] == scene_index]
+        success = [item["input"]["window_pts"] for item in chosen
+                   if item["status"] == "success"]
+        intervals = sorted(((S.rational_value(item["start"]),
+                             S.rational_value(item["end"])) for item in success))
+        cursor = S.rational_value(scene_window["start"])
+        end = S.rational_value(scene_window["end"])
+        uncovered = []
+        for left, right in intervals:
+            if left > cursor:
+                uncovered.append({"window_pts": {"start": S.rational(cursor),
+                                                   "end": S.rational(min(left, end))},
+                                  "reason": "outside_successful_window_envelopes"})
+            cursor = max(cursor, min(right, end))
+        if cursor < end:
+            uncovered.append({"window_pts": {"start": S.rational(cursor),
+                                               "end": S.rational(end)},
+                              "reason": "outside_successful_window_envelopes"})
+        coverage.append({
+            "scene_index": scene_index, "scene_window": scene_window,
+            "decoded_samples": len(scene_samples.get(scene_index, [])),
+            "selected_windows": len(chosen),
+            "processed_windows": sum(item["result"] is not None for item in chosen),
+            "successful_windows": len(success),
+            "successful_window_envelopes": success,
+            "uncovered_intervals": uncovered,
+            "omitted_window_envelopes": plan["omitted"][scene_index],
+            "observation_scope": "exact_decoded_frames_only_envelopes_not_continuous",
+        })
+    return coverage
+
+
 def _action_video_execution(value: Any) -> Optional[Dict[str, Any]]:
     """Project the owned-process receipt without leaking argv or local paths."""
     if not isinstance(value, dict):
@@ -1221,11 +1342,166 @@ def _action_video_result(value: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _run_action_video_sampling_v2(configuration: Dict[str, Any],
+                                  model_path: Optional[str],
+                                  scene_samples: Dict[int, List[Dict[str, Any]]],
+                                  scenes: Sequence[Dict[str, Any]],
+                                  requested: Optional[Dict[str, Any]],
+                                  work: Path, *, cancelled) -> Dict[str, Any]:
+    """Run at most eight local hints; absence between decoded frames stays unknown."""
+    from . import resource_budget as resources
+
+    plan = _action_video_v2_plan(scene_samples, scenes, requested)
+    config = _validate_action_video_configuration(configuration)
+    frozen_sha = S.sha256_text(config)
+    windows = []
+    available = config["status"] == "available"
+    if available and plan["planned"] and not model_path:
+        raise WorkspaceError("RECOVERY_REQUIRED",
+                             "Available video-action identity has no local execution path")
+    deadline = time.monotonic() + ACTION_VIDEO_V2_PHASE_SECONDS
+    worker_limit = float(resources.policy()["phase_seconds"]) if available else 0.0
+    staged_bytes = 0
+    verified_success_bytes = 0
+
+    def phase_cancelled() -> bool:
+        return bool(cancelled() or time.monotonic() >= deadline)
+
+    for ordinal, (scene_index, selected, descriptor) in enumerate(plan["planned"]):
+        if cancelled():
+            raise WorkspaceError("CANCELLED", "Video action analysis was cancelled")
+        result = None
+        if not available:
+            status = "not_run" if config["status"] == "unavailable" else "failed"
+            reason = config["reason"]
+        elif time.monotonic() >= deadline:
+            status, reason = "not_run", "video_action_phase_budget_exhausted"
+        else:
+            try:
+                worker_samples = []
+                window_bytes = 0
+                skip_reason = None
+                for item in selected:
+                    if cancelled():
+                        raise WorkspaceError("CANCELLED", "Video action analysis was cancelled")
+                    if time.monotonic() >= deadline:
+                        skip_reason = "video_action_phase_budget_exhausted"
+                        break
+                    image = _load_frame(Path(item["path"]))
+                    if cancelled():
+                        raise WorkspaceError("CANCELLED", "Video action analysis was cancelled")
+                    if time.monotonic() >= deadline:
+                        skip_reason = "video_action_phase_budget_exhausted"
+                        break
+                    window_bytes += int(image.nbytes)
+                    if window_bytes > ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES:
+                        skip_reason = "video_action_window_byte_budget_exhausted"
+                        break
+                    if staged_bytes + window_bytes > ACTION_VIDEO_V2_STAGING_BUDGET_BYTES:
+                        skip_reason = "video_action_staging_byte_budget_exhausted"
+                        break
+                    worker_samples.append({"scene_index": scene_index,
+                                           "frame_index": item["frame_index"],
+                                           "pts": item["pts"],
+                                           "evidence_sha256": item["evidence_sha256"],
+                                           "image": image})
+                if skip_reason is not None:
+                    status, reason = "not_run", skip_reason
+                elif shutil.disk_usage(work.parent).free < (
+                        window_bytes + ACTION_VIDEO_V2_DISK_RESERVE_BYTES):
+                    status, reason = "not_run", "video_action_disk_reserve_unavailable"
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        status, reason = "not_run", "video_action_phase_budget_exhausted"
+                    else:
+                        staged_bytes += window_bytes
+                        raw = AV.analyze_window_isolated(
+                            str(Path(model_path).resolve(strict=False)), worker_samples,
+                            (work / f"scene-{scene_index}-window-{ordinal}").resolve(),
+                            top_k=ACTION_VIDEO_TOP_K, cancelled=phase_cancelled,
+                            timeout_seconds=min(remaining, worker_limit))
+                        normalized = _action_video_result(raw)
+                        if (normalized["status"] == "success" and
+                                (normalized.get("window") or {}).get("total_input_bytes") != window_bytes):
+                            raise WorkspaceError("MODEL_WORKER_PROTOCOL",
+                                                 "Video-action worker input byte count changed")
+                        result = normalized
+                        status, reason = result["status"], result["reason"]
+                        if status == "success":
+                            verified_success_bytes += window_bytes
+            except InterruptedError as exc:
+                if cancelled():
+                    raise WorkspaceError("CANCELLED", "Video action analysis was cancelled") from exc
+                status, reason = "not_run", "video_action_phase_budget_exhausted"
+            except WorkspaceError as exc:
+                if exc.code == "CANCELLED" and not cancelled() and time.monotonic() >= deadline:
+                    status, reason = "not_run", "video_action_phase_budget_exhausted"
+                elif exc.code in {"CANCELLED", "LEASE_LOST"}:
+                    raise
+                else:
+                    status, reason = "failed", exc.code
+            except Exception as exc:
+                status, reason = "failed", type(exc).__name__
+        windows.append({"scene_index": scene_index, "input": descriptor,
+                        "status": status, "reason": str(reason)[:240] if reason else None,
+                        "result": result})
+    statuses = {item["status"] for item in windows}
+    if config["status"] == "invalid":
+        status, reason = "failed", config["reason"]
+    elif not windows:
+        status, reason = "not_run", "no_scene_has_eligible_local_window"
+    elif statuses == {"success"}:
+        status, reason = "success", None
+    elif statuses == {"not_run"}:
+        status, reason = "not_run", next(
+            (item["reason"] for item in windows if item["reason"]),
+            "video_action_runtime_unavailable")
+    else:
+        status, reason = "failed", next(
+            (item["reason"] for item in windows if item["status"] == "failed"
+             and item["reason"]), "incomplete_video_action_windows")
+    return {
+        "contract": ACTION_VIDEO_EVIDENCE_CONTRACT_V2, "status": status,
+        "reason": reason, "provider": AV.PROVIDER,
+        "authority": "auxiliary_window_semantics_only", "review_status": "unreviewed",
+        "score_kind": "softmax_score_uncalibrated", "num_frames": AV.NUM_FRAMES,
+        "top_k": ACTION_VIDEO_TOP_K, "window_policy": ACTION_VIDEO_WINDOW_POLICY_V2,
+        "configuration_sha256": frozen_sha,
+        "eligible_scenes": len(plan["eligible_scenes"]),
+        "processed_scenes": len({item["scene_index"] for item in windows
+                                 if item["result"] is not None}),
+        "ineligible_scenes": plan["ineligible_scenes"],
+        "window_budget": ACTION_VIDEO_V2_MAX_WINDOWS,
+        "phase_budget_seconds": ACTION_VIDEO_V2_PHASE_SECONDS,
+        "max_window_seconds": ACTION_VIDEO_V2_MAX_WINDOW_SECONDS,
+        "max_sample_gap_seconds": ACTION_VIDEO_V2_MAX_SAMPLE_GAP_SECONDS,
+        "max_window_input_bytes": ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES,
+        "staging_byte_budget": ACTION_VIDEO_V2_STAGING_BUDGET_BYTES,
+        "disk_reserve_bytes": ACTION_VIDEO_V2_DISK_RESERVE_BYTES,
+        "verified_success_input_bytes": verified_success_bytes,
+        "processed_windows": sum(item["result"] is not None for item in windows),
+        "omitted_windows": sum(len(items) for items in plan["omitted"].values()),
+        "coverage": _action_video_v2_coverage(plan, windows, scene_samples),
+        "supported_hints": list(config["supported_hints"]),
+        "unsupported_actions": list(config["unsupported_actions"]),
+        "windows": windows,
+    }
+
+
 def _run_action_video_sampling(configuration: Dict[str, Any], model_path: Optional[str],
                                scene_samples: Dict[int, List[Dict[str, Any]]],
-                               work: Path, *, cancelled) -> Dict[str, Any]:
+                               work: Path, *, cancelled,
+                               scenes: Optional[Sequence[Dict[str, Any]]] = None,
+                               requested: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Run one owned worker for every scene with a canonical 16-frame window."""
     config = _validate_action_video_configuration(configuration)
+    if config["window_policy"] == ACTION_VIDEO_WINDOW_POLICY_V2:
+        if scenes is None:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Local video-action scenes are missing")
+        return _run_action_video_sampling_v2(
+            config, model_path, scene_samples, scenes, requested, work,
+            cancelled=cancelled)
     planned: List[Tuple[int, List[Dict[str, Any]]]] = []
     ineligible = []
     for scene_index in sorted(scene_samples):
@@ -1365,13 +1641,15 @@ def _action_video_model_run(job_id: str, digest: str,
         model_version=AV.UPSTREAM_REVISION if exact else "unavailable",
         weights_sha256=weights,
         license=AV.WEIGHTS_LICENSE if exact else "not declared",
-        preprocessing={"input": "exactly 16 uniformly selected decoded BGR content samples per scene",
+        preprocessing={"input": ("exactly 16 locally selected decoded BGR content samples per window"
+                                 if sampling["window_policy"] == ACTION_VIDEO_WINDOW_POLICY_V2
+                                 else "exactly 16 uniformly selected decoded BGR content samples per scene"),
                        "time_domain": DOMAIN,
                        "window_policy": sampling["window_policy"],
                        "num_frames": AV.NUM_FRAMES,
                        "isolated_contract": AV.ISOLATED_CONTRACT,
                        "local_files_only": True},
-        parameters={"contract": ACTION_VIDEO_EVIDENCE_CONTRACT,
+        parameters={"contract": sampling["contract"],
                     "hint_contract": ACTION_VIDEO_HINT_CONTRACT,
                     "configuration_sha256": sampling["configuration_sha256"],
                     "implementation_sha256": configuration["implementation"]["sha256"],
@@ -1398,12 +1676,18 @@ def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any]
         raise WorkspaceError("RECOVERY_REQUIRED", message)
 
     config = _validate_action_video_configuration(configuration)
+    v2 = config["window_policy"] == ACTION_VIDEO_WINDOW_POLICY_V2
     fields = {"contract", "status", "reason", "provider", "authority", "review_status",
               "score_kind", "num_frames", "top_k", "window_policy",
               "configuration_sha256", "eligible_scenes", "processed_scenes",
               "ineligible_scenes", "supported_hints", "unsupported_actions", "windows"}
+    if v2:
+        fields |= {"window_budget", "phase_budget_seconds", "max_window_seconds",
+                   "max_sample_gap_seconds", "processed_windows", "omitted_windows",
+                   "coverage", "max_window_input_bytes", "staging_byte_budget",
+                   "disk_reserve_bytes", "verified_success_input_bytes"}
     if (not isinstance(value, dict) or set(value) != fields
-            or value["contract"] != ACTION_VIDEO_EVIDENCE_CONTRACT
+            or value["contract"] != config["contract"]
             or value["status"] not in {"success", "failed", "not_run"}
             or value["provider"] != AV.PROVIDER
             or value["authority"] != "auxiliary_window_semantics_only"
@@ -1411,7 +1695,7 @@ def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any]
             or value["score_kind"] != "softmax_score_uncalibrated"
             or value["num_frames"] != AV.NUM_FRAMES
             or value["top_k"] != ACTION_VIDEO_TOP_K
-            or value["window_policy"] != "per_scene_uniform_decoded_content_samples_v1"
+            or value["window_policy"] != config["window_policy"]
             or value["configuration_sha256"] != S.sha256_text(config)
             or value["supported_hints"] != config["supported_hints"]
             or value["unsupported_actions"] != config["unsupported_actions"]
@@ -1423,29 +1707,62 @@ def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any]
     grouped: Dict[int, List[Dict[str, Any]]] = {index: [] for index in range(len(scenes))}
     for frame in content_frames:
         grouped.setdefault(frame["scene_index"], []).append(frame)
-    selected_by_scene = {index: _select_action_video_frames(items)
-                         for index, items in grouped.items()}
-    eligible = [index for index in sorted(selected_by_scene) if selected_by_scene[index]]
-    ineligible = [index for index in sorted(selected_by_scene) if not selected_by_scene[index]]
+    if v2:
+        plan = _action_video_v2_plan(grouped, scenes, window)
+        expected_windows = [(scene_index, descriptor)
+                            for scene_index, _, descriptor in plan["planned"]]
+        eligible = plan["eligible_scenes"]
+        ineligible = plan["ineligible_scenes"]
+        if (value["window_budget"] != ACTION_VIDEO_V2_MAX_WINDOWS
+                or value["phase_budget_seconds"] != ACTION_VIDEO_V2_PHASE_SECONDS
+                or value["max_window_seconds"] != ACTION_VIDEO_V2_MAX_WINDOW_SECONDS
+                or value["max_sample_gap_seconds"] != ACTION_VIDEO_V2_MAX_SAMPLE_GAP_SECONDS
+                or value["max_window_input_bytes"] != ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES
+                or value["staging_byte_budget"] != ACTION_VIDEO_V2_STAGING_BUDGET_BYTES
+                or value["disk_reserve_bytes"] != ACTION_VIDEO_V2_DISK_RESERVE_BYTES
+                or type(value["verified_success_input_bytes"]) is not int
+                or not 0 <= value["verified_success_input_bytes"] <= ACTION_VIDEO_V2_STAGING_BUDGET_BYTES
+                or type(value["processed_windows"]) is not int
+                or type(value["omitted_windows"]) is not int
+                or value["omitted_windows"] != sum(len(items) for items in plan["omitted"].values())
+                or not isinstance(value["coverage"], list)):
+            invalid("Auxiliary video-action local window budget is inconsistent")
+    else:
+        selected_by_scene = {index: _select_action_video_frames(items)
+                             for index, items in grouped.items()}
+        eligible = [index for index in sorted(selected_by_scene) if selected_by_scene[index]]
+        ineligible = [index for index in sorted(selected_by_scene) if not selected_by_scene[index]]
+        expected_windows = [(index, _action_video_input(selected_by_scene[index]))
+                            for index in eligible]
     if (value["eligible_scenes"] != len(eligible)
             or value["ineligible_scenes"] != ineligible
-            or len(value["windows"]) != len(eligible)
-            or [item.get("scene_index") for item in value["windows"]] != eligible):
+            or len(value["windows"]) != len(expected_windows)
+            or [item.get("scene_index") for item in value["windows"]]
+            != [index for index, _ in expected_windows]):
         invalid("Auxiliary video-action scene coverage is inconsistent")
     result_count = 0
-    for item, scene_index in zip(value["windows"], eligible):
+    verified_success_bytes = 0
+    for item, (scene_index, expected_input) in zip(value["windows"], expected_windows):
         if (not isinstance(item, dict)
                 or set(item) != {"scene_index", "input", "status", "reason", "result"}
                 or item["status"] not in {"success", "failed", "not_run"}
                 or item["scene_index"] != scene_index
-                or item["input"] != _action_video_input(selected_by_scene[scene_index])):
+                or item["input"] != expected_input):
             invalid("Auxiliary video-action window input is inconsistent")
         frame_descriptors = item["input"]["frames"]
         if any(frame["evidence_sha256"] not in evidence_hashes for frame in frame_descriptors):
             invalid("Auxiliary video-action window has no registered decoded evidence")
         result = item["result"]
         if result is None:
-            if item["status"] != "failed" and config["status"] == "available":
+            if item["status"] == "success":
+                invalid("A successful video-action window has no worker result")
+            budget_skip = (v2 and item["status"] == "not_run"
+                           and item["reason"] in {
+                               "video_action_phase_budget_exhausted",
+                               "video_action_window_byte_budget_exhausted",
+                               "video_action_staging_byte_budget_exhausted",
+                               "video_action_disk_reserve_unavailable"})
+            if item["status"] != "failed" and config["status"] == "available" and not budget_skip:
                 invalid("A runnable video-action window omitted its worker result")
             continue
         result_count += 1
@@ -1489,6 +1806,8 @@ def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any]
                     or result["unsupported_actions"] != []):
                 invalid("Unavailable video-action execution emitted semantic output")
             continue
+        if v2 and config["status"] != "available":
+            invalid("Unavailable video-action model emitted a successful window")
         identity = result["model_identity"]
         actual = result["window"]
         if (result["provider"] != AV.PROVIDER
@@ -1529,6 +1848,7 @@ def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any]
                 or not isinstance(actual.get("frames"), list)
                 or len(actual["frames"]) != AV.NUM_FRAMES):
             invalid("Auxiliary video-action result window is inconsistent")
+        window_input_bytes = 0
         for returned, expected_frame in zip(actual["frames"], expected_input["frames"]):
             if (not isinstance(returned, dict)
                     or set(returned) != {"frame_index", "pts", "scene_index",
@@ -1540,7 +1860,27 @@ def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any]
                     or not isinstance(returned["shape"], list) or len(returned["shape"]) != 3
                     or any(type(size) is not int or size <= 0 for size in returned["shape"])):
                 invalid("Auxiliary video-action result frame identity is inconsistent")
-    if value["processed_scenes"] != result_count:
+            if v2:
+                height, width, channels = returned["shape"]
+                if channels != 3 or height * width > AV.MAX_FRAME_PIXELS:
+                    invalid("Auxiliary video-action frame is not bounded uint8 BGR")
+                window_input_bytes += height * width * channels
+        if v2:
+            if (type(actual["total_input_bytes"]) is not int
+                    or actual["total_input_bytes"] != window_input_bytes
+                    or window_input_bytes > ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES):
+                invalid("Auxiliary video-action window input bytes are inconsistent")
+            verified_success_bytes += window_input_bytes
+    if v2:
+        if (value["processed_windows"] != result_count
+                or value["verified_success_input_bytes"] != verified_success_bytes
+                or verified_success_bytes > ACTION_VIDEO_V2_STAGING_BUDGET_BYTES
+                or value["processed_scenes"] != len({item["scene_index"]
+                    for item in value["windows"] if item["result"] is not None})
+                or value["coverage"] != _action_video_v2_coverage(
+                    plan, value["windows"], grouped)):
+            invalid("Auxiliary video-action local coverage is inconsistent")
+    elif value["processed_scenes"] != result_count:
         invalid("Auxiliary video-action processed count is inconsistent")
     statuses = {item["status"] for item in value["windows"]}
     expected_status = ("failed" if config["status"] == "invalid"
@@ -1549,6 +1889,17 @@ def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any]
                        else "not_run" if statuses == {"not_run"} else "failed")
     if value["status"] != expected_status:
         invalid("Auxiliary video-action aggregate status is inconsistent")
+    if v2:
+        expected_reason = (config["reason"] if config["status"] == "invalid"
+                           else "no_scene_has_eligible_local_window" if not value["windows"]
+                           else None if statuses == {"success"}
+                           else next((item["reason"] for item in value["windows"]
+                                      if item["reason"] and (statuses == {"not_run"}
+                                      or item["status"] == "failed")),
+                                     "video_action_runtime_unavailable" if statuses == {"not_run"}
+                                     else "incomplete_video_action_windows"))
+        if value["reason"] != expected_reason:
+            invalid("Auxiliary video-action aggregate reason is inconsistent")
     run = next((item for item in model_runs
                 if item.get("id") == _module_run_id(job_id, "action_video")), None)
     expected_run = _action_video_model_run(job_id, digest, window, value, config)
@@ -3557,7 +3908,7 @@ class VisionJobs:
                     action_video_sampling = _run_action_video_sampling(
                         action_video_configuration, self.action_video_model_path,
                         action_video_inputs, (work / "action-video").resolve(),
-                        cancelled=cancelled)
+                        cancelled=cancelled, scenes=scenes, requested=window)
                 try:
                     acoustics_sampling = _measure_audio(
                         Path(source), ffmpeg, work, window=window,
@@ -3917,7 +4268,8 @@ class VisionJobs:
         requires_hands = (parameters["job_identity"]["config"].get("hand_landmarks", {})
                           .get("contract") == HAND_EVIDENCE_CONTRACT)
         requires_action_video = (parameters["job_identity"]["config"].get("action_video", {})
-                                 .get("contract") == ACTION_VIDEO_EVIDENCE_CONTRACT)
+                                 .get("contract") in {ACTION_VIDEO_EVIDENCE_CONTRACT,
+                                                      ACTION_VIDEO_EVIDENCE_CONTRACT_V2})
         if requires_action_video:
             expected.add("action_video_sampling")
         object_fields = {"object_sampling", "object_relations"}
@@ -5867,6 +6219,10 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                                "authority": result.get("authority"),
                                "review_status": result.get("review_status"),
                                "participant_binding": "none",
+                               **({"sampling_contract": ACTION_VIDEO_EVIDENCE_CONTRACT_V2,
+                                   "window_policy": ACTION_VIDEO_WINDOW_POLICY_V2}
+                                  if action_video.get("contract") == ACTION_VIDEO_EVIDENCE_CONTRACT_V2
+                                  else {}),
                                "supported_hints": list(action_video.get("supported_hints") or []),
                                "unsupported_actions": list(action_video.get("unsupported_actions") or []),
                            }},
