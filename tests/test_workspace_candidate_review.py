@@ -11,6 +11,7 @@ import subprocess
 import pytest
 
 from trace_annotate.workspace import semantic_schema as SS
+from trace_annotate.workspace import professional_schema as PS
 from trace_annotate.workspace import vision_schema as VS
 from trace_annotate.workspace.errors import SchemaInvalid, WorkspaceError
 from trace_annotate.workspace.store import WorkspaceStore
@@ -116,6 +117,22 @@ def test_model_candidate_may_not_store_an_interpretation(store):
     assert exc.value.code == "INTERPRETATION_REQUIRES_HUMAN"
 
 
+def test_professional_document_rejects_model_interpretation_even_if_actor_is_declared_human(store):
+    artifact = store._put_artifact(b"frame-bytes-professional-forged-actor")
+    annotation = _candidate("ann-forged-actor", [_observable(artifact["id"])], artifact["id"])
+    annotation["attributes"]["semantic"]["claims"] = [VS.interpretation(
+        statement="Person seems distressed", method_id="human-note", method_version="1",
+        evidence_ids=[artifact["id"]], start={"n": "0", "d": "1"},
+        end={"n": "1", "d": "1"})]
+    task = _current(store)
+    media = store.get_media(task["media_id"])
+    template = next(row for row in store.list_templates() if row["id"] == task["template_id"])
+    with pytest.raises(WorkspaceError) as exc:
+        PS.validate_annotation(annotation, media, template, artifact_ids={artifact["id"]},
+                               actor_types={annotation["provenance"]["actor_id"]: "human"})
+    assert exc.value.code == "INTERPRETATION_REQUIRES_HUMAN"
+
+
 def test_reviewed_status_without_review_binding_is_rejected(store):
     artifact = store._put_artifact(b"frame-bytes-forged-review")
     annotation = _candidate(
@@ -172,10 +189,8 @@ def test_v3_object_and_recipient_edits_invalidate_review_binding(store):
     claim = dict(_observable(artifact["id"]), object_ref="object-1",
                  recipient_ref="recipient-1")
     annotation = _candidate("ann-v3-refs", [claim], artifact["id"])
+    annotation["provenance"] = {"origin": "manual", "actor_id": "local-user", "job_id": None}
     _command(store, "add_annotation", {"annotation": annotation}, "cmd-v3-add")
-    _command(store, "update_annotation", {"annotation_id": "ann-v3-refs", "changes": {
-        "provenance": {"origin": "manual", "actor_id": "local-user", "job_id": None}}},
-        "cmd-v3-author")
     _command(store, "review_annotation", {"annotation_id": "ann-v3-refs", "reviewed": True},
              "cmd-v3-review")
     reviewed = next(a for a in _current(store)["annotations"] if a["id"] == "ann-v3-refs")
@@ -190,10 +205,12 @@ def test_v3_object_and_recipient_edits_invalidate_review_binding(store):
     assert store.annotation_review_digest(edited, _current(store)) != before
 
 
-def test_rejecting_unreviewed_candidate_deletes_only_that_candidate(store):
+def test_generic_delete_cannot_bypass_candidate_decision(store):
     artifact = store._put_artifact(b"frame-bytes-evidence-v3-reject")
     annotation = _candidate("ann-v3-reject", [_observable(artifact["id"])], artifact["id"])
     _command(store, "add_annotation", {"annotation": annotation}, "cmd-v3-reject-add")
-    _command(store, "delete_annotation", {"annotation_id": "ann-v3-reject"},
-             "cmd-v3-reject-delete")
-    assert all(a["id"] != "ann-v3-reject" for a in _current(store)["annotations"])
+    with pytest.raises(WorkspaceError) as exc:
+        _command(store, "delete_annotation", {"annotation_id": "ann-v3-reject"},
+                 "cmd-v3-reject-delete")
+    assert exc.value.code == "CANDIDATE_DECISION_REQUIRED"
+    assert any(a["id"] == "ann-v3-reject" for a in _current(store)["annotations"])

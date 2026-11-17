@@ -136,6 +136,31 @@ def _projection_summary(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _action_window_summary(windows: list[dict[str, Any]]) -> dict[str, list[Any]]:
+    """Read decisions from each worker result, not the enclosing scene window."""
+    statuses: list[str] = []
+    decisions: list[str | None] = []
+    reasons: list[str | None] = []
+    for window in windows:
+        status = window.get("status")
+        result = window.get("result")
+        if status not in {"success", "failed", "not_run"}:
+            raise ValueError("invalid_action_window_status")
+        if result is not None and (
+                not isinstance(result, dict) or result.get("status") != status):
+            raise ValueError("invalid_action_window_result")
+        if status == "success" and (
+                result is None or result.get("decision") not in
+                {"auxiliary_candidate", "reject", "unknown"}):
+            raise ValueError("successful_action_window_missing_decision")
+        statuses.append(status)
+        decisions.append(result.get("decision") if result is not None else None)
+        reasons.append(result.get("reason") if result is not None else window.get("reason"))
+    return {"action_window_statuses": statuses,
+            "action_window_decisions": decisions,
+            "action_window_reasons": reasons}
+
+
 def _assert_projection_evidence(task: dict[str, Any], document: dict[str, Any]) -> None:
     artifacts = {item["id"] for item in document.get("artifacts") or []}
     for annotation in task.get("annotations") or []:
@@ -277,8 +302,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "successful_hand_frame_count": len(hand_frames),
                     "hand_observation_count": hand_count,
                     "action_window_count": len(action_results),
-                    "action_window_statuses": [item.get("status") for item in action_results],
-                    "action_window_decisions": [item.get("decision") for item in action_results]},
+                    **_action_window_summary(action_results)},
             "model_runs": [_model_run_summary(item) for item in candidate["model_runs"]],
             "portable_projection": source_projection,
             "roundtrip": {

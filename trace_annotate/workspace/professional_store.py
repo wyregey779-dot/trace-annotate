@@ -115,6 +115,8 @@ def prepare_task(store, current, operation, payload, *, command_id):
         verified_local = set()
         evidence_owners = list(task['annotations'])
         evidence_owners.extend(task['extensions']['professional'].get('analysis_reports', []))
+        evidence_owners.extend(record['source_annotation'] for record in
+                               task['extensions']['professional'].get('review_decisions', []))
         for owner in evidence_owners:
             for ident in owner.get('evidence_ids', []):
                 if ident in embedded_artifacts:
@@ -330,6 +332,8 @@ def export_professional(store, task_id, *, evidence_mode='embedded'):
                 known.add(ident)
         evidence_owners = list(task['annotations'])
         evidence_owners.extend(task.get('extensions', {}).get('professional', {}).get('analysis_reports', []))
+        evidence_owners.extend(record['source_annotation'] for record in
+                               task.get('extensions', {}).get('professional', {}).get('review_decisions', []))
         for owner in evidence_owners:
             for ident in owner.get('evidence_ids', []):
                 if ident in known:

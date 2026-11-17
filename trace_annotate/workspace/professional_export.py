@@ -15,8 +15,34 @@ from .errors import SchemaInvalid
 def build_document(task, media, template, *, history=None, analyses=None, actors=None, artifacts=None):
     task,media,template=copy.deepcopy(task),copy.deepcopy(media),copy.deepcopy(template)
     if actors is None:
-        actors=[{"id":ident,"type":"historical_unverified","display_name":ident,"identity_verification":"unverified"}
-                for ident in sorted({ann["provenance"]["actor_id"] for ann in task["annotations"]})]
+        actor_types={ann["provenance"]["actor_id"]:"historical_unverified"
+                     for ann in task["annotations"]}
+        professional=task.get("extensions",{}).get("professional",{})
+        def model_actor(ident):
+            prior=actor_types.get(ident)
+            if prior not in (None,"historical_unverified","tool"):
+                raise SchemaInvalid("INVALID_PROFESSIONAL_DOCUMENT","Model actor conflicts with reviewer type")
+            actor_types[ident]="tool"
+        for annotation in task["annotations"]:
+            if annotation["provenance"]["origin"]=="model_candidate":
+                model_actor(annotation["provenance"]["actor_id"])
+        for record in professional.get("review_decisions",[]):
+            source_actor=record["source_annotation"]["provenance"]["actor_id"]
+            model_actor(source_actor)
+            review=record["review_decision"]
+            prior=actor_types.get(review["actor_id"])
+            if prior not in (None,"historical_unverified",review["actor_type"]):
+                raise SchemaInvalid("INVALID_PROFESSIONAL_DOCUMENT","Actor type declarations conflict")
+            actor_types[review["actor_id"]]=review["actor_type"]
+        for annotation in task["annotations"]:
+            review=annotation.get("review_binding") or {}
+            if review.get("actor_type") in ("human","assistant","tool"):
+                actor_types[review["actor_id"]]=review["actor_type"]
+            elif review.get("actor_id"):
+                actor_types.setdefault(review["actor_id"],"historical_unverified")
+        actors=[{"id":ident,"type":kind,"display_name":ident,
+                 "identity_verification":"local_only" if kind!="historical_unverified" else "unverified"}
+                for ident,kind in sorted(actor_types.items())]
     if analyses is None:
         professional=task.get("extensions",{}).get("professional",{})
         if not isinstance(professional,dict):

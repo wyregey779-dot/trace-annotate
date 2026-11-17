@@ -160,6 +160,16 @@ def collect_artifact_references(connection):
                     if not isinstance(artifact, dict):
                         _fail("Analysis artifact descriptor is invalid")
                     add(artifact.get("id"), "task_revision", ident, revision, "analysis", artifact)
+            decisions = professional.get("review_decisions", [])
+            if not isinstance(decisions, list):
+                _fail("Candidate decision references are invalid")
+            for decision in decisions:
+                source = decision.get("source_annotation") if isinstance(decision, dict) else None
+                source_evidence_ids = source.get("evidence_ids") if isinstance(source, dict) else None
+                if not isinstance(source_evidence_ids, list):
+                    _fail("Candidate decision source evidence is invalid")
+                for artifact_id in source_evidence_ids:
+                    add(artifact_id, "task_revision", ident, revision, "candidate_source")
         if "artifact_references" in tables:
             for artifact_id, kind, owner, revision, role in connection.execute(
                     "SELECT artifact_id,owner_kind,owner_id,owner_revision,role FROM artifact_references"):

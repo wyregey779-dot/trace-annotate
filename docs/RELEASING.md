@@ -17,7 +17,7 @@ repository does not claim a PyPI publication.
    ```bash
    python -m pip install build twine pytest tomli
    python -m build --outdir release-dist
-   python -m twine check release-dist/*
+   python -m twine check release-dist/trace_annotate-1.1.0.dev2-py3-none-any.whl release-dist/trace_annotate-1.1.0.dev2.tar.gz
    python scripts/release_assets.py --dist release-dist --expected-tag v1.1.0.dev2
    python -m pip install release-dist/trace_annotate-1.1.0.dev2-py3-none-any.whl
    python scripts/check_installed_package.py
@@ -26,8 +26,10 @@ repository does not claim a PyPI publication.
 
    The example version is the current **unreleased** development checkout; it
    does not authorize creating a tag or publishing a release. Replace it with
-   the actual reviewed version when preparing a later release. The asset check
-   compares the wheel and source distribution with the package source files and
+   the actual reviewed version when preparing a later release. Pass only the
+   two distribution files to Twine; `SHA256SUMS` may exist on a rerun and is
+   not a Python distribution. The asset check compares the wheel and source
+   distribution with the package source files and
    verifies metadata and the expected tag string. The installed-package
    check imports from outside the checkout and exercises packaged resources and
    the CLI. Test the documented quickstart and affected user workflows too.

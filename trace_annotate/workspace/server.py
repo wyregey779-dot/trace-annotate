@@ -103,11 +103,15 @@ def _command(body):
         "replace_annotations": {"annotations"},
         "revert_command": {"target_command_id"},
         "review_annotation": {"annotation_id", "reviewed"},
+        "decide_candidate": {"annotation_id", "decision", "actor_id", "actor_type",
+                             "expected_candidate_sha256", "changes", "diff_summary"},
         "import_temporal": {"annotations", "legacy_document_metadata", "legacy_document_envelope"},
     }.get(body["operation"])
     if required is None:
         raise SchemaInvalid("UNSUPPORTED_OPERATION", "Operation is not implemented in this slice")
-    if set(payload) != required:
+    valid_review_shape = (body["operation"] == "review_annotation" and
+                          set(payload) == required | {"actor_id", "actor_type"})
+    if set(payload) != required and not valid_review_shape:
         raise SchemaInvalid("SCHEMA_INVALID", "Operation payload fields are missing or unknown")
     if "annotation_id" in payload:
         _require_id(payload["annotation_id"], "annotation_id")
@@ -664,7 +668,8 @@ class _Handler(BaseHTTPRequestHandler):
                                   if a.get("provenance", {}).get("origin") == "model_candidate"]
                     result = {"task_id": task["id"], "revision": task["revision"],
                         "content_sha256": task["content_sha256"],
-                        "candidate_count": len(candidates), "candidates": candidates}
+                        "candidate_count": len(candidates), "candidates": candidates,
+                        "candidate_sha256": {a["id"]: store.candidate_digest(a) for a in candidates}}
                 self._send_json(200, result)
                 return
             if parts == ["drafts"]:

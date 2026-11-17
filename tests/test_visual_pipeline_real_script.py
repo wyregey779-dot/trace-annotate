@@ -3,11 +3,39 @@ from __future__ import annotations
 import pytest
 
 from scripts.check_visual_pipeline_real import (
+    _action_window_summary,
     _artifact_summary,
     _execution_summary,
     _model_run_summary,
     _write_json,
 )
+
+
+def test_action_window_summary_reads_nested_worker_decision_and_reason() -> None:
+    windows = [
+        {"scene_index": 0, "status": "success", "reason": None,
+         "result": {"status": "success", "decision": "unknown",
+                    "reason": "top_class_outside_supported_auxiliary_mapping"}},
+        {"scene_index": 1, "status": "success", "reason": None,
+         "result": {"status": "success", "decision": "auxiliary_candidate",
+                    "reason": None}},
+        {"scene_index": 2, "status": "not_run", "reason": "weights_unavailable",
+         "result": None},
+    ]
+
+    assert _action_window_summary(windows) == {
+        "action_window_statuses": ["success", "success", "not_run"],
+        "action_window_decisions": ["unknown", "auxiliary_candidate", None],
+        "action_window_reasons": [
+            "top_class_outside_supported_auxiliary_mapping", None,
+            "weights_unavailable"],
+    }
+
+
+def test_action_window_summary_rejects_missing_success_result() -> None:
+    with pytest.raises(ValueError, match="successful_action_window_missing_decision"):
+        _action_window_summary([{"status": "success", "reason": None,
+                                 "result": None}])
 
 
 def test_artifact_summary_matches_professional_exchange_artifact_shape() -> None:

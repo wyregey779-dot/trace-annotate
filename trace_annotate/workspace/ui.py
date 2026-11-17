@@ -63,6 +63,22 @@ dialog:modal{overscroll-behavior:contain}dialog::backdrop{overflow:hidden;oversc
 .measurement-box[hidden]{display:none}
 .measurement-summary{font-size:10px;color:var(--muted);line-height:1.6;margin-bottom:6px;overflow-wrap:anywhere}
 .tag-note{font-size:9px;color:var(--muted);line-height:1.5}
+.candidate-review-fields{display:grid;grid-template-columns:minmax(110px,auto) minmax(0,1fr);gap:7px 12px;align-items:center;padding:12px 15px;border-top:1px solid var(--line)}.candidate-review-fields label{font-size:11px;color:var(--muted)}.candidate-review-fields select{min-height:38px}.candidate-review-fields textarea,.candidate-review-fields p{grid-column:1/-1}.candidate-review-fields p{font-size:11px;line-height:1.6}.vision-evidence{border-top:1px solid var(--line);padding:12px 15px;background:#0c1723}
+.vision-evidence[hidden]{display:none}
+.vision-evidence h4{font-size:13px;margin:0 0 7px}
+.vision-evidence p{font-size:11px;line-height:1.6;margin:5px 0;overflow-wrap:anywhere}
+.vision-evidence-controls{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:10px 0}
+.vision-evidence-controls label{font-size:11px;color:var(--muted)}
+.vision-evidence-controls select{max-width:min(100%,340px)}
+.vision-evidence-controls button{min-height:38px}
+.vision-evidence-stage{display:inline-block;position:relative;max-width:100%;background:#020408;border:1px solid var(--line)}
+.vision-evidence-stage img{display:block;max-width:100%;max-height:440px;width:auto;height:auto}
+.vision-evidence-stage img[hidden]{display:none}
+.vision-evidence-stage svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.vision-evidence-stage svg[hidden]{display:none}
+.vision-evidence-notes{margin:7px 0 0;padding-left:18px;max-height:170px;overflow:auto;font-size:11px;line-height:1.55}
+.vision-evidence-notes li{overflow-wrap:anywhere}
+.vision-evidence-hash{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}
 </style>
 </head>
 <body>
@@ -130,7 +146,7 @@ dialog:modal{overscroll-behavior:contain}dialog::backdrop{overflow:hidden;oversc
    </section>
   </div>
   <section class="panel segment-panel" aria-labelledby="segments-title"><div class="panel-head"><h3 id="segments-title">已保存片段</h3><span class="muted" id="revision-label"></span></div><div class="table-wrap"><table id="segments"><thead><tr><th scope="col">标签 / 选择</th><th scope="col">时间区间</th><th scope="col">内容</th><th scope="col">轨道</th><th scope="col">审核</th></tr></thead><tbody></tbody></table><p id="no-segments" class="empty-small">尚无片段。播放视频后，填写起止时间并保存。</p></div></section>
-  <section class="panel" id="vision-panel" aria-labelledby="vision-title"><div class="panel-head"><h3 id="vision-title">视觉辅助候选</h3><span class="muted" id="vision-options">正在读取能力…</span></div><p class="empty-small">只在已准入的播放媒体上运行；候选默认未审核，必须由你逐条核对后才算人工结论。模型推断不会写成事实。</p><div class="form-actions"><button id="vision-run" class="primary" type="button" disabled>运行视觉分析</button><button id="vision-refresh" type="button" class="quiet">刷新状态</button><button id="vision-apply" type="button" disabled hidden>应用为候选片段</button><button id="vision-cancel" type="button" class="danger" disabled hidden>取消任务</button><button id="vision-retry" type="button" disabled hidden>重试任务</button></div><div id="vision-job" class="empty-small" hidden></div><div class="table-wrap"><table id="vision-candidates" hidden><thead><tr><th scope="col">候选</th><th scope="col">时间区间</th><th scope="col">来源</th><th scope="col">审核</th><th scope="col">操作</th></tr></thead><tbody></tbody></table></div></section>
+  <section class="panel" id="vision-panel" aria-labelledby="vision-title"><div class="panel-head"><h3 id="vision-title">视觉辅助候选</h3><span class="muted" id="vision-options">正在读取能力…</span></div><p class="empty-small">只在已准入的播放媒体上运行；候选默认未审核，必须由你逐条核对后才算人工结论。模型推断不会写成事实。</p><div class="form-actions"><button id="vision-run" class="primary" type="button" disabled>运行视觉分析</button><button id="vision-refresh" type="button" class="quiet">刷新状态</button><button id="vision-apply" type="button" disabled hidden>应用为候选片段</button><button id="vision-cancel" type="button" class="danger" disabled hidden>取消任务</button><button id="vision-retry" type="button" disabled hidden>重试任务</button></div><div id="vision-job" class="empty-small" hidden></div><section id="vision-evidence" class="vision-evidence" aria-labelledby="vision-evidence-title" hidden><h4 id="vision-evidence-title">逐帧证据检查（只读）</h4><p id="vision-evidence-scope"></p><p id="vision-evidence-loss"></p><div class="vision-evidence-controls"><button id="vision-evidence-prev" type="button" class="quiet" aria-label="上一组视觉采样帧">上一组</button><label for="vision-evidence-frame">采样帧</label><select id="vision-evidence-frame"></select><button id="vision-evidence-next" type="button" class="quiet" aria-label="下一组视觉采样帧">下一组</button><span id="vision-evidence-page" class="muted"></span></div><p id="vision-evidence-status" role="status" aria-live="polite"></p><div class="vision-evidence-stage"><img id="vision-evidence-image" alt="" hidden><svg id="vision-evidence-overlay" aria-hidden="true" hidden></svg></div><p id="vision-evidence-identity" class="vision-evidence-hash"></p><ol id="vision-evidence-notes" class="vision-evidence-notes"></ol></section><div class="candidate-review-fields"><label for="vision-actor-type">实际操作主体</label><select id="vision-actor-type"><option value="">请选择</option><option value="human">本人（仅自声明）</option><option value="assistant">助手</option><option value="tool">其他工具</option></select><label for="vision-actor-id">主体标识</label><input id="vision-actor-id" type="text" required maxlength="96" pattern="[A-Za-z][A-Za-z0-9_-]{0,95}" placeholder="如 reviewer-1 或 assistant-1"><label for="vision-diff-summary">修改摘要（仅采纳编辑时填写）</label><textarea id="vision-diff-summary" rows="2" maxlength="500" placeholder="说明哪些字段因逐帧核对而修改"></textarea><p class="muted">身份由操作者自声明，并非身份认证；助手或工具的决定仍是未审核，不会记为人工签核。拒绝会移除活动候选，但保留来源与证据记录。</p></div><div class="table-wrap"><table id="vision-candidates" hidden><thead><tr><th scope="col">候选</th><th scope="col">时间区间</th><th scope="col">来源</th><th scope="col">审核</th><th scope="col">操作</th></tr></thead><tbody></tbody></table></div></section>
   <p class="footer-note"><span class="connected"></span>本机持久化 · 稀疏片段标注 · 导出为开发版工作区快照，不含媒体文件，也不是可直接导入的便携项目包。</p>
  </section>
 </main>
@@ -149,14 +165,14 @@ function showTime(r){const n=BigInt(r.n),d=BigInt(r.d);let q=d;while(q%2n===0n)q
 function compareTime(a,b){const x=BigInt(a.n)*BigInt(b.d)-BigInt(b.n)*BigInt(a.d);return x<0n?-1:x>0n?1:0;}
 function seconds(r){return Number(r.n)/Number(r.d);}
 function clone(v){return JSON.parse(JSON.stringify(v));}
-const state={snapshot:null,intakes:[],task:null,media:null,selected:null,original:null,dirty:false,busy:false,loadingTask:false,playGeneration:0,playIntent:false,playWaiting:false,playError:null,segmentPlayback:null,segmentStartClock:null,playRAF:null,pending:null,conflict:false,sequence:0,frameSequence:0,frame:null,frameBlob:null,loadingFrame:false,importing:false,stopImport:false,maxUpload:512*1024*1024,uploadRows:[],anchors:{},formBase:null,anchorBase:null,intakeCommands:[],intakePoll:null,batch:null,batchRunId:null,batchController:null,statusUnavailable:false,visionScene:false,visionJob:null,visionResult:null,visionTimer:null,visionGeneration:0,visionAbort:null,compareToken:0,compareBlobs:[]};
+const state={snapshot:null,intakes:[],task:null,media:null,selected:null,original:null,dirty:false,busy:false,loadingTask:false,playGeneration:0,playIntent:false,playWaiting:false,playError:null,segmentPlayback:null,segmentStartClock:null,playRAF:null,pending:null,conflict:false,sequence:0,frameSequence:0,frame:null,frameBlob:null,loadingFrame:false,importing:false,stopImport:false,maxUpload:512*1024*1024,uploadRows:[],anchors:{},formBase:null,anchorBase:null,intakeCommands:[],intakePoll:null,batch:null,batchRunId:null,batchController:null,statusUnavailable:false,visionScene:false,visionJob:null,visionResult:null,visionTimer:null,visionGeneration:0,visionAbort:null,visionEvidencePage:0,visionEvidenceToken:0,visionEvidenceLoadToken:0,visionEvidenceBlob:null,visionEvidenceReviewJob:null,visionEvidenceReviewResult:null,visionEvidenceReviewAnnotation:null,visionCandidateDigests:{},compareToken:0,compareBlobs:[]};
 // Read-only observability for the browser control script: the exact command id
 // a button click used, so a terminal-state replay can be checked against the
 // persisted receipt instead of guessing an id.
 window.__traceAnnotateIntakeCommands=()=>state.intakeCommands.slice();
 function clearReviewIntent(){if($('segment-reviewed').checked){$('segment-reviewed').checked=false;$('review-notice').textContent='内容已修改，旧复核已自动取消。请核实当前内容后重新勾选。';}}
 function notice(message,kind=''){const el=$('status');el.textContent=message;el.className='notice'+(kind?' '+kind:'');el.hidden=!message;}
-function describeError(error){const code=error.code||'CONNECTION_FAILED';const messages={MEDIA_BINDING_REQUIRED:'旧版文件尚未绑定媒体，请在原通用工具核对源文件后导出v2再导入',MEDIA_IDENTITY_MISMATCH:'标注文件与当前视频身份不匹配，未导入',TEMPORAL_ENDPOINT_MISMATCH:'标注超出实际媒体终点，未自动裁切，请核对源文件和时间边界',HISTORY_DIVERGED:'此操作之后任务已有其他修改，撤销未应用；已保存内容和历史均保留',REVISION_CONFLICT:'任务修订已改变，草稿未覆盖服务器数据',MEDIA_CHANGED:'媒体或任务内容已改变，请重新加载后核对',INVALID_TOKEN:'会话已失效，请重新打开当前服务页面',FORBIDDEN_ORIGIN:'请求来源校验失败，请从本机服务地址打开',SCHEMA_INVALID:'标注字段不符合规则，请核对时间、标签与轨道',LIMIT_EXCEEDED:'文件或请求超过服务限制',UNSUPPORTED_MEDIA:'视频格式或时间信息不受支持',DEPENDENCY_UNAVAILABLE:'本机缺少必要的媒体工具',IMPORT_BUSY:'另一个导入正在处理，请完成后再试',SOURCE_MISSING:'媒体源不可用',CONNECTION_FAILED:'与本机服务连接失败',INTERNAL_ERROR:'服务处理异常，需核对保存回执',COMMAND_UNKNOWN:'尚未发现该命令的持久回执',INSUFFICIENT_MEMORY:'可用内存不足，请关闭其他占内存的程序后重试',MEMORY_STATUS_UNAVAILABLE:'暂时无法读取可用内存，请稍后重试',MODEL_RESOURCE_BUSY:'其他模型任务正在运行，请稍后重试',MODEL_TIMEOUT:'模型运行超时，可稍后重试或缩小分析范围',MODEL_MEMORY_FAILED:'模型因内存不足停止，请释放内存后重试',MODEL_WORKER_FAILED:'模型进程已停止，请重试；反复发生时检查运行记录',MODEL_LOAD_FAILED:'本地模型加载失败，请核对运行环境与权重后重试',MODEL_WORKER_PROTOCOL:'模型结果无法验证，请保留运行记录并检查配置',CONTROL_IDENTITY_MISMATCH:'重试回执与当前任务不匹配，请刷新后核对',VISION_RESUBMIT_REQUIRED:'分析配置已改变，请重新运行分析'};return (messages[code]||'操作未完成')+'（'+code+'）';}
+function describeError(error){const code=error.code||'CONNECTION_FAILED';const messages={MEDIA_BINDING_REQUIRED:'旧版文件尚未绑定媒体，请在原通用工具核对源文件后导出v2再导入',MEDIA_IDENTITY_MISMATCH:'标注文件与当前视频身份不匹配，未导入',TEMPORAL_ENDPOINT_MISMATCH:'标注超出实际媒体终点，未自动裁切，请核对源文件和时间边界',HISTORY_DIVERGED:'此操作之后任务已有其他修改，撤销未应用；已保存内容和历史均保留',REVISION_CONFLICT:'任务修订已改变，草稿未覆盖服务器数据',MEDIA_CHANGED:'媒体或任务内容已改变，请重新加载后核对',INVALID_TOKEN:'会话已失效，请重新打开当前服务页面',FORBIDDEN_ORIGIN:'请求来源校验失败，请从本机服务地址打开',SCHEMA_INVALID:'标注字段不符合规则，请核对时间、标签与轨道',LIMIT_EXCEEDED:'文件或请求超过服务限制',UNSUPPORTED_MEDIA:'视频格式或时间信息不受支持',DEPENDENCY_UNAVAILABLE:'本机缺少必要的媒体工具',IMPORT_BUSY:'另一个导入正在处理，请完成后再试',SOURCE_MISSING:'媒体源不可用',CONNECTION_FAILED:'与本机服务连接失败',INTERNAL_ERROR:'服务处理异常，需核对保存回执',COMMAND_UNKNOWN:'尚未发现该命令的持久回执',INSUFFICIENT_MEMORY:'可用内存不足，请关闭其他占内存的程序后重试',MEMORY_STATUS_UNAVAILABLE:'暂时无法读取可用内存，请稍后重试',MODEL_RESOURCE_BUSY:'其他模型任务正在运行，请稍后重试',MODEL_TIMEOUT:'模型运行超时，可稍后重试或缩小分析范围',MODEL_MEMORY_FAILED:'模型因内存不足停止，请释放内存后重试',MODEL_WORKER_FAILED:'模型进程已停止，请重试；反复发生时检查运行记录',MODEL_LOAD_FAILED:'本地模型加载失败，请核对运行环境与权重后重试',MODEL_WORKER_PROTOCOL:'模型结果无法验证，请保留运行记录并检查配置',CONTROL_IDENTITY_MISMATCH:'重试回执与当前任务不匹配，请刷新后核对',VISION_RESUBMIT_REQUIRED:'分析配置已改变，请重新运行分析',CANDIDATE_DECISION_REQUIRED:'模型候选必须使用显式接受、采纳编辑或拒绝',CANDIDATE_STALE:'候选或来源作业已变化，请刷新后重新核对证据'};return (messages[code]||'操作未完成')+'（'+code+'）';}
 async function request(path,{method='GET',body,headers={},signal}={}){const h=new Headers(headers);h.set('X-TraceAnnotate-Token',token);if(body!==undefined&&typeof body==='string'&&!h.has('Content-Type'))h.set('Content-Type','application/json');let response;try{response=await fetch(API+path,{method,body,headers:h,signal,mode:'same-origin',credentials:'same-origin',cache:'no-store'});}catch(cause){const e=new Error('Connection failed');e.code='CONNECTION_FAILED';e.cause=cause;throw e;}if(!response.ok){let payload;try{payload=await response.json();}catch(_){}const e=new Error(payload?.error?.message||'Request failed');e.code=payload?.error?.code||'HTTP_'+response.status;e.status=response.status;e.details=payload?.error?.details||{};throw e;}return response;}
 async function json(path,options){return (await request(path,options)).json();}
 function commandId(prefix='cmd'){return prefix+'-'+crypto.randomUUID().replaceAll('-','');}
@@ -175,21 +191,95 @@ async function refreshIntakes(){try{const payload=await json('/intakes');state.i
 function ensureIntakePolling(){if(state.intakePoll)return;if(state.statusUnavailable)return;const active=()=>state.intakes.some(i=>i.state==='queued'||i.state==='preparing'||i.state==='cancel_requested');if(!active())return;state.intakePoll=setInterval(async()=>{if(!active()){clearInterval(state.intakePoll);state.intakePoll=null;return;}await refreshIntakes();},1000);}
 function currentForm(){return {label:$('segment-label').value,start:$('segment-start').value,end:$('segment-end').value,text:$('segment-text').value,track:$('segment-track').value,tags:$('segment-tags').value,transition:$('segment-transition')?.value||'',gradientStart:$('gradient-start')?.value||'',gradientEnd:$('gradient-end')?.value||'',reviewed:Boolean($('segment-reviewed')?.checked)};}
 function updateDirty(){state.dirty=JSON.stringify(currentForm())!==JSON.stringify(state.formBase)||JSON.stringify(state.anchors)!==JSON.stringify(state.anchorBase);renderSaveState();queueDraft();}
-function renderSaveState(){const el=$('save-state');el.classList.toggle('dirty',Boolean(state.dirty||state.pending||state.conflict));el.textContent=state.pending?'待确认保存':state.loadingTask?'正在加载…':state.busy?'正在保存…':state.conflict?'修订冲突 · 草稿保留':state.dirty?'草稿未保存':'已保存 · r'+(state.task?.revision??0);$('segment-fields').disabled=Boolean(!state.task||state.busy||state.pending||state.loadingTask);$('new-segment').disabled=Boolean(!state.task||state.busy||state.pending||state.loadingTask);$('delete-segment').disabled=Boolean(!state.selected||state.busy||state.pending||state.loadingTask);$('save-segment').disabled=Boolean(state.conflict||state.busy||state.pending||state.loadingTask);$('split-segment').disabled=Boolean(!state.selected||state.busy||state.pending||state.loadingTask);$('merge-next').disabled=Boolean(!state.selected||state.busy||state.pending||state.loadingTask);$('measurement-save').disabled=Boolean(!state.selected||state.busy||state.pending||state.loadingTask);$('pending-retry').disabled=Boolean(state.busy||state.loadingTask);$('pending-panel').hidden=!state.pending;$('conflict-panel').hidden=!state.conflict;updateUndoRedoButtons();renderPlayback();renderProfessionalAnalysis();renderProfessionalRendering();$('vision-run').disabled=Boolean(!state.task||!state.visionScene||state.busy||state.pending||state.loadingTask||state.dirty);$('vision-apply').disabled=Boolean(state.busy||state.pending||state.loadingTask||state.dirty||visionInputIsStale());const visionActive=Boolean(state.visionJob&&['queued','running','cancel_requested'].includes(state.visionJob.state));$('vision-cancel').hidden=!visionActive;$('vision-cancel').disabled=Boolean(!visionActive||state.visionJob?.state==='cancel_requested'||state.busy||state.loadingTask);renderVisionRetry();}
+function renderSaveState(){const candidateSelected=selectedSegment()?.provenance?.origin==='model_candidate';const el=$('save-state');el.classList.toggle('dirty',Boolean(state.dirty||state.pending||state.conflict));el.textContent=state.pending?'待确认保存':state.loadingTask?'正在加载…':state.busy?'正在保存…':state.conflict?'修订冲突 · 草稿保留':state.dirty?'草稿未保存':'已保存 · r'+(state.task?.revision??0);$('segment-fields').disabled=Boolean(!state.task||state.busy||state.pending||state.loadingTask);$('new-segment').disabled=Boolean(!state.task||state.busy||state.pending||state.loadingTask);$('delete-segment').disabled=Boolean(!state.selected||candidateSelected||state.busy||state.pending||state.loadingTask);$('save-segment').disabled=Boolean(candidateSelected||state.conflict||state.busy||state.pending||state.loadingTask);$('segment-reviewed').disabled=Boolean(candidateSelected);$('split-segment').disabled=Boolean(!state.selected||candidateSelected||state.busy||state.pending||state.loadingTask);$('merge-next').disabled=Boolean(!state.selected||candidateSelected||state.busy||state.pending||state.loadingTask);$('measurement-save').disabled=Boolean(!state.selected||candidateSelected||state.busy||state.pending||state.loadingTask);$('pending-retry').disabled=Boolean(state.busy||state.loadingTask);$('pending-panel').hidden=!state.pending;$('conflict-panel').hidden=!state.conflict;updateUndoRedoButtons();renderPlayback();renderProfessionalAnalysis();renderProfessionalRendering();$('vision-run').disabled=Boolean(!state.task||!state.visionScene||state.busy||state.pending||state.loadingTask||state.dirty);$('vision-apply').disabled=Boolean(state.busy||state.pending||state.loadingTask||state.dirty||visionInputIsStale());const visionActive=Boolean(state.visionJob&&['queued','running','cancel_requested'].includes(state.visionJob.state));$('vision-cancel').hidden=!visionActive;$('vision-cancel').disabled=Boolean(!visionActive||state.visionJob?.state==='cancel_requested'||state.busy||state.loadingTask);renderVisionRetry();}
 function updateAnchorLabels(){for(const which of ['start','end'])$(which+'-anchor').textContent=state.anchors[which]?.anchor?'绑定确定帧 #'+state.anchors[which].anchor.frame_index:'秒级边界 · 支持精确分数';}
 async function loadVisionOptions(){try{const options=await json('/vision-options');const caps=options.capabilities||{};state.visionScene=Boolean(caps.scene);const availability=value=>value===true?'可用':value===false||value==null?'不可用':typeof value==='object'?value.available===true?'可用':availability(value.status):({loaded:'可用',not_loaded:'未加载',unavailable:'不可用',released:'已验证，可按需运行'}[value]||'未确认');$('vision-options').textContent='镜头边界 '+availability(caps.scene)+' · 人体框 '+availability(caps.person)+' · 人脸关键点 '+availability(caps.landmarks)+' · 人脸 '+availability(caps.face)+' · OCR '+availability(caps.ocr)+' · CLIP '+availability(caps.clip)+' · VLM '+availability(caps.vlm)+' · 候选需核对';$('vision-run').disabled=!state.task||!caps.scene||state.busy||state.pending||state.loadingTask||state.dirty;}catch(error){state.visionScene=false;$('vision-options').textContent='能力状态不可用（'+describeError(error)+'）';$('vision-run').disabled=true;}}
-function renderVisionCandidates(items=[]){const table=$('vision-candidates'),body=table.querySelector('tbody');body.replaceChildren();for(const ann of items){const tr=document.createElement('tr');const name=document.createElement('td'),button=document.createElement('button');button.type='button';button.className='segment-select';button.textContent=ann.label;button.addEventListener('click',()=>selectAnnotation(ann.id));name.append(button);const time=document.createElement('td');time.className='mono';time.textContent=ann.type==='segment'?showTime(ann.start.seconds)+' – '+showTime(ann.end.seconds)+' s':'整片';const origin=document.createElement('td');origin.textContent=(ann.provenance?.origin||'')+' · '+(ann.provenance?.job_id||'');const review=document.createElement('td');const current=state.task?.annotations.find(item=>item.id===ann.id)||ann;review.textContent=current.review_status==='reviewed'?'已复核':'未审核';const actions=document.createElement('td'),accept=document.createElement('button'),reject=document.createElement('button');accept.type='button';accept.className='quiet';accept.textContent='接受';reject.type='button';reject.className='danger';reject.textContent='拒绝';accept.addEventListener('click',async()=>{await selectAnnotation(ann.id);if(state.selected!==ann.id)return;const target=state.task.annotations.find(item=>item.id===ann.id);if(!target)return;const provenance={...target.provenance,origin:'manual',actor_id:'local-user',job_id:null};const updated=await saveCommand('update_annotation',{annotation_id:ann.id,changes:{provenance}});if(updated)await saveCommand('review_annotation',{annotation_id:ann.id,reviewed:true});await refreshVisionStatus();});reject.addEventListener('click',async()=>{await selectAnnotation(ann.id);if(state.selected!==ann.id)return;const base=clone(state.task);if(!await confirmAction('删除会创建新修订，受保护撤销只在历史未被其他修改分叉时应用。',{title:'删除这个片段？',accept:'删除片段',cancel:'保留片段'}))return;if(state.task?.id!==base.id)return;await saveCommand('delete_annotation',{annotation_id:ann.id},{base});await refreshVisionStatus();});actions.append(accept,reject);tr.append(name,time,origin,review,actions);body.append(tr);}table.hidden=!items.length;}
-async function refreshVisionStatus(){const taskId=state.task?.id;if(!taskId)return;const generation=state.visionGeneration;try{const status=await json('/tasks/'+encodeURIComponent(taskId)+'/vision-status');if(generation!==state.visionGeneration||state.task?.id!==taskId)return;renderVisionCandidates(status.candidates||[]);}catch(error){if(generation!==state.visionGeneration||state.task?.id!==taskId)return;if(error.code!=='CONNECTION_FAILED')notice('视觉候选状态读取失败：'+describeError(error),'error');}}
+function renderVisionCandidates(items=[]){
+ const table=$('vision-candidates'),body=table.querySelector('tbody');body.replaceChildren();
+ for(const ann of items){
+  const tr=document.createElement('tr'),name=document.createElement('td'),button=document.createElement('button');
+  button.type='button';button.className='segment-select';button.textContent=ann.label;
+  button.addEventListener('click',async()=>{if(ann.type==='segment'){await selectAnnotation(ann.id);if(state.selected!==ann.id)return;}await openVisionEvidenceForCandidate(ann);});
+  name.append(button);
+  const time=document.createElement('td');time.className='mono';
+  time.textContent=ann.type==='segment'?showTime(ann.start.seconds)+' – '+showTime(ann.end.seconds)+' s':ann.type==='event'?'事件 @ '+showTime(ann.at.seconds)+' s':'整片';
+  const origin=document.createElement('td');origin.textContent='模型候选 · '+(ann.provenance?.job_id||'作业未知');
+  const review=document.createElement('td');review.textContent='未审核';
+  const actions=document.createElement('td');
+  for(const [decision,label,style] of [['accepted','接受','quiet'],['edited','采纳编辑','quiet'],['rejected','拒绝','danger']]){
+   const control=document.createElement('button');control.type='button';control.className=style;control.textContent=label;
+   control.disabled=!state.visionCandidateDigests?.[ann.id]||(decision==='edited'&&ann.type!=='segment');
+   control.addEventListener('click',()=>decideVisionCandidate(ann.id,decision));actions.append(control);
+  }
+  tr.append(name,time,origin,review,actions);body.append(tr);
+ }
+ table.hidden=!items.length;
+}
+function visionDecisionActor(){
+ const select=$('vision-actor-type'),input=$('vision-actor-id');
+ if(!select.value){select.focus();notice('请先选择实际操作主体。','warning');return null;}
+ const actor_id=input.value.trim();
+ if(!/^[A-Za-z][A-Za-z0-9_-]{0,95}$/.test(actor_id)){input.focus();notice('请填写有效的主体标识。','warning');return null;}
+ return {actor_type:select.value,actor_id};
+}
+async function decideVisionCandidate(annotationId,decision){
+ if(!state.task||state.busy||state.pending||state.conflict||state.loadingTask)return;
+ const candidate=state.task.annotations.find(item=>item.id===annotationId&&item.provenance?.origin==='model_candidate');
+ const digest=state.visionCandidateDigests?.[annotationId];
+ if(!candidate||!digest){notice('候选或摘要已变化，请刷新任务和候选状态。','warning');return;}
+ const actor=visionDecisionActor();if(!actor)return;
+ if(decision!=='rejected'&&state.visionEvidenceReviewAnnotation!==annotationId){
+  notice('请先点击候选名称，读取并核对该作业的逐帧证据。','warning');return;
+ }
+ let changes={},diff_summary='';
+ if(decision==='edited'){
+  if(candidate.type!=='segment'||state.selected!==annotationId){notice('请先选中该候选，在片段表单修改后再采纳编辑。','warning');return;}
+  try{changes=buildChanges();delete changes.review_status;}catch(error){notice(error.message||String(error),'error');return;}
+  if(!Object.keys(changes).length){notice('尚无内容差异；如不修改，请选择接受。','warning');return;}
+  diff_summary=$('vision-diff-summary').value.trim();
+  if(!diff_summary){$('vision-diff-summary').focus();notice('采纳编辑需要填写改动依据与字段摘要。','warning');return;}
+ }else{
+  if(state.dirty){notice('当前片段有未保存草稿；请先撤回草稿或用“采纳编辑”提交。','warning');return;}
+  if(decision==='rejected'){
+   const taskId=state.task.id;
+   if(!await confirmAction('拒绝会从活动片段移除候选，但来源快照、作业证据和决定仍保留。',{title:'拒绝这个模型候选？',accept:'确认拒绝',cancel:'保留候选'})||state.task?.id!==taskId)return;
+  }
+ }
+ const base=clone(state.task);
+ const receipt=await saveCommand('decide_candidate',{annotation_id:annotationId,decision,...actor,expected_candidate_sha256:digest,changes,diff_summary},{base});
+ if(!receipt)return;
+ state.visionCandidateDigests={};await refreshVisionStatus();
+ notice((decision==='rejected'?'候选已拒绝并留存来源':actor.actor_type==='human'?'决定已记录为本人自声明复核':'决定已记录，仍为未审核')+' · 修订 r'+receipt.revision,'success');
+}
+async function refreshVisionStatus(){
+ const taskId=state.task?.id;if(!taskId)return;const generation=state.visionGeneration;
+ try{
+  const status=await json('/tasks/'+encodeURIComponent(taskId)+'/vision-status');
+  if(generation!==state.visionGeneration||state.task?.id!==taskId)return;
+  if(status.task_id!==taskId||status.revision!==state.task.revision||status.content_sha256!==state.task.content_sha256){
+   state.visionCandidateDigests={};renderVisionCandidates([]);
+   notice('候选状态与当前任务修订不一致，请重新加载任务后核对。','warning');return;
+  }
+  const candidates=status.candidates||[];
+  state.visionCandidateDigests=status.candidate_sha256||{};
+  renderVisionCandidates(candidates);
+  if(state.visionEvidenceReviewAnnotation&&!candidates.some(item=>item.id===state.visionEvidenceReviewAnnotation&&item.provenance?.job_id===state.visionEvidenceReviewJob?.id)){clearVisionEvidence();renderVisionEvidence();}
+ }catch(error){
+  if(generation!==state.visionGeneration||state.task?.id!==taskId)return;
+  state.visionCandidateDigests={};renderVisionCandidates([]);
+  if(error.code!=='CONNECTION_FAILED')notice('视觉候选状态读取失败：'+describeError(error),'error');
+ }
+}
 function resetVision(){
  // Saving reloads the same task; switching tasks suspends only its UI polling.
  // Keep one frozen job reference per task so neither action loses real work.
  if(state.task?.id&&state.visionJob?.task_id===state.task.id){if(!state.visionTasks)state.visionTasks=new Map();state.visionTasks.set(state.task.id,{job:state.visionJob,result:state.visionResult});}
  if(state.visionRetryOwner){state.busy=false;state.visionRetryOwner=null;}state.visionGeneration++;if(state.visionTimer){clearTimeout(state.visionTimer);state.visionTimer=null;}if(state.visionAbort){state.visionAbort.abort();state.visionAbort=null;}
- state.visionJob=null;state.visionResult=null;renderVisionCandidates([]);renderVisionJob();
+ state.visionJob=null;state.visionResult=null;state.visionCandidateDigests={};if(typeof clearVisionEvidence==='function')clearVisionEvidence();renderVisionCandidates([]);renderVisionJob();
 }
 function restoreTaskVision(){
  const cached=state.visionTasks?.get(state.task?.id);if(!cached||cached.job.task_id!==state.task.id)return;
- state.visionJob={...cached.job};state.visionResult=cached.result;renderVisionJob();
+ state.visionJob={...cached.job};state.visionResult=cached.result;renderVisionJob();if(typeof renderVisionEvidence==='function')renderVisionEvidence();
  if(!['succeeded','failed','cancelled'].includes(state.visionJob.state))pollVision();
 }
 function visionInputIsStale(){const job=state.visionJob,task=state.task;return Boolean(job&&task&&(job.task_id!==task.id||job.input_revision!==task.revision||job.input_sha256!==task.content_sha256));}
@@ -205,7 +295,7 @@ async function retryVision(){
  const owner={};state.visionRetryOwner=owner;state.busy=true;renderSaveState();const controller=new AbortController();state.visionAbort=controller;
  let control=savedVisionRetry(job);
  const current=()=>visionIsCurrent(taskId,generation,job.id);
- const accept=result=>{if(!result||result.job_id!==job.id||result.action!==control.action||result.state!=='queued')throw Object.assign(new Error('Retry receipt identity mismatch'),{code:'CONTROL_IDENTITY_MISMATCH'});stashVisionRetry(job,null);if(!current())return;state.visionJob={...job,state:result.state,error_code:null,error_message:null,cancel_requested:false,terminal:false};state.visionResult=null;renderVisionJob();state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;pollVision();notice('已确认重试；候选仍需逐条核对，不会自动改动标注。','success');};
+ const accept=result=>{if(!result||result.job_id!==job.id||result.action!==control.action||result.state!=='queued')throw Object.assign(new Error('Retry receipt identity mismatch'),{code:'CONTROL_IDENTITY_MISMATCH'});stashVisionRetry(job,null);if(!current())return;state.visionJob={...job,state:result.state,error_code:null,error_message:null,cancel_requested:false,terminal:false};state.visionResult=null;if(typeof clearVisionEvidence==='function')clearVisionEvidence();renderVisionJob();state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;pollVision();notice('已确认重试；候选仍需逐条核对，不会自动改动标注。','success');};
  try{
   // A lost response may already have committed. Reconcile the SAME command
   // before looking at a later job attempt, so it cannot retry that attempt.
@@ -223,8 +313,8 @@ async function retryVision(){
  finally{if(state.visionAbort===controller)state.visionAbort=null;if(state.visionRetryOwner===owner){state.busy=false;state.visionRetryOwner=null;}renderSaveState();}
 }
 function renderVisionJob(){const box=$('vision-job'),cancel=$('vision-cancel');if(!state.visionJob){box.hidden=true;$('vision-apply').hidden=true;cancel.hidden=true;cancel.disabled=true;renderVisionRetry();return;}box.hidden=false;const names={queued:'排队',running:'运行中',cancel_requested:'取消中',succeeded:'已完成',failed:'失败',cancelled:'已取消'};const modules=state.visionResult?.module_status||{};const moduleText=['person','landmarks','face','ocr','clip','vlm','scene','motion','boundary'].filter(name=>modules[name]&&modules[name]!=='not_run').map(name=>name+'='+modules[name]).join(' ');const capability=state.visionResult?(()=>{const c=state.visionResult.content_sampling||{},a=state.visionResult.actions_sampling||{};const supported=(a.supported||[]).join('/')||'无';const unsupported=(a.unsupported||[]).join('/')||'无';return '六项能力 转场='+(modules.transition||'not_run')+' 内容='+(c.status||'not_run')+'('+(c.changes??0)+'变化/'+(c.filtered??0)+'过滤)'+' 人体/人脸/景别/运镜='+(modules.person||'not_run')+'/'+(modules.face||'not_run')+'/'+(modules.framing||'not_run')+'/'+(modules.motion||'not_run')+' 人脸关键点='+(modules.landmarks||'not_run')+' 动作='+(a.status||modules.actions||'not_run')+'('+(a.candidates?.length??0)+'候选;支持'+supported+';未支持'+unsupported+')'+' 表情='+(modules.expressive||'not_run')+(modules.expressive_reason?'('+modules.expressive_reason+')':'')+' 声学='+(modules.acoustics||'not_run')})():'';const runs=state.visionResult?.model_runs||[];const content=state.visionResult?.content_sampling;const contentText=content?' · 内容采样 '+content.status+' '+content.returned+' 帧 / 需 '+content.required_samples+' 帧'+(content.insufficient_scenes?'（'+content.insufficient_scenes+' 个镜头不足）':''):'';box.textContent='视觉任务 '+state.visionJob.id.slice(-8)+' · '+(names[state.visionJob.state]||state.visionJob.state)+(state.visionJob.error_code?' · '+describeError({code:state.visionJob.error_code}):'')+(state.visionResult?' · 候选镜头 '+state.visionResult.scenes.length+' 个、关键帧 '+state.visionResult.keyframes.length+' 个、运行记录 '+runs.length+' 条':'')+(moduleText?' · '+moduleText:'')+contentText+(capability?' · '+capability:'')+(visionInputIsStale()?' · 当前任务已修订，结果仅供查看；重新运行分析后才能应用。':'');const active=['queued','running','cancel_requested'].includes(state.visionJob.state);cancel.hidden=!active;cancel.disabled=!active||state.visionJob.state==='cancel_requested'||state.busy||state.loadingTask;$('vision-apply').hidden=!(state.visionJob.state==='succeeded'&&state.visionResult);$('vision-apply').disabled=Boolean(state.busy||state.pending||state.loadingTask||state.dirty||visionInputIsStale());renderVisionRetry();}
-async function pollVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||job.terminal||!taskId)return;const controller=new AbortController();state.visionAbort=controller;try{const status=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-status',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;if(status.task_id!==taskId||status.job_id!==job.id)throw new Error('视觉任务身份不匹配');state.visionJob={...job,...status};if(status.state==='succeeded'){state.visionResult=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-result',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;const content=state.visionResult.content_sampling;if(content?.status==='insufficient_samples'){const first=(content.scene_results||[]).find(item=>item.status==='insufficient_samples');notice('内容变化采样不足：'+(first?.message||('需要至少 '+content.required_samples+' 帧，当前 '+content.returned+' 帧'))+' 该镜头未判定为无变化。','warning');}state.visionJob.terminal=true;}else if(['failed','cancelled'].includes(status.state)){state.visionJob.terminal=true;}renderVisionJob();if(!state.visionJob.terminal)state.visionTimer=setTimeout(pollVision,1500);}catch(error){if(error.name==='AbortError'||!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:'failed',error_code:error.code||'STATUS_FAILED',error_message:error.message||'',terminal:true};renderVisionJob();notice('视觉任务状态读取失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;}}
-async function runVision(){if(!state.task||state.busy||state.dirty||state.loadingTask){notice('请先保存当前片段并等待任务加载完成。','warning');return;}const task=state.task;const sequence=state.sequence;const generation=state.visionGeneration;state.busy=true;renderSaveState();try{const batch=await json('/tasks/'+encodeURIComponent(task.id)+'/vision-jobs',{method:'POST',body:JSON.stringify({command_id:commandId('vis'),expected_revision:task.revision,expected_sha256:task.content_sha256,window:null,subject_annotation_id:null})});if(sequence!==state.sequence||task.id!==state.task?.id)return;const item=batch.jobs?.[0];if(!item)throw new Error('Vision batch has no job');if(state.visionTimer){clearTimeout(state.visionTimer);state.visionTimer=null;}state.visionResult=null;state.visionJob={id:item.id||item.job_id,task_id:task.id,input_revision:task.revision,input_sha256:task.content_sha256,state:item.state||'queued'};renderVisionJob();pollVision();notice('已提交视觉分析任务；按可用能力运行，只生成候选，不自动改标注。','success');}catch(error){if(sequence===state.sequence&&task.id===state.task?.id)notice('视觉任务提交失败：'+describeError(error),'error');}finally{if(sequence===state.sequence)state.busy=false;renderSaveState();}}
+async function pollVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||job.terminal||!taskId)return;const controller=new AbortController();state.visionAbort=controller;try{const status=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-status',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;if(status.task_id!==taskId||status.job_id!==job.id)throw new Error('视觉任务身份不匹配');state.visionJob={...job,...status};if(status.state==='succeeded'){state.visionResult=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-result',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;const content=state.visionResult.content_sampling;if(content?.status==='insufficient_samples'){const first=(content.scene_results||[]).find(item=>item.status==='insufficient_samples');notice('内容变化采样不足：'+(first?.message||('需要至少 '+content.required_samples+' 帧，当前 '+content.returned+' 帧'))+' 该镜头未判定为无变化。','warning');}state.visionJob.terminal=true;if(typeof renderVisionEvidence==='function')renderVisionEvidence();}else if(['failed','cancelled'].includes(status.state)){state.visionJob.terminal=true;}renderVisionJob();if(!state.visionJob.terminal)state.visionTimer=setTimeout(pollVision,1500);}catch(error){if(error.name==='AbortError'||!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:'failed',error_code:error.code||'STATUS_FAILED',error_message:error.message||'',terminal:true};renderVisionJob();notice('视觉任务状态读取失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;}}
+async function runVision(){if(!state.task||state.busy||state.dirty||state.loadingTask){notice('请先保存当前片段并等待任务加载完成。','warning');return;}const task=state.task;const sequence=state.sequence;const generation=state.visionGeneration;state.busy=true;renderSaveState();try{const batch=await json('/tasks/'+encodeURIComponent(task.id)+'/vision-jobs',{method:'POST',body:JSON.stringify({command_id:commandId('vis'),expected_revision:task.revision,expected_sha256:task.content_sha256,window:null,subject_annotation_id:null})});if(sequence!==state.sequence||task.id!==state.task?.id)return;const item=batch.jobs?.[0];if(!item)throw new Error('Vision batch has no job');if(state.visionTimer){clearTimeout(state.visionTimer);state.visionTimer=null;}state.visionResult=null;clearVisionEvidence();state.visionJob={id:item.id||item.job_id,task_id:task.id,input_revision:task.revision,input_sha256:task.content_sha256,state:item.state||'queued'};renderVisionJob();pollVision();notice('已提交视觉分析任务；按可用能力运行，只生成候选，不自动改标注。','success');}catch(error){if(sequence===state.sequence&&task.id===state.task?.id)notice('视觉任务提交失败：'+describeError(error),'error');}finally{if(sequence===state.sequence)state.busy=false;renderSaveState();}}
 async function cancelVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||!['queued','running','cancel_requested'].includes(job.state)||state.busy)return;state.busy=true;renderSaveState();const controller=new AbortController();state.visionAbort=controller;try{const result=await json('/jobs/'+encodeURIComponent(job.id)+'/control',{method:'POST',body:JSON.stringify({command_id:commandId('vcan'),action:'cancel'}),signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:result.state,cancel_requested:true,terminal:['cancelled','succeeded','failed'].includes(result.state)};renderVisionJob();if(state.visionJob.terminal){state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;notice('视觉任务已取消；未生成或未应用的候选不会改动标注。','warning');}else{notice('已请求取消；任务在下一个检查点停止，候选不会自动应用。','warning');state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;pollVision();}}catch(error){if(error.name!=='AbortError'&&visionIsCurrent(taskId,generation,job.id))notice('取消失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;if(taskId===state.task?.id)state.busy=false;renderSaveState();}}
 async function applyVision(){if(!state.task||!state.visionJob||!state.visionResult||state.busy||state.pending||state.loadingTask||state.dirty)return;if(visionInputIsStale()){notice('当前任务修订已改变；请重新运行视觉分析，旧结果不会直接写入当前标注。','warning');return;}const task=state.task;const jobId=state.visionJob.id;state.busy=true;renderSaveState();try{const result=await json('/jobs/'+encodeURIComponent(jobId)+'/apply-vision',{method:'POST',body:JSON.stringify({command_id:commandId('vap'),expected_revision:task.revision,expected_sha256:task.content_sha256,operation:'apply_vision_job',payload:{}})});await switchTask(task.id,{force:true});notice('视觉候选已写入；请逐条核对、修改并人工复核。','success');return result;}catch(error){notice('应用候选失败：'+describeError(error),'error');}finally{state.busy=false;renderSaveState();}}
 function fillForm(annotation=null){if(state.segmentPlayback&&state.segmentPlayback.annotationId!==(annotation?.id||null))pausePlayback({clearSegment:true});state.selected=annotation?.id||null;state.original=annotation?clone(annotation):null;const start=annotation?.start||{seconds:state.media.video_start},end=annotation?.end||{seconds:state.media.video_end};$('segment-label').value=annotation?.label||'';$('segment-start').value=showTime(start.seconds);$('segment-end').value=showTime(end.seconds);$('segment-text').value=annotation?.text||'';$('segment-track').value=annotation?.track||'main';const reserved=reservedTagParts(annotation?.tags||[]);$('segment-tags').value=reserved.plain.join('\n');$('segment-transition').value=TRANSITION_VALUES.has(reserved.transition)?reserved.transition:'';$('gradient-start').value=reserved.gradientStart;$('gradient-end').value=reserved.gradientEnd;if($('segment-reviewed'))$('segment-reviewed').checked=Boolean(annotation?.review_status==='reviewed'&&annotation?.review_binding);if($('review-notice')){$('review-notice').textContent='修改时间、标签、内容、转场/渐变、轨道或语义量值后，旧复核将失效，需重新核对并勾选。';$('review-notice').style.color='var(--muted)';}state.anchors={start:clone(start),end:clone(end)};state.formBase=currentForm();state.anchorBase=clone(state.anchors);state.dirty=false;state.conflict=false;const midpoint=rat(BigInt(start.seconds.n)*BigInt(end.seconds.d)+BigInt(end.seconds.n)*BigInt(start.seconds.d),2n*BigInt(start.seconds.d)*BigInt(end.seconds.d));$('split-at').value=showTime(midpoint);renderMeasurements(annotation);$('form-title').textContent=annotation?'编辑片段':'新增片段';updateAnchorLabels();renderSaveState();renderSegments();renderExportTracks();scheduleCompare();}
@@ -258,7 +348,7 @@ async function verifiedFramePng(index,media=state.media){
  const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),byte=>byte.toString(16).padStart(2,'0')).join('');
  if(digest!==response.headers.get('X-TraceAnnotate-Image-SHA256'))throw new Error('Frame image hash mismatch');
  const url=URL.createObjectURL(new Blob([bytes],{type:'image/png'}));
- return {row,url};
+ return {row,url,image_sha256:digest};
 }
 
 async function frameAtTime(target,mode,media){
@@ -583,6 +673,7 @@ async function listRecoverableDrafts(){
 
 async function saveSegment(event){
  event.preventDefault();if(state.busy||state.pending||state.loadingTask)return;
+ if(selectedSegment()?.provenance?.origin==='model_candidate'){notice('模型候选请在下方候选表核对证据后使用“接受、采纳编辑或拒绝”。','warning');return;}
  try{const wantReview=$('segment-reviewed').checked,values=buildChanges(),selected=state.selected;let receipt=null;
  if(selected){delete values.review_status;if(Object.keys(values).length)receipt=await saveCommand('update_annotation',{annotation_id:selected,changes:values});
  else if(wantReview!==(state.original?.review_status==='reviewed')){await saveCommand('review_annotation',{annotation_id:selected,reviewed:wantReview});return;}
@@ -592,11 +683,11 @@ async function saveSegment(event){
  if(!reviewed)notice('内容已保存；审核尚未确认，请恢复回执或核对后重新审核。','warning');}
  }catch(error){notice(error.code?describeError(error):error.message,'error');}
 }
-async function deleteSegment(){if(!state.selected||state.busy||state.pending||state.loadingTask)return;
+async function deleteSegment(){if(!state.selected||state.busy||state.pending||state.loadingTask)return;if(selectedSegment()?.provenance?.origin==='model_candidate'){notice('模型候选请在下方候选表使用“拒绝”，来源证据会保留。','warning');return;}
  const base=clone(state.task),selected=state.selected;
  if(await confirmAction('删除会创建新修订，受保护撤销只在历史未被其他修改分叉时应用。',{title:'删除这个片段？',accept:'删除片段',cancel:'保留片段'})){
  if(state.task?.id!==base.id)return;await saveCommand('delete_annotation',{annotation_id:selected},{base});}}
-function plainTimelineSegment(annotation){const attributes=annotation?.attributes||{};return annotation&&annotation.type==='segment'&&!(annotation.evidence_ids||[]).length&&Object.keys(attributes).length===0;}
+function plainTimelineSegment(annotation){const attributes=annotation?.attributes||{};return annotation&&annotation.type==='segment'&&annotation.provenance?.origin!=='model_candidate'&&!(annotation.evidence_ids||[]).length&&Object.keys(attributes).length===0;}
 async function splitSegment(){
  if(!state.selected||state.busy||state.pending||state.loadingTask)return;const base=clone(state.task),annotation=selectedSegment();
  if(!annotation)return;if(!plainTimelineSegment(annotation)){notice('带证据或语义声明的片段不能拆分：拆分会让量值与证据区间失去唯一归属。请先清除语义/证据。','error');return;}
@@ -623,7 +714,7 @@ async function mergeNextSegment(){
  const receipt=await saveCommand('replace_annotations',{annotations:list},{base});if(receipt)notice('已合并到 '+showTime(next.end.seconds)+' s；保留所选片段 id 与标签，复核回落未审核。','success');
 }
 async function saveMeasurement(){
- if(!state.selected||state.busy||state.pending||state.loadingTask)return;const annotation=selectedSegment();const claims=(annotation?.attributes?.semantic?.claims||[]).filter(claim=>claim&&claim.claim_type==='measured'&&claim.measurement);const claim=claims.find(item=>item.id===$('measurement-claim').value);if(!claim){notice('没有可编辑的 measured claim。','warning');return;}
+ if(!state.selected||state.busy||state.pending||state.loadingTask)return;const annotation=selectedSegment();if(annotation?.provenance?.origin==='model_candidate'){notice('模型候选量值不能通过普通更新修改；请先完成显式候选决定。','warning');return;}const claims=(annotation?.attributes?.semantic?.claims||[]).filter(claim=>claim&&claim.claim_type==='measured'&&claim.measurement);const claim=claims.find(item=>item.id===$('measurement-claim').value);if(!claim){notice('没有可编辑的 measured claim。','warning');return;}
  const value=Number($('measurement-value').value);if(!Number.isFinite(value)){notice('量值必须是有限数字。','error');return;}const unit=$('measurement-unit').value.trim();if(!unit){notice('单位不能为空。','error');return;}const basis=$('measurement-basis').value;if(!['measured','declared'].includes(basis)){notice('口径必须是 measured 或 declared。','error');return;}
  const attributes=clone(annotation.attributes||{});const target=attributes.semantic.claims.find(item=>item.id===claim.id);target.measurement={...target.measurement,value,unit,basis};
  const receipt=await saveCommand('update_annotation',{annotation_id:annotation.id,changes:{attributes}});
@@ -814,6 +905,173 @@ function stopBatchUploads(){const b=state.batch;if(!b)return;b.stopped=true;if(s
 async function cancelOwnedBatchIntakes(){const b=state.batch;if(!b)return 0;let count=0;for(const item of b.items){if(item.runId!==state.batchRunId||!item.intakeId)continue;const row=state.intakes.find(i=>i.id===item.intakeId);if(!row||!['queued','preparing','cancel_requested'].includes(row.state))continue;await intakeAction(item.intakeId,'cancel');count++;}if(count)notice('已请求取消本批 '+count+' 个排队或准备中的项目；其他批次与当前编辑任务未受影响。','warning');return count;}
 async function recoverBatch(){const stored=restoreBatch();if(!stored)return;state.batch={id:stored.id,createdAt:stored.createdAt,items:stored.items.map(i=>({...i,file:null,note:i.note||'',runId:i.runId||'legacy'})),running:false,stopped:true};for(const item of state.batch.items){if(item.phase==='pending'){item.phase='skipped';item.note='页面已刷新，未提交';}}state.batchRunId=null;renderBatch();let reconciled=0;for(const item of state.batch.items){if(item.phase==='unknown'&&item.commandId){await reconcileBatchItem(item,{budget:2});reconciled++;}}syncBatchFromIntakes();saveBatch();renderBatch();if(reconciled)notice('已按原始命令核对 '+reconciled+' 个未确认的上传；不会自动重复上传。','warning');}
 async function importFiles(){const files=Array.from($('file-input').files||[]);$('file-input').value='';if(!files.length)return;if(state.importing){notice('上一批仍在提交，请等待或先停止。','warning');return;}startBatch(files);}
+const VISION_EVIDENCE_PAGE_SIZE=12;
+const VISION_EVIDENCE_OBJECT_LIMIT=24;
+const VISION_EVIDENCE_HAND_LIMIT=4;
+const VISION_SVG_NS='http://www.w3.org/2000/svg';
+function releaseVisionEvidenceFrame(){
+ state.visionEvidenceToken=(state.visionEvidenceToken||0)+1;
+ if(state.visionEvidenceBlob){URL.revokeObjectURL(state.visionEvidenceBlob);state.visionEvidenceBlob=null;}
+ if(typeof document==='undefined')return;
+ const image=$('vision-evidence-image'),overlay=$('vision-evidence-overlay');
+ image.removeAttribute('src');image.hidden=true;overlay.replaceChildren();overlay.hidden=true;
+ $('vision-evidence-identity').textContent='';$('vision-evidence-notes').replaceChildren();
+}
+function clearVisionEvidence(){
+ state.visionEvidenceLoadToken=(state.visionEvidenceLoadToken||0)+1;
+ state.visionEvidenceReviewJob=null;state.visionEvidenceReviewResult=null;state.visionEvidenceReviewAnnotation=null;
+ releaseVisionEvidenceFrame();state.visionEvidencePage=0;
+ if(typeof document==='undefined')return;
+ $('vision-evidence').hidden=true;$('vision-evidence-frame').replaceChildren();
+ $('vision-evidence-status').textContent='';
+}
+function visionProjectionManifest(jobId){
+ for(const annotation of state.task?.annotations||[]){
+  for(const claim of annotation.attributes?.semantic?.claims||[]){
+   const parameters=claim.method?.parameters;
+   if(claim.method?.id==='visual-candidate-projection-manifest-v1'&&parameters?.source_job_id===jobId)return parameters;
+  }
+ }
+ return null;
+}
+function visionEvidenceLossText(result,jobId){
+ const frames=Array.isArray(result.keyframes)?result.keyframes.length:0;
+ const sampling=result.sampling||{};
+ const parts=['界面每组最多显示 '+VISION_EVIDENCE_PAGE_SIZE+' 帧，共 '+frames+' 帧；切换组可检查其余帧。'];
+ if(frames){const first=result.keyframes[0],last=result.keyframes[frames-1];parts.push('本次实际采样帧覆盖 '+showTime(first.timestamp)+'–'+showTime(last.timestamp)+' s；不代表区间外画面已分析。');}
+ if(sampling.truncated)parts.push('原始采样已截断：计划 '+sampling.planned+' 帧，实际 '+sampling.returned+' 帧；未采样后段不能推断为无目标或无动作。');
+ else if(sampling.planned!=null&&sampling.returned!=null)parts.push('原始采样 '+sampling.returned+'/'+sampling.planned+' 帧。');
+ const manifest=visionProjectionManifest(jobId);
+ if(manifest){
+  const omitted=Object.entries(manifest.omitted||{}).filter(([,value])=>Number(value)>0).map(([key,value])=>key+' '+value);
+  parts.push('专业 JSON 投影'+(manifest.projection_complete?'完整。':'有损：'+(omitted.join('、')||manifest.omission_reason||'请查看原始作业')+'；完整候选保留在本地作业与项目备份。'));
+ }else parts.push('尚无当前作业的专业 JSON 投影清单；本页展示原始候选的有界视图，不代表导出无损。');
+ return parts.join(' ');
+}
+function renderVisionEvidence(){
+ if(typeof document==='undefined')return;
+ releaseVisionEvidenceFrame();
+ const panel=$('vision-evidence'),result=state.visionEvidenceReviewResult||state.visionResult,job=state.visionEvidenceReviewJob||state.visionJob,media=state.media,task=state.task;
+ if(!result||!job||!task||!media){panel.hidden=true;return;}
+ panel.hidden=false;
+ if(result.job_id!==job.id||result.task_id!==task.id||result.media_id!==media.id||result.input_sha256!==job.input_sha256||result.file_sha256!==media.playback?.sha256){
+  $('vision-evidence-status').textContent='候选结果与当前任务或媒体身份不一致，已拒绝显示帧证据。';
+  $('vision-evidence-frame').replaceChildren();return;
+ }
+ $('vision-evidence-scope').textContent='范围：'+(result.scope||'未声明')+'。模型框、手部点和动作结论均为未复核候选；此视图不证明准确率或人工签核。';
+ $('vision-evidence-loss').textContent=visionEvidenceLossText(result,job.id);
+ const keyframes=Array.isArray(result.keyframes)?result.keyframes:[];
+ const pages=Math.ceil(keyframes.length/VISION_EVIDENCE_PAGE_SIZE);
+ state.visionEvidencePage=Math.max(0,Math.min(state.visionEvidencePage||0,Math.max(0,pages-1)));
+ const start=state.visionEvidencePage*VISION_EVIDENCE_PAGE_SIZE;
+ const select=$('vision-evidence-frame');select.replaceChildren();
+ for(let index=start;index<Math.min(start+VISION_EVIDENCE_PAGE_SIZE,keyframes.length);index++){
+  const option=document.createElement('option');option.value=String(index);
+  option.textContent='帧 #'+keyframes[index].frame_index+' · '+showTime(keyframes[index].timestamp)+' s';select.append(option);
+ }
+ $('vision-evidence-prev').disabled=state.visionEvidencePage===0;
+ $('vision-evidence-next').disabled=state.visionEvidencePage>=pages-1;
+ $('vision-evidence-page').textContent=keyframes.length?'第 '+(state.visionEvidencePage+1)+' / '+pages+' 组 · '+(start+1)+'–'+Math.min(start+VISION_EVIDENCE_PAGE_SIZE,keyframes.length)+' / '+keyframes.length+' 帧':'无采样帧';
+ if(!keyframes.length){$('vision-evidence-status').textContent='作业没有可显示的采样帧。';return;}
+ loadVisionEvidenceFrame().catch(error=>{$('vision-evidence-status').textContent='帧证据加载失败：'+String(error.message||error);});
+}
+async function openVisionEvidenceForCandidate(annotation){
+ const task=state.task,media=state.media,jobId=annotation.provenance?.job_id;
+ if(!task||!media||annotation.provenance?.origin!=='model_candidate'||typeof jobId!=='string')return;
+ clearVisionEvidence();
+ const generation=state.visionEvidenceLoadToken;
+ const current=()=>generation===state.visionEvidenceLoadToken&&state.task?.id===task.id&&state.media?.id===media.id&&(annotation.type!=='segment'||state.selected===annotation.id)&&state.task.annotations.some(item=>item.id===annotation.id&&item.provenance?.job_id===jobId);
+ $('vision-evidence').hidden=false;
+ $('vision-evidence-status').textContent='正在读取已保存候选的持久作业证据…';
+ try{
+  const status=await json('/jobs/'+encodeURIComponent(jobId)+'/vision-status');
+  if(!current())return;
+  if(status.job_id!==jobId||status.task_id!==task.id||status.state!=='succeeded'||status.has_candidate!==true)throw new Error('作业状态与该候选不一致');
+  const result=await json('/jobs/'+encodeURIComponent(jobId)+'/vision-result');
+  if(!current())return;
+  if(result.job_id!==jobId||result.task_id!==task.id||result.media_id!==media.id||result.file_sha256!==media.playback?.sha256||result.input_sha256!==status.input_sha256||result.input_revision!==status.input_revision)throw new Error('候选结果与持久作业、任务或媒体身份不一致');
+  state.visionEvidenceReviewJob={...status,id:jobId};
+  state.visionEvidenceReviewResult=result;
+  state.visionEvidenceReviewAnnotation=annotation.id;
+  renderVisionEvidence();
+ }catch(error){
+  if(current())$('vision-evidence-status').textContent='已保存候选证据未通过核对：'+String(error.message||error);
+ }
+}
+function visionEvidenceNote(text){const item=document.createElement('li');item.textContent=text;$('vision-evidence-notes').append(item);}
+function visionEvidenceStatus(frame,result){
+ const parts=[];
+ for(const [name,value] of [['物体框',frame.object],['手部点',frame.hands],['人脸',frame.face],['表情',frame.expressive],['景别',frame.framing],['CLIP',frame.clip]]){
+  if(!value)continue;
+  parts.push(name+'：'+(value.status||'unknown')+(value.reason?'（'+value.reason+'）':''));
+ }
+ const windows=(result.action_video_sampling?.windows||[]).filter(item=>item.input?.frames?.some(sample=>sample.frame_index===frame.frame_index)).slice(0,3);
+ for(const window of windows){const decision=window.result?.decision||'unknown';parts.push('动作窗口：'+decision+(window.result?.reason||window.reason?'（'+(window.result?.reason||window.reason)+'）':''));}
+ return parts;
+}
+function visionEvidenceOverlay(frame,width,height){
+ const overlay=$('vision-evidence-overlay'),identity=frame.hands?.frame_identity,shape=identity?.shape;
+ const handGeometry=Array.isArray(shape)&&shape.length===3&&shape[0]===height&&shape[1]===width&&identity.frame_index===frame.frame_index&&identity.evidence_sha256===frame.evidence_sha256;
+ const dimensions=state.media?.display_dimensions;
+ const mediaGeometry=(state.visionEvidenceReviewResult||state.visionResult)?.sampling?.frame_map_sha256===state.media?.frame_map_sha256&&dimensions?.playback_width===width&&dimensions?.playback_height===height;
+ const verified=handGeometry||mediaGeometry;
+ const objects=Array.isArray(frame.object?.objects_detected)?frame.object.objects_detected:[];
+ const hands=Array.isArray(frame.hands?.hands)?frame.hands.hands:[];
+ if(!verified){visionEvidenceNote('叠加层未显示：模型解码尺寸或帧证据身份未与预览图核对一致；下列模型观察仅供文字核对。');return;}
+ overlay.setAttribute('viewBox','0 0 '+width+' '+height);
+ overlay.setAttribute('preserveAspectRatio','xMidYMid meet');
+ const stroke=Math.max(2,Math.min(width,height)/280);
+ let invalid=0;
+ for(const object of objects.slice(0,VISION_EVIDENCE_OBJECT_LIMIT)){
+  const box=object.box;
+  if(!Array.isArray(box)||box.length!==4||!box.every(Number.isFinite)||box[0]<0||box[1]<0||box[2]>width||box[3]>height||box[2]<=box[0]||box[3]<=box[1]){invalid++;continue;}
+  const rect=document.createElementNS(VISION_SVG_NS,'rect');
+  for(const [key,value]of [['x',box[0]],['y',box[1]],['width',box[2]-box[0]],['height',box[3]-box[1]],['stroke-width',stroke]])rect.setAttribute(key,String(value));
+  rect.setAttribute('fill','none');rect.setAttribute('stroke','#69e6b6');overlay.append(rect);
+ }
+ for(const hand of hands.slice(0,VISION_EVIDENCE_HAND_LIMIT)){
+  for(const point of (hand.landmarks_pixel||[]).slice(0,21)){
+   if(!Array.isArray(point)||!Number.isFinite(point[0])||!Number.isFinite(point[1])||point[0]<0||point[0]>width||point[1]<0||point[1]>height){invalid++;continue;}
+   const circle=document.createElementNS(VISION_SVG_NS,'circle');circle.setAttribute('cx',String(point[0]));circle.setAttribute('cy',String(point[1]));circle.setAttribute('r',String(stroke*1.2));circle.setAttribute('fill','#f8be75');overlay.append(circle);
+  }
+ }
+ overlay.hidden=overlay.childElementCount===0;
+ if(invalid)visionEvidenceNote('有 '+invalid+' 个越界或非法坐标未叠加。');
+}
+async function loadVisionEvidenceFrame(){
+ const result=state.visionEvidenceReviewResult||state.visionResult,job=state.visionEvidenceReviewJob||state.visionJob,task=state.task,media=state.media;
+ const index=Number($('vision-evidence-frame').value);
+ const frame=Number.isInteger(index)?result?.keyframes?.[index]:null;
+ releaseVisionEvidenceFrame();
+ if(!frame||!job||!task||!media)return;
+ const nonce=state.visionEvidenceToken;
+ $('vision-evidence-status').textContent='正在核对帧图与源/代理 PTS…';
+ let preview;
+ try{
+  preview=await verifiedFramePng(frame.frame_index,media);
+  if(!preview)throw new Error('采样帧超出媒体帧范围');
+  if(nonce!==state.visionEvidenceToken||state.task?.id!==task.id||(state.visionEvidenceReviewJob||state.visionJob)?.id!==job.id||(state.visionEvidenceReviewResult||state.visionResult)!==result)return;
+  if(preview.row.frame_index!==frame.frame_index||preview.row.source_pts!==frame.source_pts||preview.row.proxy_pts!==frame.proxy_pts)throw new Error('候选帧与已验证预览帧的序号或 PTS 不一致');
+  const probe=new Image();probe.src=preview.url;await probe.decode();
+  if(nonce!==state.visionEvidenceToken||state.task?.id!==task.id||(state.visionEvidenceReviewJob||state.visionJob)?.id!==job.id||(state.visionEvidenceReviewResult||state.visionResult)!==result)return;
+  const previewRow=preview.row,previewSha=preview.image_sha256;
+  const image=$('vision-evidence-image');image.src=preview.url;image.hidden=false;
+  image.alt='视觉候选帧 #'+frame.frame_index+'，源 PTS '+frame.source_pts+'，代理 PTS '+frame.proxy_pts;
+  state.visionEvidenceBlob=preview.url;preview=null;
+  $('vision-evidence-status').textContent='已验证预览 PNG、媒体身份和帧 PTS；框与关键点仍是未复核模型输出。';
+  $('vision-evidence-identity').textContent='帧 #'+frame.frame_index+' · 源 PTS '+frame.source_pts+' · 代理 PTS '+frame.proxy_pts+' · '+showTime(previewRow.seconds)+' s · 候选帧证据 SHA256 '+(frame.evidence_sha256||'未提供')+' · 预览 PNG SHA256 '+previewSha+' · 持久候选结果 SHA256 '+(job.result_sha256||'接口未提供');
+  for(const status of visionEvidenceStatus(frame,result))visionEvidenceNote(status);
+  const objects=Array.isArray(frame.object?.objects_detected)?frame.object.objects_detected:[];
+  for(const object of objects.slice(0,VISION_EVIDENCE_OBJECT_LIMIT))visionEvidenceNote('未复核物体候选：'+(object.class_label||'unknown')+' · 框 '+JSON.stringify(object.box)+' · 模型分值 '+(object.score??'无')+'（未校准）');
+  if(objects.length>VISION_EVIDENCE_OBJECT_LIMIT)visionEvidenceNote('本帧另有 '+(objects.length-VISION_EVIDENCE_OBJECT_LIMIT)+' 个物体框未在界面列出或叠加。');
+  const hands=Array.isArray(frame.hands?.hands)?frame.hands.hands:[];
+  for(const hand of hands.slice(0,VISION_EVIDENCE_HAND_LIMIT))visionEvidenceNote('未复核手部点：'+(hand.handedness_raw||'方向未知')+' · '+(hand.landmarks_pixel?.length||0)+' 个点；左右手镜像假设未核实。');
+  if(hands.length>VISION_EVIDENCE_HAND_LIMIT)visionEvidenceNote('本帧另有 '+(hands.length-VISION_EVIDENCE_HAND_LIMIT)+' 只手未在界面列出或叠加。');
+  visionEvidenceOverlay(frame,probe.naturalWidth,probe.naturalHeight);
+ }catch(error){
+  if(nonce===state.visionEvidenceToken){releaseVisionEvidenceFrame();$('vision-evidence-status').textContent='帧证据核对失败，未显示画面或叠加：'+String(error.message||error);}
+ }finally{if(preview?.url)URL.revokeObjectURL(preview.url);}
+}
 function bind(){
  observeTimelineSize();
  $('export-track').hidden=true;
@@ -830,7 +1088,7 @@ function bind(){
  $('restore-draft-file').addEventListener('change',()=>{const file=$('restore-draft-file').files?.[0];$('restore-draft-file').value='';restoreDraftFile(file);});
  $('restore-saved-draft').addEventListener('click',()=>{try{restoreDraftEnvelope(JSON.parse($('saved-drafts').value)).catch(e=>notice(e.message,'error'));}catch(e){notice(e.message,'error');}});
  if($('segment-reviewed'))$('segment-reviewed').addEventListener('change',()=>{if($('review-notice')){$('review-notice').textContent=$('segment-reviewed').checked?'已勾选人工复核。保存后将记录为 reviewed。':'未勾选人工复核。';$('review-notice').style.color=$('segment-reviewed').checked?'var(--accent)':'var(--muted)';}updateDirty();});
- $('segment-form').addEventListener('submit',saveSegment);$('delete-segment').addEventListener('click',deleteSegment);$('file-input').addEventListener('change',importFiles);$('task-filter').addEventListener('input',renderTasks);$('refresh-workspace').addEventListener('click',refreshWorkspace);$('vision-run').addEventListener('click',runVision);$('vision-refresh').addEventListener('click',refreshVisionStatus);$('vision-apply').addEventListener('click',applyVision);$('vision-cancel').addEventListener('click',cancelVision);$('vision-retry').addEventListener('click',retryVision);$('export-workspace').addEventListener('click',exportWorkspace);
+ $('segment-form').addEventListener('submit',saveSegment);$('delete-segment').addEventListener('click',deleteSegment);$('file-input').addEventListener('change',importFiles);$('task-filter').addEventListener('input',renderTasks);$('refresh-workspace').addEventListener('click',refreshWorkspace);$('vision-run').addEventListener('click',runVision);$('vision-refresh').addEventListener('click',refreshVisionStatus);$('vision-apply').addEventListener('click',applyVision);$('vision-cancel').addEventListener('click',cancelVision);$('vision-retry').addEventListener('click',retryVision);$('vision-evidence-frame').addEventListener('change',()=>{loadVisionEvidenceFrame().catch(error=>{$('vision-evidence-status').textContent=String(error.message||error);});});for(const [id,delta]of [['vision-evidence-prev',-1],['vision-evidence-next',1]])$(id).addEventListener('click',()=>{state.visionEvidencePage+=delta;renderVisionEvidence();});$('export-workspace').addEventListener('click',exportWorkspace);
  $('stop-import').addEventListener('click',stopBatchUploads);$('cancel-batch-queued').addEventListener('click',()=>{cancelOwnedBatchIntakes().catch(()=>{});});
  $('new-segment').addEventListener('click',async()=>{if(await mayLeave())fillForm();});$('discard-draft').addEventListener('click',async()=>{if(await mayLeave())fillForm(state.original);});$('reload-task').addEventListener('click',async()=>{if(await confirmAction('丢弃此页草稿并加载任务最新修订；其他标签页已经保存的修改会保留。')){await loadSnapshot();await switchTask(state.task.id,{force:true});}});$('pending-retry').addEventListener('click',()=>recoverPending({resend:true}));
  const invalidateReview=()=>{if($('segment-reviewed')?.checked){$('segment-reviewed').checked=false;if($('review-notice')){$('review-notice').textContent='内容已修改，旧复核已自动取消。请核实当前内容后重新勾选。';$('review-notice').style.color='var(--warn)';}}};for(const id of ['segment-label','segment-text','segment-track','segment-tags'])$(id).addEventListener('input',()=>{invalidateReview();updateDirty();});for(const which of ['start','end'])$('segment-'+which).addEventListener('input',()=>{delete state.anchors[which];updateAnchorLabels();invalidateReview();updateDirty();});

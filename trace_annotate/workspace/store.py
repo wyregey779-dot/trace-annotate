@@ -1226,6 +1226,7 @@ class WorkspaceStore:
                            details={"expected_sha256": expected_sha256,
                                     "current_sha256": current["content_sha256"]})
         new_task = copy.deepcopy(current)
+        candidate_decision = None
         if operation == "revert_command":
             if set(payload) != {"target_command_id"}:
                 raise SchemaInvalid("SCHEMA_INVALID", "History requires the original command id")
@@ -1273,7 +1274,9 @@ class WorkspaceStore:
             from .professional_store import prepare_task
             new_task = prepare_task(self, current, operation, payload, command_id=command_id)
         elif operation == "review_annotation":
-            if set(payload) != {"annotation_id", "reviewed"} or type(payload["reviewed"]) is not bool:
+            if (set(payload) not in ({"annotation_id", "reviewed"},
+                                     {"annotation_id", "reviewed", "actor_id", "actor_type"})
+                    or type(payload["reviewed"]) is not bool):
                 raise SchemaInvalid("SCHEMA_INVALID", "Review requires annotation_id and a boolean")
             S.require_id(payload["annotation_id"], "annotation_id")
             target = next((a for a in new_task["annotations"] if a["id"] == payload["annotation_id"]), None)
@@ -1281,9 +1284,37 @@ class WorkspaceStore:
                 raise NotFound("ANNOTATION_NOT_FOUND", "Annotation to review is missing")
             if target.get("provenance", {}).get("origin") == "model_candidate":
                 raise SchemaInvalid("SCHEMA_INVALID",
-                                    "Model candidate must be upgraded to a manual origin before review")
+                                    "Model candidate requires an explicit candidate decision")
+            if "actor_type" in payload:
+                S.require_id(payload["actor_id"], "review actor")
+                if payload["actor_type"] not in {"human", "assistant", "tool"}:
+                    raise SchemaInvalid("SCHEMA_INVALID", "Review actor type is invalid")
+                if payload["reviewed"] and payload["actor_type"] != "human":
+                    raise SchemaInvalid("SCHEMA_INVALID", "Assistant or tool review is not human signoff")
+        elif operation == "decide_candidate":
+            candidate_decision = self._decide_candidate(
+                new_task, payload, command_id=command_id, source_revision=current_rev)
         else:
             new_task["annotations"] = self._apply_operation(copy.deepcopy(current["annotations"]), operation, payload)
+        if operation in {"update_annotation", "delete_annotation", "replace_annotations",
+                         "import_temporal", "import_professional"}:
+            protected = {a["id"]: a for a in current["annotations"]
+                         if a.get("provenance", {}).get("origin") == "model_candidate"}
+            after = {a["id"]: a for a in new_task["annotations"]}
+            for ident, before in protected.items():
+                if ident not in after or S.canonical_json(before) != S.canonical_json(after[ident]):
+                    raise SchemaInvalid("CANDIDATE_DECISION_REQUIRED",
+                                        "Model candidate changes require an explicit decision")
+            prior_decisions = ((current.get("extensions") or {}).get("professional") or {}).get("review_decisions") or []
+            if operation in {"update_annotation", "replace_annotations", "import_professional"}:
+                for record in prior_decisions:
+                    ident = record.get("annotation_id")
+                    prior = next((a for a in current["annotations"] if a["id"] == ident), None)
+                    updated = after.get(ident)
+                    if (prior is not None and updated is not None and
+                            prior.get("provenance") != updated.get("provenance")):
+                        raise SchemaInvalid("CANDIDATE_DECISION_REQUIRED",
+                                            "Decided candidate provenance is immutable")
         new_task["revision"] = current_rev + 1
         if operation in {"add_annotation", "update_annotation", "replace_annotations", "import_temporal"}:
             # Classic temporal documents and simple local edits can carry an
@@ -1302,7 +1333,8 @@ class WorkspaceStore:
         template = next(value for value in self.list_templates() if value["id"] == current["template_id"] and value["version"] == current["template_version"])
         for annotation in new_task["annotations"]:
             self._validate_annotation(annotation, self.get_media(current["media_id"]), template,
-                                      model_run_ids=self._declared_model_run_ids(new_task))
+                                      model_run_ids=self._declared_model_run_ids(new_task),
+                                      actor_type=self._decision_actor_type(new_task, annotation))
         previous = {a["id"]: a for a in current["annotations"]}
         if operation not in {"import_professional", "import_temporal", "revert_command"}:
             for annotation in new_task["annotations"]:
@@ -1329,9 +1361,23 @@ class WorkspaceStore:
                 annotation["review_status"] = "reviewed" if payload["reviewed"] else "unreviewed"
                 annotation.pop("review_binding", None)
                 if payload["reviewed"]:
-                    annotation["review_binding"] = {"content_sha256": subject, "actor_id": "local-user",
+                    annotation["review_binding"] = {"content_sha256": subject,
+                                                   "actor_id": payload.get("actor_id", annotation["provenance"]["actor_id"]),
                                                    "command_id": command_id, "reviewed_at": _now(),
-                                                   "task_revision": new_task["revision"]}
+                                                   "task_revision": new_task["revision"],
+                                                   "actor_type": payload.get("actor_type", "historical_unverified"),
+                                                   "identity_verification": "self_declared" if "actor_type" in payload else "historical_unverified"}
+            if (operation == "decide_candidate" and candidate_decision is not None
+                    and annotation["id"] == candidate_decision["annotation_id"]
+                    and candidate_decision["review_decision"]["actor_type"] == "human"):
+                annotation["review_status"] = "reviewed"
+                annotation["review_binding"] = {"content_sha256": subject,
+                                                "actor_id": candidate_decision["review_decision"]["actor_id"],
+                                                "command_id": command_id,
+                                                "reviewed_at": candidate_decision["review_decision"]["reviewed_at"],
+                                                "task_revision": new_task["revision"],
+                                                "actor_type": "human",
+                                                "identity_verification": "self_declared"}
         new_task["content_sha256"] = self.task_digest(new_task)
         new_rev_id = S.make_id("rev", task_id + str(new_task["revision"]))
         commit_id = S.make_id("cmt", command_id)
@@ -1348,6 +1394,14 @@ class WorkspaceStore:
             response["imported_count"] = len(new_task["annotations"])
         elif operation == "import_vision_candidates":
             response["candidate_count"] = len(payload["candidates"])
+        elif operation == "decide_candidate":
+            review = candidate_decision["review_decision"]
+            response["candidate_decision"] = {
+                "id": candidate_decision["id"], "annotation_id": candidate_decision["annotation_id"],
+                "decision": review["decision"], "actor_id": review["actor_id"],
+                "actor_type": review["actor_type"], "identity_verification": "self_declared",
+                "review_status": ("removed" if review["decision"] == "rejected" else
+                                  "reviewed" if review["actor_type"] == "human" else "unreviewed")}
         ts = _now()
         with self.transaction():
             self.conn.execute("UPDATE tasks SET revision=? WHERE id=?",
@@ -1385,6 +1439,150 @@ class WorkspaceStore:
                    if key not in {"review_status", "review_binding"}}
         return S.sha256_text({"annotation": subject, "media_id": task["media_id"],
                               "template_id": task["template_id"], "template_version": task["template_version"]})
+
+    @staticmethod
+    def candidate_digest(annotation):
+        """A portable pre-decision identity independent of mutable review flags."""
+        return S.sha256_text({key: value for key, value in annotation.items()
+                              if key not in {"review_status", "review_binding"}})
+
+    def _candidate_lineage(self, candidate, *, task_id, source_revision):
+        """Retain the local job identity without inventing a missing model run."""
+        source_job = S.require_id(candidate["provenance"]["job_id"], "source_job_id")
+        claims = ((candidate.get("attributes") or {}).get("semantic") or {}).get("claims") or []
+        run_ids = sorted({claim["model_run_id"] for claim in claims
+                          if isinstance(claim, dict) and claim.get("model_run_id") is not None})
+        row = self.conn.execute("SELECT body FROM job_commits WHERE job_id=?", (source_job,)).fetchone()
+        if row is None:
+            raise Conflict("CANDIDATE_STALE", "Candidate has no verifiable local vision job")
+        try:
+            from .queue import _read_job
+            commit = json.loads(row[0])
+            job = _read_job(self, source_job)
+            artifact = commit["artifact"]
+            registered = self.conn.execute(
+                "SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?",
+                (artifact["id"],)).fetchone()
+            if (commit["job_id"] != source_job or job["id"] != source_job
+                    or job["task_id"] != task_id or commit["task_id"] != task_id
+                    or commit["disposition"] != "candidate"
+                    or registered is None
+                    or artifact != {"id": artifact["id"], "relative_path": registered[0],
+                                    "sha256": registered[1], "size_bytes": str(registered[2])}):
+                raise ValueError("job artifact registration differs")
+            S.require_hash(commit["input_sha256"])
+            S.require_hash(artifact["sha256"])
+            if _stable_object_sha256(self.root / artifact["relative_path"], registered[2]) != artifact["sha256"]:
+                raise ValueError("job candidate bytes differ")
+            source_digest = self.candidate_digest(candidate)
+            admitted = False
+            for body_text, commit_text in self.conn.execute(
+                    "SELECT r.body,c.body FROM task_revisions r JOIN durable_commits c ON c.id=r.commit_id "
+                    "WHERE r.task_id=? AND r.revision<=? ORDER BY r.revision DESC",
+                    (task_id, source_revision)):
+                revision_commit = json.loads(commit_text)
+                if revision_commit.get("operation") != "import_vision_candidates":
+                    continue
+                historical = json.loads(body_text)
+                if any(item.get("id") == candidate["id"]
+                       and item.get("provenance", {}).get("job_id") == source_job
+                       and self.candidate_digest(item) == source_digest
+                       for item in historical.get("annotations", [])):
+                    admitted = True
+                    break
+            if not admitted:
+                raise Conflict("CANDIDATE_STALE", "Candidate has no matching admitted task revision")
+            lineage = {"job_id": source_job, "model_run_ids": run_ids,
+                       "input_sha256": commit["input_sha256"],
+                       "result_sha256": artifact["sha256"],
+                       "parameters": copy.deepcopy(job["parameters"]),
+                       "created_at": commit["created_at"]}
+            from . import semantic_schema as SS
+            return SS.validate_lineage(lineage, model_run_ids=run_ids)
+        except Conflict:
+            raise
+        except (KeyError, TypeError, ValueError, sqlite3.DatabaseError, WorkspaceError) as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Candidate job lineage is unavailable or corrupt") from exc
+
+    def _decide_candidate(self, task, payload, *, command_id, source_revision):
+        required = {"annotation_id", "decision", "actor_id", "actor_type",
+                    "expected_candidate_sha256", "changes", "diff_summary"}
+        if set(payload) != required:
+            raise SchemaInvalid("SCHEMA_INVALID", "Candidate decision fields are missing or unknown")
+        ident = S.require_id(payload["annotation_id"], "annotation_id")
+        actor_id = S.require_id(payload["actor_id"], "actor_id")
+        actor_type = payload["actor_type"]
+        decision = payload["decision"]
+        if actor_type not in {"human", "assistant", "tool"} or decision not in {"accepted", "edited", "rejected"}:
+            raise SchemaInvalid("SCHEMA_INVALID", "Candidate decision or actor type is invalid")
+        S.require_hash(payload["expected_candidate_sha256"], "expected_candidate_sha256")
+        changes = payload["changes"]
+        summary = payload["diff_summary"]
+        if not isinstance(changes, dict) or not isinstance(summary, str) or len(summary) > 500:
+            raise SchemaInvalid("SCHEMA_INVALID", "Candidate changes or difference summary is invalid")
+        if decision == "edited":
+            allowed = {"label", "text", "tags", "track", "start", "end", "at", "attributes"}
+            if not changes or set(changes) - allowed or not summary.strip():
+                raise SchemaInvalid("SCHEMA_INVALID", "Edited candidate requires allowed changes and a summary")
+        elif changes or summary:
+            raise SchemaInvalid("SCHEMA_INVALID", "Accept and reject cannot carry edits")
+        source = next((item for item in task["annotations"] if item["id"] == ident), None)
+        if source is None:
+            raise NotFound("ANNOTATION_NOT_FOUND", "Candidate is missing")
+        if source.get("provenance", {}).get("origin") != "model_candidate":
+            raise Conflict("CANDIDATE_STALE", "Annotation is no longer a model candidate")
+        if actor_id == source["provenance"]["actor_id"] and actor_type != "tool":
+            raise SchemaInvalid("ACTOR_TYPE_CONFLICT",
+                                "The generating tool identity cannot be used for human or assistant review")
+        source_digest = self.candidate_digest(source)
+        if source_digest != payload["expected_candidate_sha256"]:
+            raise Conflict("CANDIDATE_STALE", "Candidate contents changed before review")
+        lineage = self._candidate_lineage(source, task_id=task["id"], source_revision=source_revision)
+        for evidence_id in source.get("evidence_ids", []):
+            row = self.conn.execute(
+                "SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?", (evidence_id,)).fetchone()
+            if row is None or row[0] != "objects/" + row[1] or _stable_object_sha256(self.root / row[0], row[2]) != row[1]:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Candidate evidence is missing or corrupt")
+        decided = None
+        if decision != "rejected":
+            decided = copy.deepcopy(source)
+            decided.update(copy.deepcopy(changes))
+            decided["provenance"] = {"origin": "manual", "actor_id": actor_id, "job_id": None}
+            decided["review_status"] = "unreviewed"
+            decided.pop("review_binding", None)
+            task["annotations"] = [decided if item["id"] == ident else item for item in task["annotations"]]
+        else:
+            task["annotations"] = [item for item in task["annotations"] if item["id"] != ident]
+        review = {"actor_id": actor_id, "actor_type": actor_type,
+                  "decision": decision, "reviewed_at": _now(),
+                  "content_sha256": self.candidate_digest(decided) if decided is not None else source_digest,
+                  "previous_content_sha256": source_digest,
+                  "command_id": command_id, "diff_summary": summary or None}
+        from . import semantic_schema as SS
+        SS.validate_review_decision(review)
+        record = {"id": S.make_id("rdec", command_id), "annotation_id": ident,
+                  "identity_verification": "self_declared",
+                  "source_task_revision": source_revision,
+                  "source_annotation_sha256": source_digest,
+                  "source_annotation": copy.deepcopy(source),
+                  "generation_lineage": lineage,
+                  "review_decision": review, "changed_fields": sorted(changes)}
+        professional = task.setdefault("extensions", {}).setdefault("professional", {})
+        records = professional.setdefault("review_decisions", [])
+        if not isinstance(records, list) or len(records) >= 256:
+            raise SchemaInvalid("PROFESSIONAL_LIMIT_EXCEEDED", "Candidate decision count exceeds 256")
+        records.append(record)
+        return record
+
+    @staticmethod
+    def _decision_actor_type(task, annotation):
+        records = ((task.get("extensions") or {}).get("professional") or {}).get("review_decisions") or []
+        for record in reversed(records):
+            if (record.get("annotation_id") == annotation["id"]
+                    and record.get("review_decision", {}).get("actor_id") == annotation.get("provenance", {}).get("actor_id")
+                    and record.get("review_decision", {}).get("decision") in {"accepted", "edited"}):
+                return record["review_decision"].get("actor_type")
+        return None
 
     def _apply_operation(self, annotations: List[Dict[str, Any]], operation: str,
                          payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1461,7 +1659,7 @@ class WorkspaceStore:
             ids.add(checked["id"])
         return ids
 
-    def _validate_annotation(self, ann, media, template, *, model_run_ids=None):
+    def _validate_annotation(self, ann, media, template, *, model_run_ids=None, actor_type=None):
         allowed = {"id", "type", "label", "text", "tags", "track", "attributes", "evidence_ids", "provenance", "start", "end", "at", "legacy_id", "review_status", "review_binding"}
         if set(ann) - allowed:
             raise SchemaInvalid("SCHEMA_INVALID", "Annotation contains unknown fields")
@@ -1494,7 +1692,9 @@ class WorkspaceStore:
                 raise SchemaInvalid("SCHEMA_INVALID", "Unreviewed annotation cannot carry a review binding")
             required_review = {
                 "content_sha256", "actor_id", "command_id", "reviewed_at", "task_revision"}
-            if not isinstance(review, dict) or set(review) != required_review:
+            optional_review = {"actor_type", "identity_verification"}
+            if (not isinstance(review, dict) or not required_review <= set(review)
+                    or set(review) - required_review - optional_review):
                 raise SchemaInvalid("SCHEMA_INVALID", "Review binding has an invalid shape")
             S.require_hash(review["content_sha256"])
             S.require_id(review["actor_id"], "review actor")
@@ -1504,6 +1704,11 @@ class WorkspaceStore:
             if (type(review["task_revision"]) is not int
                     or not 0 <= review["task_revision"] <= S.MAX_SAFE_INTEGER):
                 raise SchemaInvalid("SCHEMA_INVALID", "Review binding revision is invalid")
+            if ("actor_type" in review) != ("identity_verification" in review):
+                raise SchemaInvalid("SCHEMA_INVALID", "Review actor declaration is incomplete")
+            if "actor_type" in review and (review["actor_type"] not in {"human", "assistant", "tool", "historical_unverified"}
+                    or review["identity_verification"] not in {"self_declared", "historical_unverified"}):
+                raise SchemaInvalid("SCHEMA_INVALID", "Review actor declaration is invalid")
         if "legacy_id" in ann and (not isinstance(ann["legacy_id"], str) or not ann["legacy_id"].strip()):
             raise SchemaInvalid("SCHEMA_INVALID", "legacy_id must be a nonempty string")
         if ann["evidence_ids"] != [] or ann["attributes"] != {}:
@@ -1535,7 +1740,7 @@ class WorkspaceStore:
                                         "Annotation evidence must reference a registered artifact")
             if ann["attributes"]:
                 SS.validate_semantic(ann["attributes"]["semantic"],
-                                     actor_type="human" if provenance["origin"] == "manual" else "tool",
+                                     actor_type=(actor_type or ("human" if provenance["origin"] == "manual" else "tool")),
                                      model_run_ids=set(model_run_ids or ()),
                                      evidence_ids=set(ann["evidence_ids"]))
                 if provenance["origin"] == "model_candidate" and any(

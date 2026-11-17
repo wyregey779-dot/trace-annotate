@@ -154,6 +154,18 @@ def fail_code(code, call):
     assert exc.value.code == code
 
 
+def decide(store, candidate, *, command_id, decision, changes=None, actor_id="test-reviewer",
+           actor_type="human", diff_summary="", expected_task=None):
+    current = expected_task or task(store)
+    return store.apply_task_command(
+        command_id=command_id, task_id=current["id"], expected_revision=current["revision"],
+        expected_sha256=current["content_sha256"], operation="decide_candidate",
+        payload={"annotation_id": candidate["id"], "decision": decision, "actor_id": actor_id,
+                 "actor_type": actor_type,
+                 "expected_candidate_sha256": store.candidate_digest(candidate),
+                 "changes": changes or {}, "diff_summary": diff_summary}, request_body=b"{}")
+
+
 def test_content_span_handles_single_boundary_index():
     assert V._content_span([42]) == 1
     assert V._content_span([2, 10]) == 9
@@ -809,11 +821,8 @@ def test_apply_replays_committed_projection_after_mapper_changes(store, monkeypa
         after = task(store)
         objects = {path.name for path in store.objects_dir.iterdir()}
         # A subsequent edit must not change which historical payload is replayed.
-        store.apply_task_command(
-            command_id="later-edit", task_id=after["id"], expected_revision=after["revision"],
-            expected_sha256=after["content_sha256"], operation="update_annotation",
-            payload={"annotation_id": after["annotations"][0]["id"], "changes": {"text": "later edit"}},
-            request_body=b"{}")
+        decide(store, after["annotations"][0], command_id="later-edit", decision="edited",
+               changes={"text": "later edit"}, diff_summary="Test revision after candidate apply")
         edited = task(store)
         # A committed command is replayed from its immutable task revision,
         # not from the disposable candidate object.
@@ -993,18 +1002,9 @@ def test_detected_content_candidate_evidence_review_and_roundtrip(tmp_path, cont
         reopened = project.get_task(task_id)
         assert reopened == after
 
-        project.apply_task_command(
-            command_id="content-human-edit", task_id=task_id, expected_revision=reopened["revision"],
-            expected_sha256=reopened["content_sha256"], operation="update_annotation",
-            payload={"annotation_id": annotation["id"], "changes": {
-                "label": "受控测试人工复核流程",
-                "provenance": {"origin": "manual", "actor_id": "local-user", "job_id": None}}},
-            request_body=b"{}")
-        edited = project.get_task(task_id)
-        project.apply_task_command(
-            command_id="content-human-review", task_id=task_id, expected_revision=edited["revision"],
-            expected_sha256=edited["content_sha256"], operation="review_annotation",
-            payload={"annotation_id": annotation["id"], "reviewed": True}, request_body=b"{}")
+        decide(project, annotation, command_id="content-human-edit", decision="edited",
+               actor_id="test-reviewer", changes={"label": "受控测试人工复核流程"},
+               diff_summary="Reviewed the visible content in the controlled clip")
         reviewed = project.get_task(task_id)
         source_annotation = next(item for item in reviewed["annotations"] if item["id"] == annotation["id"])
         assert source_annotation["review_status"] == "reviewed"
@@ -1365,25 +1365,133 @@ def test_human_upgrade_rewrites_origin_then_reviews(store):
                expected_revision=current["revision"], expected_sha256=store.task_digest(current), request_body=body)
     after = task(store)
     candidate = after["annotations"][0]
-    upgraded = store.apply_task_command(
-        command_id="human-edit", task_id=after["id"], expected_revision=after["revision"],
-        expected_sha256=store.task_digest(after), operation="update_annotation",
-        payload={"annotation_id": candidate["id"],
-                 "changes": {"label": "人工确认的镜头", "provenance": {"origin": "manual", "actor_id": "local-user", "job_id": None}}},
-        request_body=b'{}')["response"]
-    after = store.get_task(after["id"])
-    reviewed = store.apply_task_command(
-        command_id="human-review", task_id=after["id"], expected_revision=after["revision"],
-        expected_sha256=store.task_digest(after), operation="review_annotation",
-        payload={"annotation_id": candidate["id"], "reviewed": True}, request_body=b'{}')["response"]
+    upgraded = decide(store, candidate, command_id="human-edit", decision="edited",
+                     actor_id="test-reviewer", changes={"label": "人工确认的镜头"},
+                     diff_summary="Reviewed the shot in the controlled fixture")["response"]
     final = store.get_task(after["id"])
     upgraded_ann = next(a for a in final["annotations"] if a["id"] == candidate["id"])
     assert upgraded_ann["label"] == "人工确认的镜头"
     assert upgraded_ann["provenance"]["origin"] == "manual"
     assert upgraded_ann["review_status"] == "reviewed"
     assert isinstance(upgraded_ann.get("review_binding"), dict)
-    assert upgraded_ann["review_binding"]["actor_id"] == "local-user"
+    assert upgraded_ann["review_binding"]["actor_id"] == "test-reviewer"
     jobs.close()
+
+
+@pytest.mark.parametrize(
+    "decision,actor_type,changes,summary,expected_status",
+    [
+        ("accepted", "assistant", {}, "", "unreviewed"),
+        ("edited", "human", {"label": "Reviewed test shot"}, "Visible test shot checked", "reviewed"),
+        ("rejected", "human", {}, "", "removed"),
+    ],
+)
+def test_candidate_decision_preserves_source_and_rejects_stale_or_generic_edits(
+        store, clip, tmp_path, decision, actor_type, changes, summary, expected_status):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        before = task(store)
+        queued = submit(jobs, command_id="candidate-decision-submit")["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        jobs.apply(queued["id"], command_id="candidate-decision-apply",
+                   expected_revision=before["revision"], expected_sha256=before["content_sha256"],
+                   request_body=b"{}")
+        applied = task(store)
+        candidate = applied["annotations"][0]
+        candidate_sha = store.candidate_digest(candidate)
+        fail_code("CANDIDATE_DECISION_REQUIRED", lambda: store.apply_task_command(
+            command_id="generic-candidate-delete", task_id=applied["id"],
+            expected_revision=applied["revision"], expected_sha256=applied["content_sha256"],
+            operation="delete_annotation", payload={"annotation_id": candidate["id"]},
+            request_body=b"{}"))
+        fail_code("CANDIDATE_STALE", lambda: store.apply_task_command(
+            command_id="stale-candidate-decision", task_id=applied["id"],
+            expected_revision=applied["revision"], expected_sha256=applied["content_sha256"],
+            operation="decide_candidate", payload={
+                "annotation_id": candidate["id"], "decision": decision, "actor_id": "test-reviewer",
+                "actor_type": actor_type, "expected_candidate_sha256": "0" * 64,
+                "changes": changes, "diff_summary": summary}, request_body=b"{}"))
+        fail_code("ACTOR_TYPE_CONFLICT", lambda: store.apply_task_command(
+            command_id="forged-human-generator", task_id=applied["id"],
+            expected_revision=applied["revision"], expected_sha256=applied["content_sha256"],
+            operation="decide_candidate", payload={
+                "annotation_id": candidate["id"], "decision": "accepted",
+                "actor_id": candidate["provenance"]["actor_id"], "actor_type": "human",
+                "expected_candidate_sha256": candidate_sha,
+                "changes": {}, "diff_summary": ""}, request_body=b"{}"))
+        assert task(store) == applied
+        receipt = decide(store, candidate, command_id="candidate-decision", decision=decision,
+                         actor_type=actor_type, changes=changes, diff_summary=summary)
+        assert receipt["response"]["candidate_decision"]["review_status"] == expected_status
+        assert receipt["response"]["candidate_decision"]["identity_verification"] == "self_declared"
+        assert decide(store, candidate, command_id="candidate-decision", decision=decision,
+                      actor_type=actor_type, changes=changes, diff_summary=summary,
+                      expected_task=applied)["idempotent_replay"]
+        after = task(store)
+        records = after["extensions"]["professional"]["review_decisions"]
+        assert len(records) == 1
+        record = records[0]
+        assert record["source_annotation"] == candidate
+        assert record["source_annotation_sha256"] == candidate_sha
+        assert record["generation_lineage"]["job_id"] == queued["id"]
+        assert record["generation_lineage"]["result_sha256"] == jobs.queue.get_job(queued["id"])["commit"]["artifact"]["sha256"]
+        if decision == "rejected":
+            assert all(item["id"] != candidate["id"] for item in after["annotations"])
+        else:
+            active = next(item for item in after["annotations"] if item["id"] == candidate["id"])
+            assert active["provenance"]["actor_id"] == "test-reviewer"
+            assert active["review_status"] == expected_status
+            if actor_type == "human":
+                assert active["review_binding"]["identity_verification"] == "self_declared"
+            else:
+                assert "review_binding" not in active
+        document = json.loads(PStore.export_professional(store, after["id"])["data"])
+        assert document["task"]["extensions"]["professional"]["review_decisions"][0] == record
+        declared_actors = {actor["id"]: actor["type"] for actor in document["actors"]}
+        assert declared_actors[candidate["provenance"]["actor_id"]] == "tool"
+        assert declared_actors["test-reviewer"] == actor_type
+        destination = WorkspaceStore(tmp_path / "candidate-decision-import")
+        destination.create()
+        try:
+            destination.import_source(clip)
+            target = task(destination)
+            PStore.apply_import(destination, target["id"], command_id="decision-import",
+                                expected_revision=target["revision"],
+                                expected_sha256=target["content_sha256"],
+                                document=document, request_body=b"{}")
+            destination.close()
+            destination.open()
+            imported = task(destination)
+            assert imported["extensions"]["professional"]["review_decisions"] == records
+        finally:
+            destination.close()
+    finally:
+        jobs.close()
+
+
+def test_professional_import_cannot_silently_replace_active_model_candidate(store, clip):
+    jobs = V.VisionJobs(store, clip_model_path="nonexistent-clip-weights",
+                        vlm_model_path="nonexistent-vlm-weights")
+    try:
+        before = task(store)
+        queued = submit(jobs, command_id="protected-import-submit")["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        jobs.apply(queued["id"], command_id="protected-import-apply",
+                   expected_revision=before["revision"], expected_sha256=before["content_sha256"],
+                   request_body=b"{}")
+        current = task(store)
+        candidate = current["annotations"][0]
+        document = json.loads(PStore.export_professional(store, current["id"])["data"])
+        fail_code("CANDIDATE_DECISION_REQUIRED", lambda: PStore.apply_import(
+            store, current["id"], command_id="protected-import-overwrite",
+            expected_revision=current["revision"], expected_sha256=current["content_sha256"],
+            document=document, request_body=b"{}"))
+        unchanged = task(store)
+        assert unchanged == current
+        assert unchanged["annotations"][0]["id"] == candidate["id"]
+    finally:
+        jobs.close()
 
 
 def test_close_stops_runner_and_cancels_active(store):
@@ -1536,6 +1644,18 @@ def test_http_vision_chain_submit_result_apply_status(store, clip, monkeypatch):
         status = get(f"tasks/{task_id}/vision-status")
         assert status["candidate_count"] == len(result["scenes"])
         assert all(c["provenance"]["origin"] == "model_candidate" for c in status["candidates"])
+        candidate = status["candidates"][0]
+        assert status["candidate_sha256"][candidate["id"]] == store.candidate_digest(candidate)
+        decision = post(f"tasks/{task_id}/commands", {
+            "command_id": "http-candidate-accept", "expected_revision": status["revision"],
+            "expected_sha256": status["content_sha256"], "operation": "decide_candidate",
+            "payload": {"annotation_id": candidate["id"], "decision": "accepted",
+                        "actor_id": "test-assistant", "actor_type": "assistant",
+                        "expected_candidate_sha256": status["candidate_sha256"][candidate["id"]],
+                        "changes": {}, "diff_summary": ""}})
+        assert decision["candidate_decision"]["review_status"] == "unreviewed"
+        decided = get(f"tasks/{task_id}")
+        assert next(a for a in decided["annotations"] if a["id"] == candidate["id"])["review_status"] == "unreviewed"
     finally:
         server.shutdown()
         thread.join(timeout=10)

@@ -322,11 +322,21 @@ def validate_annotation(annotation, media, template, *, artifact_ids=None, actor
         SS.validate_semantic(annotation["attributes"]["semantic"], actor_type=actor_type,
                              model_run_ids=set(model_run_ids or ()),
                              evidence_ids=annotation["evidence_ids"])
+        if origin == "model_candidate" and any(
+                claim["claim_type"] == "interpretation"
+                for claim in annotation["attributes"]["semantic"]["claims"]):
+            _invalid("Model candidates cannot store interpretations", "INTERPRETATION_REQUIRES_HUMAN")
     if "review_binding" in annotation:
         review=annotation["review_binding"]
-        _object(review,{"content_sha256","actor_id","command_id","reviewed_at","task_revision"})
+        _object(review,{"content_sha256","actor_id","command_id","reviewed_at","task_revision"},
+                {"actor_type","identity_verification"})
         S.require_hash(review["content_sha256"]); S.require_id(review["actor_id"]); S.require_id(review["command_id"])
         _text(review["reviewed_at"],nonempty=True); _integer(review["task_revision"])
+        if ("actor_type" in review)!=("identity_verification" in review):
+            _invalid("Review actor declaration is incomplete")
+        if "actor_type" in review and (review["actor_type"] not in ("human","assistant","tool","historical_unverified")
+                or review["identity_verification"] not in ("self_declared","historical_unverified")):
+            _invalid("Review actor declaration is invalid")
         if annotation["review_status"] != "reviewed":
             _invalid("Unreviewed annotation must not claim a current review binding")
     times={"segment":{"start","end"},"event":{"at"},"whole_clip":set()}[kind]
@@ -419,6 +429,40 @@ def _validate_document(document):
         checked=SS.validate_model_run(run)
         if checked["id"] in model_run_ids:_invalid("Duplicate model run identifier")
         model_run_ids.add(checked["id"])
+    decision_ids=set()
+    for record in _list(extension.get("review_decisions",[]),256):
+        _object(record,{"id","annotation_id","identity_verification","source_task_revision",
+                        "source_annotation_sha256","source_annotation","generation_lineage",
+                        "review_decision","changed_fields"})
+        S.require_id(record["id"]);S.require_id(record["annotation_id"])
+        if record["id"] in decision_ids or record["identity_verification"]!="self_declared":
+            _invalid("Duplicate or unverifiable candidate decision")
+        decision_ids.add(record["id"])
+        _integer(record["source_task_revision"])
+        S.require_hash(record["source_annotation_sha256"])
+        source=record["source_annotation"]
+        validate_annotation(source,media,template,artifact_ids=artifact_ids,
+                            actor_types=actor_types,model_run_ids=model_run_ids)
+        if (source["id"]!=record["annotation_id"] or source["provenance"]["origin"]!="model_candidate"
+                or source["review_status"]!="unreviewed" or
+                S.sha256_text({key:value for key,value in source.items()
+                               if key not in ("review_status","review_binding")})!=record["source_annotation_sha256"]):
+            _invalid("Candidate decision source snapshot differs from its identity")
+        lineage=SS.validate_lineage(record["generation_lineage"],model_run_ids=model_run_ids)
+        if lineage["job_id"]!=source["provenance"]["job_id"]:
+            _invalid("Candidate decision lineage does not match the source job")
+        review=SS.validate_review_decision(record["review_decision"])
+        if review["previous_content_sha256"]!=record["source_annotation_sha256"]:
+            _invalid("Candidate decision does not bind its source")
+        if (not isinstance(record["changed_fields"],list)
+                or record["changed_fields"]!=sorted(set(record["changed_fields"]))
+                or any(name not in {"label","text","tags","track","start","end","at","attributes"}
+                       for name in record["changed_fields"])):
+            _invalid("Candidate decision changed fields are invalid")
+        if (review["decision"]=="edited")!=(bool(record["changed_fields"])):
+            _invalid("Candidate edit record has no changed fields")
+        if review["decision"]=="rejected" and review["content_sha256"]!=record["source_annotation_sha256"]:
+            _invalid("Rejected candidate must bind the source content")
     seen=set()
     for annotation in _list(task["annotations"]):
         validate_annotation(annotation,media,template,artifact_ids=artifact_ids,
