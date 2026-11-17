@@ -40,6 +40,7 @@ from ..extractors.objects import (ObjectExtractor, PROVIDER as OBJECT_PROVIDER,
                                   MAX_OBJECTS as OBJECT_DETECTOR_MAX_OBJECTS)
 from ..extractors.object_tracks import (RELATION_CONTRACT, TRACK_CONTRACT,
                                         build_object_tracks, relation_evidence)
+from ..extractors.hand_object_evidence import build_hand_object_evidence
 from ..extractors.hands import (CODE_VERSION as HAND_CODE_VERSION,
                                 CANCELLATION_BOUNDARY as HAND_CANCELLATION_BOUNDARY,
                                 HandLandmarkExtractor,
@@ -777,8 +778,10 @@ def _validate_job(job: Dict[str, Any]) -> Dict[str, Any]:
     if task["id"] != job["task_id"] or task["media_id"] != media["id"] or task["revision"] != job["input_revision"]:
         raise WorkspaceError("RECOVERY_REQUIRED", "Vision snapshot identity is inconsistent")
     window = parameters["window"]
-    if window is not None and S.rational_value(window["end"]) > S.rational_value(media["duration"]):
-        raise SchemaInvalid("SCHEMA_INVALID", "Vision interval exceeds playback duration")
+    if window is not None and (
+            S.rational_value(window["start"]) < S.rational_value(media["video_start"])
+            or S.rational_value(window["end"]) > S.rational_value(media["video_end"])):
+        raise SchemaInvalid("SCHEMA_INVALID", "Vision interval exceeds decoded video timeline")
     subject = parameters["subject_annotation_id"]
     if subject is not None:
         annotation = next((a for a in task["annotations"] if a["id"] == subject), None)
@@ -819,9 +822,17 @@ def _extract_keyframe(ffmpeg: str, video_path: Path, seconds: float, output: Pat
 
 
 def _run_scenes(scene_detector: SceneDetector, video_path: Path,
-                thresholds: Any) -> Dict[str, Any]:
+                thresholds: Any, window: Optional[Dict[str, Any]] = None,
+                timeline_start: float = 0.0, cancelled=None) -> Dict[str, Any]:
     try:
-        segments = scene_detector.detect_scenes_ffmpeg(str(video_path))
+        selected = None if window is None else (
+            float(S.rational_value(window["start"])),
+            float(S.rational_value(window["end"])))
+        segments = scene_detector.detect_scenes_ffmpeg(
+            str(video_path), window=selected, timeline_start=timeline_start,
+            cancelled=cancelled)
+    except InterruptedError:
+        raise
     except (SceneDetectionError, ValueError, OSError) as exc:
         return {"status": "failed",
                 "error": safe_failure_reason(exc, "scene_detection_failed"),
@@ -3207,7 +3218,10 @@ class VisionJobs:
                 extractors = self._extractors or {"face": None, "ocr": None, "clip": None}
                 _validate_loaded_deployment(extractors, deployment)
                 detector = SceneDetector(thresholds=thresholds)
-                scene_result = _run_scenes(detector, Path(source), thresholds)
+                window = parameters["window"]
+                scene_result = _run_scenes(
+                    detector, Path(source), thresholds, window,
+                    float(S.rational_value(job["media_snapshot"]["video_start"])), cancelled)
                 keyframes: List[Dict[str, Any]] = []
                 scene_frames: Dict[int, List[Dict[str, Any]]] = {}
                 motion_by_scene: Dict[int, Dict[str, Any]] = {}
@@ -3225,7 +3239,6 @@ class VisionJobs:
 
                 landmark_images = []
                 active_scene: Optional[int] = None
-                window = parameters["window"]
                 scenes = scene_result["scenes"]
                 if window is not None:
                     start = S.rational_value(window["start"])
@@ -4183,6 +4196,42 @@ class VisionJobs:
             return self._read_result(job_id)
         except (OSError, ValueError, KeyError, TypeError, RecursionError, SchemaInvalid) as exc:
             raise WorkspaceError("RECOVERY_REQUIRED", "Vision candidate or commit is corrupt") from exc
+
+    def hand_object_geometry(self, job_id: str) -> Dict[str, Any]:
+        """Derive bounded geometry from a verified candidate without saving it."""
+        result = self.result(job_id)
+        try:
+            geometry = build_hand_object_evidence(
+                result["keyframes"], result.get("object_sampling") or {})
+            source_sha256 = S.sha256_text(result)
+        except (ValueError, TypeError, KeyError, OverflowError, SchemaInvalid) as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED",
+                                 "Vision geometry source is inconsistent") from exc
+        coverage = geometry["coverage"]
+        return {
+            "kind": "traceannotate.hand-object-geometry",
+            "version": 1,
+            "source": {
+                "job_id": result["job_id"],
+                "task_id": result["task_id"],
+                "input_revision": result["input_revision"],
+                "vision_result_sha256": source_sha256,
+                "playback_sha256": result["file_sha256"],
+            },
+            "geometry": geometry,
+            "scope": "read_only_derived_admitted_keyframes_only_not_persisted_or_action_recognition",
+            "omission": {
+                "sampled_module_coverage_complete": coverage["sampled_module_coverage_complete"],
+                "object_truncated_keyframes": coverage["object_truncated_keyframes"],
+                "object_detection_omissions": coverage["object_detection_omissions"],
+                "object_detection_omissions_unknown_keyframes": coverage[
+                    "object_detection_omissions_unknown_keyframes"],
+                "skipped_outside_frame_hands": coverage["skipped_outside_frame_hands"],
+                "skipped_ambiguous_tracks": coverage["skipped_ambiguous_tracks"],
+                "omitted_pairs": coverage["omitted_pairs"],
+                "truncated": coverage["truncated"],
+            },
+        }
 
     def _read_result(self, job_id: str) -> Dict[str, Any]:
         return self._read_result_with_snapshot(job_id)[0]

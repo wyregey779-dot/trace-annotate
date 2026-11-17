@@ -1,10 +1,14 @@
 """Conditional history and content-bound review regressions (real store)."""
 import copy
 import json
+import shutil
+import subprocess
 
 import pytest
 
+from trace_annotate.workspace import professional_store as PStore
 from trace_annotate.workspace import schema as S
+from trace_annotate.workspace import vision_jobs as V
 from trace_annotate.workspace.errors import WorkspaceError
 from trace_annotate.workspace.store import WorkspaceStore
 
@@ -120,3 +124,100 @@ def test_corrupt_historical_revision_cannot_be_promoted_to_current(store):
         submit(store, "cmd-undo", "revert_command", {"target_command_id": "cmd-edit"})
     assert error.value.code == "RECOVERY_REQUIRED"
     assert store.get_task("tsk-history") == before
+
+
+@pytest.fixture(scope="module")
+def candidate_clip(tmp_path_factory):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for candidate history")
+    source = tmp_path_factory.mktemp("candidate-history-source") / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin",
+        "-f", "lavfi", "-i", "color=blue:s=64x64:r=10:d=0.5",
+        "-f", "lavfi", "-i", "color=red:s=64x64:r=10:d=0.5",
+        "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+        "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ], check=True, capture_output=True, timeout=60)
+    return source
+
+
+@pytest.mark.parametrize("decision,changes,summary", [
+    ("accepted", {}, ""),
+    ("edited", {"label": "Reviewed test shot"}, "Visible test shot checked"),
+    ("rejected", {}, ""),
+])
+def test_candidate_decision_cannot_be_undone_without_erasing_audit_history(
+        tmp_path, candidate_clip, decision, changes, summary):
+    project = WorkspaceStore(tmp_path / "candidate-project")
+    project.create()
+    jobs = None
+    try:
+        project.import_source(candidate_clip)
+        task_id = project.list_tasks()[0]["task_id"]
+        initial = project.get_task(task_id)
+        jobs = V.VisionJobs(project, clip_model_path="nonexistent-clip-weights",
+                            vlm_model_path="nonexistent-vlm-weights")
+        queued = jobs.submit(task_id, command_id="candidate-history-submit",
+                             expected_revision=initial["revision"],
+                             expected_sha256=initial["content_sha256"])["jobs"][0]
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        jobs.apply(queued["id"], command_id="candidate-history-apply",
+                   expected_revision=initial["revision"],
+                   expected_sha256=initial["content_sha256"], request_body=b"{}")
+        with_candidate = project.get_task(task_id)
+        candidate = with_candidate["annotations"][0]
+        project.apply_task_command(
+            command_id="candidate-history-decision", task_id=task_id,
+            expected_revision=with_candidate["revision"],
+            expected_sha256=with_candidate["content_sha256"], operation="decide_candidate",
+            payload={"annotation_id": candidate["id"], "decision": decision,
+                     "actor_id": "test-reviewer", "actor_type": "human",
+                     "expected_candidate_sha256": project.candidate_digest(candidate),
+                     "changes": changes, "diff_summary": summary}, request_body=b"{}")
+        decided = project.get_task(task_id)
+        records = decided["extensions"]["professional"]["review_decisions"]
+        assert len(records) == 1
+        snapshot = project.get_snapshot()
+        with pytest.raises(WorkspaceError) as error:
+            project.apply_task_command(
+                command_id="candidate-history-undo-decision", task_id=task_id,
+                expected_revision=decided["revision"],
+                expected_sha256=decided["content_sha256"], operation="revert_command",
+                payload={"target_command_id": "candidate-history-decision"}, request_body=b"{}")
+        assert error.value.code == "REVIEW_HISTORY_CONFLICT"
+        assert project.get_snapshot() == snapshot
+        assert project.conn.execute(
+            "SELECT 1 FROM command_receipts WHERE command_id=?",
+            ("candidate-history-undo-decision",)).fetchone() is None
+        exported = json.loads(PStore.export_professional(project, task_id)["data"])
+        assert exported["task"]["extensions"]["professional"]["review_decisions"] == records
+        if decision == "rejected":
+            assert all(item["id"] != candidate["id"] for item in decided["annotations"])
+        else:
+            assert next(item for item in decided["annotations"] if item["id"] == candidate["id"])["provenance"]["origin"] == "manual"
+        # Later ordinary edits remain reversible while the decision ledger stays intact.
+        project.apply_task_command(
+            command_id="candidate-history-add", task_id=task_id,
+            expected_revision=decided["revision"], expected_sha256=decided["content_sha256"],
+            operation="add_annotation", payload={"annotation": ann("ann-later")}, request_body=b"{}")
+        added = project.get_task(task_id)
+        project.apply_task_command(
+            command_id="candidate-history-undo-add", task_id=task_id,
+            expected_revision=added["revision"], expected_sha256=added["content_sha256"],
+            operation="revert_command", payload={"target_command_id": "candidate-history-add"},
+            request_body=b"{}")
+        undone = project.get_task(task_id)
+        assert undone["extensions"]["professional"]["review_decisions"] == records
+        assert all(item["id"] != "ann-later" for item in undone["annotations"])
+        project.apply_task_command(
+            command_id="candidate-history-redo-add", task_id=task_id,
+            expected_revision=undone["revision"], expected_sha256=undone["content_sha256"],
+            operation="revert_command", payload={"target_command_id": "candidate-history-undo-add"},
+            request_body=b"{}")
+        redone = project.get_task(task_id)
+        assert redone["extensions"]["professional"]["review_decisions"] == records
+        assert any(item["id"] == "ann-later" for item in redone["annotations"])
+    finally:
+        if jobs is not None:
+            jobs.close()
+        project.close()

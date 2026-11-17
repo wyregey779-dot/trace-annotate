@@ -121,7 +121,7 @@ def _harness():
         "window.fixture={installJob,switchTask(){state.visionGeneration++;if(state.visionAbort)state.visionAbort.abort();state.visionAbort=null;state.visionJob=null;state.visionResult=null;state.task={id:'task-B',revision:2,content_sha256:'b'.repeat(64),annotations:[]};state.busy=false;state.visionRetryOwner=null;renderVisionJob();renderSaveState();},view(){return JSON.parse(JSON.stringify(state));}};",
         "$('vision-retry').addEventListener('click',retryVision);installJob({state:'failed',error_code:'INSUFFICIENT_MEMORY'});",
     ])
-    return '<!doctype html><meta charset="utf-8"><title>Shipped vision retry-control regression</title>' + buttons + '<p id="status" role="status"></p><p id="vision-options"></p><div id="vision-job"></div><script>' + script + '</script>'
+    return '<!doctype html><meta charset="utf-8"><title>Shipped vision retry-control regression</title>' + buttons + '<p id="status" role="status"></p><p id="vision-options"></p><p id="vision-coverage" role="status"></p><div id="vision-job"></div><script>' + script + '</script>'
 
 
 def test_real_chrome_retry_click_receipts_stale_input_and_task_races(tmp_path):

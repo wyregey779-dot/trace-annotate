@@ -46,7 +46,8 @@ for(const snippet of snippets)vm.runInContext(snippet,context);
 
 
 def vision_snippets():
-    return [implementation('function resetVision(', 'async function runVision('),
+    return [implementation('function gcd(', 'function clone('),
+            implementation('function resetVision(', 'async function runVision('),
             implementation('async function switchTask(', '// Pixel layout'),
             implementation('async function acceptReceipt(', 'async function recoverPending('),
             implementation('async function applyVision(', 'function fillForm(')]

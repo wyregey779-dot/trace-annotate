@@ -660,6 +660,10 @@ class _Handler(BaseHTTPRequestHandler):
                 _require_id(parts[1], "job_id")
                 self._send_json(200, self.server.vision_jobs.result(parts[1]))
                 return
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "hand-object-geometry":
+                _require_id(parts[1], "job_id")
+                self._send_json(200, self.server.vision_jobs.hand_object_geometry(parts[1]))
+                return
             if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "vision-status":
                 _require_id(parts[1], "task_id")
                 with store.transaction():

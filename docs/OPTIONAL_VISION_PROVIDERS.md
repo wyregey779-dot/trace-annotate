@@ -94,3 +94,23 @@ Raw sampled-frame measurements remain in the candidate artifact. Portable
 segment claims use its representative keyframe and retain their evidence/model
 run links. Applying a candidate keeps `origin=model_candidate` and
 `review_status=unreviewed`; human signoff is a separate operation.
+
+## Read-only hand and object geometry
+
+For a completed vision job, the authenticated workspace endpoint
+`GET /api/v1/projects/current/jobs/{job_id}/hand-object-geometry` derives
+same-frame pixel measurements from the verified candidate. The response binds
+each pair to its hand and object observation IDs, scene, frame, rational PTS,
+and immutable frame hash. It reports the nearest hand landmark's distance to
+an object box, hand-box distance, and box intersection over union. A zero
+distance or overlapping boxes do not establish touch, possession, or an action.
+
+The query does not change the task or its review decisions. Its source hash
+identifies the complete vision result used for the calculation. Missing hand
+or object providers return `not_run`; a valid sampled result with no comparable
+pairs returns an empty `success` result. Coverage is limited to sampled frames.
+The result retains at most three nearest object boxes per hand and 1,024 pairs
+overall, with omitted counts and explicit markers for unavailable or truncated
+provider output. This derived view is not stored in the candidate or included
+in the portable professional JSON projection; retain the vision job and project
+backup when these measurements matter.

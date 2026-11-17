@@ -266,13 +266,13 @@ def validate_configuration(value):
 def _unavailable(module, config):
     config = validate_configuration(config)
     settings = config[module]
-    dependencies = ("torch", "open_clip") if module == "clip" else ("torch", "transformers")
-    if any(util.find_spec(name) is None for name in dependencies):
-        return "model_runtime_unavailable"
     # Downloads belong to a separate acquisition/import step.  A queued
     # inference job must never change the frozen cache it is validating.
     if config["allow_download"]:
         return "model_acquisition_required"
+    dependencies = ("torch", "open_clip") if module == "clip" else ("torch", "transformers")
+    if any(util.find_spec(name) is None for name in dependencies):
+        return "model_runtime_unavailable"
     if module == "clip" and not settings["selection_resolved"]:
         return "model_selection_unresolved"
     if not any(

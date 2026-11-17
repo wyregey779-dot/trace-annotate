@@ -1259,6 +1259,10 @@ class WorkspaceStore:
             if (new_task.get("id") != task_id or new_task.get("revision") != original.get("previous_revision")
                     or new_task.get("content_sha256") != before[1] or self.task_digest(new_task) != before[1]):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Historical revision identity or digest is corrupt")
+            current_decisions = ((current.get("extensions") or {}).get("professional") or {}).get("review_decisions") or []
+            restored_decisions = ((new_task.get("extensions") or {}).get("professional") or {}).get("review_decisions") or []
+            if restored_decisions != current_decisions:
+                raise Conflict("REVIEW_HISTORY_CONFLICT", "Undo would alter candidate decision history")
         elif operation == "import_temporal":
             from .legacy_adapter import validate_temporal_import_payload
             validate_temporal_import_payload(payload, self.get_media(current["media_id"]))

@@ -13,7 +13,7 @@ import json
 import stat
 
 from . import schema as S
-from .errors import SchemaInvalid, WorkspaceError
+from .errors import Conflict, SchemaInvalid, WorkspaceError
 from .professional_schema import MAX_EVIDENCE_BYTES
 
 # Leave room for the bounded command identity/revision envelope when a file
@@ -83,6 +83,15 @@ def prepare_task(store, current, operation, payload, *, command_id):
     if operation == 'import_professional':
         if set(payload) != {'document'}:
             raise SchemaInvalid('SCHEMA_INVALID', 'Professional import requires one document')
+        # Import replaces the task's annotations and extensions. A local
+        # candidate decision is an immutable audit event, including when its
+        # candidate was rejected and no active annotation remains. Refuse the
+        # replacement before admitting any portable object bytes.
+        professional = (current.get('extensions') or {}).get('professional') or {}
+        local_decisions = professional.get('review_decisions') or []
+        if local_decisions:
+            raise Conflict('REVIEW_HISTORY_CONFLICT',
+                           'Professional import would replace existing candidate decision history')
         imported = import_payload(payload['document'], media, task['id'])
         # Preflight portable object identities before publishing any bytes.
         # A transaction can roll back registration but not immutable files.

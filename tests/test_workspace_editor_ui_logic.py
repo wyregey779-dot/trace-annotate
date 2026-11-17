@@ -102,6 +102,7 @@ const vm = require('node:vm'), assert = require('node:assert/strict');
 const implementation = JSON.parse(process.argv[1]);
 const fields = {
   'vision-job': {hidden: true, textContent: ''},
+  'vision-coverage': {textContent: ''},
   'vision-cancel': {hidden: false, disabled: false},
   'vision-apply': {hidden: false, disabled: false},
   'vision-retry': {hidden: false, disabled: false}
@@ -112,7 +113,7 @@ const state = {
   visionJob: {id: 'job-12345678', task_id:'task-A', input_revision:0, input_sha256:'original', state: 'succeeded'},
   visionResult: {
     scenes: [{}, {}],
-    keyframes: [{}, {}],
+    keyframes: [{timestamp:{n:'0',d:'1'}}, {timestamp:{n:'1',d:'1'}}],
     module_status: {
       scene: 'success', transition: 'success', face: 'success', person:'success', landmarks:'success',
       framing: 'success', motion: 'success', actions: 'success',
@@ -132,7 +133,7 @@ const state = {
   },
   busy: false, loadingTask: false, dirty: false
 };
-const context = {state, $: id => fields[id]};
+const context = {state, $: id => fields[id], showTime:value=>String(Number(value.n)/Number(value.d))};
 vm.createContext(context);
 vm.runInContext(implementation, context);
 context.renderVisionJob();
@@ -140,6 +141,7 @@ assert.match(fields['vision-job'].textContent,
   /内容采样 insufficient_samples 8 帧 \/ 需 9 帧（1 个镜头不足）/);
 assert.match(fields['vision-job'].textContent,
   /六项能力 转场=success 内容=insufficient_samples\(0变化\/2过滤\) 人体\/人脸\/景别\/运镜=success\/success\/success\/success 人脸关键点=success 动作=success\(0候选;支持走\/跑;未支持拿起\/放下\/打开\/关闭\/递交\) 表情=not_run\(no_landmark_provider_in_this_build\) 声学=success/);
+assert.match(fields['vision-coverage'].textContent,/不证明逐帧覆盖/);
 assert.equal(fields['vision-apply'].hidden, false);
 assert.equal(fields['vision-cancel'].hidden, true);
 assert.equal(fields['vision-retry'].hidden, true);

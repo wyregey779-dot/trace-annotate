@@ -1,6 +1,6 @@
 """Local FFmpeg scene-cut assistance with explicit failure reporting.
 
-Successful results partition the complete video timeline. Cuts are visual-change
+Successful results partition the inspected video timeline. Cuts are visual-change
 candidates, not semantic event boundaries. Short shots are retained. The legacy
 ``scene_min_duration_s`` setting no longer bypasses video validation or hides
 cuts in short clips. FFmpeg and ffprobe must both be available on PATH.
@@ -11,7 +11,8 @@ import json
 import math
 from pathlib import Path
 import subprocess
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from trace_annotate.extractors.base import BaseExtractor, ExtractorStatus
 from trace_annotate.config import MetricThresholds
@@ -33,11 +34,44 @@ def _finite_number(value: Any, name: str, *, positive: bool = True) -> float:
     return result
 
 
-def _run(command: List[str]) -> subprocess.CompletedProcess:
+def _run(command: List[str], *, cancelled: Optional[Callable[[], bool]] = None,
+         timeout: float = 30) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, timeout=30,
-                                encoding="utf-8", errors="replace")
+        if cancelled is None:
+            result = subprocess.run(command, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, timeout=timeout,
+                                    encoding="utf-8", errors="replace")
+        else:
+            if cancelled():
+                raise InterruptedError("Scene detection was cancelled")
+            process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True,
+                                       encoding="utf-8", errors="replace")
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    if cancelled():
+                        raise InterruptedError("Scene detection was cancelled")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(.25, remaining))
+                        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except BaseException:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.communicate(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                raise
+    except InterruptedError:
+        raise
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SceneDetectionError(f"{command[0]} could not complete: {exc}") from exc
     if result.returncode != 0:
@@ -46,12 +80,12 @@ def _run(command: List[str]) -> subprocess.CompletedProcess:
     return result
 
 
-def _video_duration(path: Path) -> float:
+def _video_timeline(path: Path, cancelled: Optional[Callable[[], bool]] = None) -> tuple[float, float, float]:
     result = _run([
         "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=codec_type,duration:format=duration",
+        "-show_entries", "stream=codec_type,start_time,duration:format=start_time,duration",
         "-of", "json", str(path),
-    ])
+    ], cancelled=cancelled)
     try:
         metadata = json.loads(result.stdout)
         streams = metadata.get("streams", [])
@@ -64,9 +98,20 @@ def _video_duration(path: Path) -> float:
         duration = float(raw)
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("video duration is not finite and positive")
+        start = float(streams[0].get("start_time", 0))
+        if not math.isfinite(start):
+            raise ValueError("video start is not finite")
+        raw_format_start = metadata.get("format", {}).get("start_time", 0)
+        format_start = float(0 if raw_format_start in (None, "N/A") else raw_format_start)
+        if not math.isfinite(format_start):
+            raise ValueError("container start is not finite")
     except (TypeError, ValueError, AttributeError, IndexError, KeyError, OverflowError) as exc:
         raise SceneDetectionError(f"ffprobe did not report a usable video duration: {exc}") from exc
-    return duration
+    return start, format_start, duration
+
+
+def _video_duration(path: Path) -> float:
+    return _video_timeline(path)[2]
 
 
 def merge_adjacent_cuts(
@@ -101,7 +146,7 @@ def merge_adjacent_cuts(
 
 
 class SceneDetector(BaseExtractor):
-    """Suggest cuts after validating and decoding the whole local video."""
+    """Suggest cuts after validating and decoding the selected local range."""
 
     def __init__(self, thresholds: Optional[MetricThresholds] = None):
         self.thresholds = thresholds or MetricThresholds()
@@ -115,13 +160,19 @@ class SceneDetector(BaseExtractor):
         video_path: str,
         threshold: Optional[float] = None,
         cap_seconds: Optional[float] = None,
+        *,
+        window: Optional[tuple[float, float]] = None,
+        timeline_start: Optional[float] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> List[Dict[str, float]]:
         """Return a complete partition, or raise instead of returning partial data.
 
         ``cap_seconds`` is a maximum accepted duration, not permission to omit
         the remainder of a clip. Increase it explicitly for longer inputs. Each
         external command also has a 30-second execution timeout. Timestamps are
-        relative to the first decoded video frame; no nominal FPS is assumed.
+        relative to the first decoded video frame unless ``timeline_start`` is
+        supplied. A selected window is scanned at its actual decoded timestamps,
+        without assuming a constant frame rate.
         """
         th = _finite_number(self.thresholds.scene_threshold if threshold is None
                             else threshold, "threshold", positive=False)
@@ -132,35 +183,86 @@ class SceneDetector(BaseExtractor):
         path = Path(video_path).resolve()
         if not path.is_file():
             raise SceneDetectionError(f"Video source is not an existing regular file: {path}")
-        duration = _video_duration(path)
-        if duration > cap:
+        stream_start, format_start, duration = _video_timeline(path, cancelled)
+        base = 0.0 if timeline_start is None else _finite_number(
+            timeline_start, "timeline_start", positive=False)
+        # A negative playback offset is invalid, while a positive video offset
+        # is possible when an audio stream starts before the first video frame.
+        if base < 0:
+            raise ValueError("timeline_start must not be negative")
+        end = base + duration
+        if window is None:
+            selected_start, selected_end = base, end
+        else:
+            if (not isinstance(window, tuple) or len(window) != 2):
+                raise ValueError("window must be a finite (start, end) pair")
+            requested_start = _finite_number(window[0], "window start", positive=False)
+            requested_end = _finite_number(window[1], "window end", positive=False)
+            if requested_start < 0 or requested_start >= requested_end:
+                raise ValueError("window must be a positive half-open interval")
+            selected_start = max(base, requested_start)
+            selected_end = min(end, requested_end)
+            if selected_start >= selected_end:
+                raise SceneDetectionError("Requested window does not overlap the decoded video timeline")
+        inspected_duration = selected_end - selected_start
+        if inspected_duration > cap:
             raise SceneDetectionError(
-                f"Video duration {duration} seconds exceeds cap_seconds={cap}; "
-                "increase the limit explicitly to inspect the complete video")
+                f"Selected video duration {inspected_duration} seconds exceeds cap_seconds={cap}; "
+                "increase the limit explicitly to inspect the complete selected range")
 
-        result = _run([
-            "ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "error",
-            "-xerror", "-err_detect", "explode", "-i", str(path),
+        command = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "error",
+                   "-xerror", "-err_detect", "explode"]
+        # Emit the first decoded frame as proof the inspected range has video.
+        # It is a sentinel, not a scene cut.
+        select = f"select='eq(n,0)+gt(scene,{th})',metadata=print:file=-"
+        if timeline_start is None and window is None:
+            command += ["-i", str(path)]
+            filter_graph = f"setpts=PTS-STARTPTS,{select}"
+        else:
+            source_start = selected_start - base + stream_start
+            source_end = selected_end - base + stream_start
+            if window is not None:
+                # Both options are input-side: decoding stops at the selected
+                # end even when the scene filter emits no cut frames. Input
+                # -ss is relative to the container start; trim uses stream PTS.
+                input_seek = max(0.0, source_start - format_start)
+                command += ["-ss", f"{input_seek:.9f}",
+                            "-t", f"{inspected_duration:.9f}"]
+            command += ["-copyts", "-i", str(path)]
+            trim = (f"trim=start={source_start:.9f}:end={source_end:.9f},"
+                    if window is not None else "")
+            filter_graph = f"{trim}{select}"
+        command += [
             "-map", "0:v:0", "-an", "-sn", "-dn",
-            "-vf", f"setpts=PTS-STARTPTS,select='gt(scene,{th})',metadata=print:file=-",
+            "-vf", filter_graph,
             "-f", "null", "-",
-        ])
+        ]
+        timeout = max(30.0, min(180.0, inspected_duration / 8.0))
+        result = _run(command, cancelled=cancelled, timeout=timeout)
         interior: List[tuple[float, float]] = []
+        observed_frame = False
         for line in result.stdout.splitlines():
             if "pts_time:" not in line:
                 continue
             try:
                 timestamp = float(line.split("pts_time:", 1)[1].split()[0])
-                if not math.isfinite(timestamp) or not 0 <= timestamp <= duration:
+                if timeline_start is not None or window is not None:
+                    timestamp += base - stream_start
+                if not math.isfinite(timestamp) or not selected_start <= timestamp <= selected_end:
                     raise ValueError("cut falls outside the video timeline")
                 score = 0.0
                 if "lavfi.scene_score=" in line:
                     score = float(line.split("lavfi.scene_score=", 1)[1].split()[0])
             except (ValueError, IndexError) as exc:
                 raise SceneDetectionError(f"Invalid FFmpeg scene timestamp: {line!r}") from exc
+            if not observed_frame:
+                observed_frame = True
+                continue
             interior.append((timestamp, score))
+        if not observed_frame:
+            raise SceneDetectionError("Selected range contains no decoded video frames")
         merged = merge_adjacent_cuts(interior)
-        cuts = {0.0, duration, *(timestamp for timestamp, _score in merged)}
+        cuts = {selected_start, selected_end, *(timestamp for timestamp, _score in merged)}
         ordered = sorted(cuts)
         return [{"start": start, "end": end, "duration": end - start}
                 for start, end in zip(ordered, ordered[1:])]

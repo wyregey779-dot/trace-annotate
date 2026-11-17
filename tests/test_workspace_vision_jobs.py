@@ -1246,7 +1246,8 @@ def test_content_sampling_and_claims_stay_inside_requested_middle_window(tmp_pat
         queued = submit(jobs, command_id="content-middle", window=window)["jobs"][0]
         assert jobs.run_pending()[0]["state"] == "succeeded"
         result = jobs.result(queued["id"])
-        assert len(result["scenes"]) == 1 and result["scenes"][0]["duration"] == 12
+        assert len(result["scenes"]) == 1
+        assert result["scenes"][0] == {"start": 4.25, "end": 7.75, "duration": 3.5}
         assert result["content_sampling"]["scene_results"][0]["window"] == window
         left, right = S.rational_value(window["start"]), S.rational_value(window["end"])
         assert result["content_frames"]
@@ -1392,6 +1393,7 @@ def test_candidate_decision_preserves_source_and_rejects_stale_or_generic_edits(
                         vlm_model_path="nonexistent-vlm-weights")
     try:
         before = task(store)
+        before_decision_document = json.loads(PStore.export_professional(store, before["id"])["data"])
         queued = submit(jobs, command_id="candidate-decision-submit")["jobs"][0]
         assert jobs.run_pending()[0]["state"] == "succeeded"
         jobs.apply(queued["id"], command_id="candidate-decision-apply",
@@ -1446,6 +1448,20 @@ def test_candidate_decision_preserves_source_and_rejects_stale_or_generic_edits(
                 assert active["review_binding"]["identity_verification"] == "self_declared"
             else:
                 assert "review_binding" not in active
+        # The old document contains no decision. Importing it here used to
+        # replace the entire professional extension and erase the decision,
+        # including after rejection when there is no active candidate.
+        snapshot = store.get_snapshot()
+        object_names = {path.name for path in store.objects_dir.iterdir()}
+        fail_code("REVIEW_HISTORY_CONFLICT", lambda: PStore.apply_import(
+            store, after["id"], command_id="import-before-candidate-decision",
+            expected_revision=after["revision"], expected_sha256=after["content_sha256"],
+            document=before_decision_document, request_body=b"{}"))
+        assert store.get_snapshot() == snapshot
+        assert {path.name for path in store.objects_dir.iterdir()} == object_names
+        assert store.conn.execute(
+            "SELECT 1 FROM command_receipts WHERE command_id=?",
+            ("import-before-candidate-decision",)).fetchone() is None
         document = json.loads(PStore.export_professional(store, after["id"])["data"])
         assert document["task"]["extensions"]["professional"]["review_decisions"][0] == record
         declared_actors = {actor["id"]: actor["type"] for actor in document["actors"]}
@@ -1718,6 +1734,59 @@ def test_submit_many_freezes_each_task_and_replays_the_same_receipt(store):
         assert [item["id"] for item in replay["jobs"]] == [job["id"]]
     finally:
         jobs.close(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def audio_leading_vision_clip(tmp_path_factory):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for media timeline fixtures")
+    source = tmp_path_factory.mktemp("vision-audio-leading-source") / "source.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-nostdin",
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=10:duration=1",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+        "-vf", "setpts=PTS+1/TB", "-fps_mode", "passthrough",
+        "-c:v", "libx264", "-bf", "0", "-c:a", "aac", str(source),
+    ], check=True, capture_output=True, timeout=60)
+    return source
+
+
+def test_explicit_vision_window_excludes_audio_only_head_and_tail(
+        tmp_path, audio_leading_vision_clip):
+    project = WorkspaceStore(tmp_path / "audio-leading-workspace")
+    project.create()
+    jobs = None
+    try:
+        project.import_source(audio_leading_vision_clip)
+        current = task(project)
+        media = project.get_media(current["media_id"])
+        assert S.rational_value(media["video_start"]) == 1
+        assert S.rational_value(media["video_end"]) == 2
+        assert S.rational_value(media["duration"]) >= 3
+        jobs = V.VisionJobs(project, clip_model_path="nonexistent-clip-weights",
+                            vlm_model_path="nonexistent-vlm-weights")
+        item = {"task_id": current["id"], "expected_revision": current["revision"],
+                "expected_sha256": current["content_sha256"]}
+        for window in (
+                {"start": S.rational("0"), "end": S.rational("3/2")},
+                {"start": S.rational("3/2"), "end": S.rational("5/2")}):
+            fail_code("SCHEMA_INVALID", lambda w=window: jobs.submit(
+                current["id"], command_id="vision-outside-single",
+                expected_revision=current["revision"],
+                expected_sha256=current["content_sha256"], window=w))
+            fail_code("SCHEMA_INVALID", lambda w=window: jobs.submit_many(
+                [item], command_id="vision-outside-batch", window=w))
+        valid = {"start": media["video_start"], "end": media["video_end"]}
+        single = jobs.submit(current["id"], command_id="vision-outside-single",
+                             expected_revision=current["revision"],
+                             expected_sha256=current["content_sha256"], window=valid)
+        batch = jobs.submit_many([item], command_id="vision-outside-batch", window=valid)
+        assert single["jobs"][0]["parameters"]["window"] == valid
+        assert batch["jobs"][0]["parameters"]["window"] == valid
+    finally:
+        if jobs is not None:
+            jobs.close(timeout=5)
+        project.close()
 
 
 def test_vision_options_never_loads_models(store, monkeypatch):
