@@ -15,13 +15,13 @@ def implementation(begin, end):
     return text[start:text.index(end, start)]
 
 
-def node_check(program, snippets):
+def node_check(program, snippets, tmp_path):
     node = shutil.which('node')
     if node is None:
         pytest.skip('Node is required to execute shipped browser state logic')
     bootstrap = r'''
 const vm=require('node:vm'), assert=require('node:assert/strict');
-const snippets=JSON.parse(process.argv[1]);
+const snippets=JSON.parse(require('node:fs').readFileSync(process.argv[2],'utf8'));
 const fields=new Map();
 const element=id=>{if(!fields.has(id))fields.set(id,{hidden:false,disabled:false,checked:false,value:'1',textContent:'',load(){}});return fields.get(id);};
 const calls=[];
@@ -40,7 +40,11 @@ vm.createContext(context);
 for(const snippet of snippets)vm.runInContext(snippet,context);
 (async()=>{
 '''
-    result = subprocess.run([node, '-e', bootstrap+program+'\n})().catch(e=>{console.error(e);process.exitCode=1;});', json.dumps(snippets)],
+    script = tmp_path / 'active-vision-ui.cjs'
+    data = tmp_path / 'snippets.json'
+    script.write_text(bootstrap+program+'\n})().catch(e=>{console.error(e);process.exitCode=1;});', encoding='utf-8')
+    data.write_text(json.dumps(snippets), encoding='utf-8')
+    result = subprocess.run([node, str(script), str(data)],
                             capture_output=True, text=True, encoding='utf-8', timeout=30)
     assert result.returncode == 0, result.stdout+result.stderr
 
@@ -53,7 +57,7 @@ def vision_snippets():
             implementation('async function applyVision(', 'function fillForm(')]
 
 
-def test_saved_revision_keeps_running_job_but_old_result_cannot_apply():
+def test_saved_revision_keeps_running_job_but_old_result_cannot_apply(tmp_path):
     node_check(r'''
 context.pollVision=()=>{calls.push(['poll',context.state.visionJob.id]);};
 context.state.pending={taskId:'A',command:{command_id:'cmd-save',operation:'add_annotation',payload:{annotation:{id:'ann-1'}}}};
@@ -67,10 +71,10 @@ context.renderVisionJob();
 assert.equal(element('vision-apply').disabled,true,'old revision candidates cannot silently apply');
 const before=calls.length;await context.applyVision();
 assert.ok(calls.slice(before).some(c=>c[0]==='notice'&&/修订/.test(c[1])),'explain the stale input');
-''', vision_snippets())
+''', vision_snippets(), tmp_path)
 
 
-def test_switching_tasks_restores_only_its_own_job():
+def test_switching_tasks_restores_only_its_own_job(tmp_path):
     node_check(r'''
 context.pollVision=()=>{};
 context.json=async path=>({id:path.split('/').at(-1),media_id:'MA',revision:0,content_sha256:'old',annotations:[]});
@@ -81,10 +85,10 @@ await context.switchTask('A');
 assert.equal(context.state.visionJob?.id,'job-A','returning to A must resume A '+JSON.stringify(calls));
 await context.switchTask('B');
 assert.equal(context.state.visionJob?.id,'job-B','B keeps its separate background job');
-''', vision_snippets())
+''', vision_snippets(), tmp_path)
 
 
-def test_late_poll_cannot_replace_new_tasks_job():
+def test_late_poll_cannot_replace_new_tasks_job(tmp_path):
     node_check(r'''
 let resolve;context.json=()=>new Promise(r=>{resolve=r;});
 const pending=context.pollVision();
@@ -94,11 +98,11 @@ resolve({job_id:'job-A',task_id:'A',state:'succeeded'});
 await pending;
 assert.equal(context.state.visionJob.id,'job-B');
 assert.equal(context.state.visionResult,null);
-''', [implementation('function resetVision(', 'async function runVision(')])
+''', [implementation('function resetVision(', 'async function runVision(')], tmp_path)
 
 
 @pytest.mark.parametrize('terminal,expected', [('succeeded','admitted'),('failed','failed'),('cancelled','cancelled')])
-def test_terminal_import_status_removes_obsolete_queue_note(terminal,expected):
+def test_terminal_import_status_removes_obsolete_queue_note(terminal,expected,tmp_path):
     node_check(r'''
 context.state.batch={items:[{intakeId:'intake-1',phase:'accepted',note:'已受理 · queued'}]};
 context.state.intakes=[{id:'intake-1',state:TERMINAL,task_id:'task-A',error_code:'DECODE_FAILED'}];
@@ -106,12 +110,12 @@ assert.equal(context.syncBatchFromIntakes(),true);
 const item=context.state.batch.items[0];assert.equal(item.phase,EXPECTED);
 assert.ok(!/queued|已受理/.test(item.note),'terminal state must replace stale queue note');
 '''.replace('TERMINAL',json.dumps(terminal)).replace('EXPECTED',json.dumps(expected)),
-               [implementation('function syncBatchFromIntakes(', 'async function reconcileBatchItem(')])
+               [implementation('function syncBatchFromIntakes(', 'async function reconcileBatchItem(')], tmp_path)
 
 
 
 
-def test_changed_hash_at_same_revision_blocks_apply_and_shows_provider_status():
+def test_changed_hash_at_same_revision_blocks_apply_and_shows_provider_status(tmp_path):
     node_check(r'''
 context.state.visionJob={id:'job-A',task_id:'A',input_revision:0,input_sha256:'different',state:'succeeded'};
 context.state.visionResult={scenes:[],keyframes:[],module_status:{person:'success',landmarks:'success',expressive:'not_run'}};
@@ -122,13 +126,13 @@ assert.match(element('vision-job').textContent,/人脸关键点=success/);
 assert.match(element('vision-job').textContent,/表情=not_run/);
 context.state.visionJob.input_sha256='old';context.renderVisionJob();
 assert.equal(element('vision-apply').disabled,false);
-''', [implementation('function resetVision(', 'async function runVision(')])
+''', [implementation('function resetVision(', 'async function runVision(')], tmp_path)
 
 
-def test_optional_provider_options_are_not_claimed_before_available():
+def test_optional_provider_options_are_not_claimed_before_available(tmp_path):
     node_check(r'''
 context.json=async()=>({capabilities:{scene:true,person:true,landmarks:false},loaded:false});
 await context.loadVisionOptions();
 assert.match(element('vision-options').textContent,/人体框 可用/);
 assert.match(element('vision-options').textContent,/人脸关键点 不可用/);
-''', [implementation('async function loadVisionOptions(', 'function renderVisionCandidates(')])
+''', [implementation('async function loadVisionOptions(', 'function renderVisionCandidates(')], tmp_path)
