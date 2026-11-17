@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from html.parser import HTMLParser
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,6 +13,15 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import build_reference_review_pack as pack  # noqa: E402
 import build_reference_truth as reference  # noqa: E402
+
+
+class _PageTags(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tags = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append((tag, dict(attrs)))
 
 
 @pytest.fixture
@@ -72,6 +82,18 @@ def test_vfr_review_pack_uses_actual_before_and_current_pts(observed_vfr, tmp_pa
         assert image.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
         assert reference.sha256(image) == entry["sha256"]
     assert (output / "manifest.json").is_file()
+    page = output / manifest["review_page"]["path"]
+    css = output / manifest["review_page"]["stylesheet"]["path"]
+    assert reference.sha256(page) == manifest["review_page"]["sha256"]
+    assert reference.sha256(css) == manifest["review_page"]["stylesheet"]["sha256"]
+    page_text = page.read_text(encoding="utf-8")
+    assert "未人工复核" in page_text
+    assert page_text.index('<div class="frames">') < page_text.index('<details class="metadata">')
+    assert '<details class="sources">' in page_text
+    assert "源视频 PTS 时间基" in page_text and "标注时间轴秒数" in page_text
+    assert str(reference.rational(event["current"]["time_base"])) in page_text
+    assert str(reference.rational(event["current"]["seconds"])) in page_text
+    assert css.read_text(encoding="utf-8").startswith(":root")
     assert manifest["video_sha256"] == reference.sha256(video)
     assert manifest["frame_map_sha256"] == reference.sha256(frame_map)
     assert manifest["annotation_sha256"] == reference.sha256(annotation)
@@ -139,3 +161,104 @@ def test_changed_source_video_and_empty_map_fail_closed(observed_vfr, tmp_path):
     with pytest.raises(ValueError, match="empty decoded frame map"):
         reference.build_reference(annotation, video, frame_map,
                                   reference.sha256(video), "fixture")
+
+
+def test_local_review_page_escapes_untrusted_annotation_and_has_no_active_content(observed_vfr, tmp_path):
+    source, video, frame_map, annotation, _ = observed_vfr
+    payload = json.loads(annotation.read_text(encoding="utf-8"))
+    payload["task"]["annotations"][0]["label"] = '<script>alert("x")</script>'
+    payload["task"]["annotations"][0]["provenance"]["actor_id"] = '"><img src=x onerror=alert(1)>'
+    annotation.write_text(json.dumps(payload), encoding="utf-8")
+    source.write_text(json.dumps(reference.build_reference(
+        annotation, video, frame_map, reference.sha256(video), "fixture")), encoding="utf-8")
+    output = tmp_path / "safe-page"
+    manifest = pack.build_pack(source, output)
+    page = (output / "index.html").read_text(encoding="utf-8")
+    assert '&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;' in page
+    assert '&lt;img src=x onerror=alert(1)&gt;' in page
+    assert "default-src 'none'" in page and "img-src 'self'" in page
+    assert manifest["human_review"] is False
+    parsed = _PageTags()
+    parsed.feed(page)
+    assert not any(tag in {"script", "iframe", "form", "base"} for tag, _ in parsed.tags)
+    assert not any(name.startswith("on") for _, attrs in parsed.tags for name in attrs)
+    assert all(attrs["src"].startswith("frame-index-") for tag, attrs in parsed.tags if tag == "img")
+    assert all(attrs["href"].startswith("#") or attrs["href"] == "review.css"
+               for _, attrs in parsed.tags if "href" in attrs)
+    assert sum(tag == "img" for tag, _ in parsed.tags) == 2
+
+
+def test_review_page_rejects_foreign_image_path_and_failed_render_has_no_manifest(observed_vfr, tmp_path, monkeypatch):
+    source = observed_vfr[0]
+    output = tmp_path / "path-check"
+    manifest = pack.build_pack(source, output)
+    manifest["events"][0]["current"]["path"] = "../private.png"
+    with pytest.raises(ValueError, match="generated frame name"):
+        pack._render_review_html(manifest)
+    manifest["events"][0]["current"]["path"] = "frame-index-000002.png"
+    manifest["decoded_video_role"] = "prepared_playback_copy"
+    assert "播放副本 PTS 时间基" in pack._render_review_html(manifest)
+
+    def render_failure(_):
+        raise ValueError("render stopped")
+
+    monkeypatch.setattr(pack, "_render_review_html", render_failure)
+    failed = tmp_path / "failed-render"
+    with pytest.raises(ValueError, match="render stopped"):
+        pack.build_pack(source, failed)
+    assert (failed / "FAILED.json").is_file()
+    assert not (failed / "manifest.json").exists()
+    assert not (failed / "index.html").exists()
+
+
+def test_partial_page_write_cannot_leave_success_manifest(observed_vfr, tmp_path, monkeypatch):
+    original = Path.write_text
+
+    def incomplete_html(self, data, *args, **kwargs):
+        if self.name == "index.html.incomplete":
+            original(self, "incomplete", *args, **kwargs)
+            raise OSError("simulated write interruption")
+        return original(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", incomplete_html)
+    output = tmp_path / "interrupted-page"
+    with pytest.raises(OSError, match="simulated write interruption"):
+        pack.build_pack(observed_vfr[0], output)
+    assert (output / "FAILED.json").is_file()
+    assert not (output / "manifest.json").exists()
+    assert not (output / "index.html").exists()
+    assert not (output / "review.css").exists()
+    assert (output / "index.html.incomplete").exists()
+
+
+def test_manifest_promotion_failure_demotes_page_and_stylesheet(observed_vfr, tmp_path, monkeypatch):
+    original = Path.rename
+
+    def fail_manifest_promotion(self, target):
+        if self.name == "manifest.json.incomplete":
+            raise OSError("simulated manifest promotion failure")
+        return original(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_manifest_promotion)
+    output = tmp_path / "failed-promotion"
+    with pytest.raises(OSError, match="simulated manifest promotion failure"):
+        pack.build_pack(observed_vfr[0], output)
+    assert (output / "FAILED.json").is_file()
+    for name in ("manifest.json", "index.html", "review.css"):
+        assert not (output / name).exists()
+        assert (output / f"{name}.incomplete").exists()
+
+
+def test_partial_manifest_write_never_promotes_page(observed_vfr, tmp_path, monkeypatch):
+    def incomplete_manifest(_, stream, **_kwargs):
+        stream.write('{"partial":')
+        raise OSError("simulated manifest write interruption")
+
+    monkeypatch.setattr(pack.json, "dump", incomplete_manifest)
+    output = tmp_path / "interrupted-manifest"
+    with pytest.raises(OSError, match="simulated manifest write interruption"):
+        pack.build_pack(observed_vfr[0], output)
+    assert (output / "FAILED.json").is_file()
+    for name in ("manifest.json", "index.html", "review.css"):
+        assert not (output / name).exists()
+        assert (output / f"{name}.incomplete").exists()
