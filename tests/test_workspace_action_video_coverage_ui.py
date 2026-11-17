@@ -75,6 +75,16 @@ const showTime=value=>String(Number(value.n)/Number(value.d));
             assert "成功 1 / 选中 2 窗口" in page.locator("#vision-action-coverage").inner_text()
             page.evaluate("document.getElementById('vision-action-coverage-saved').remove()")
             assert page.locator("#vision-action-coverage").count() == 1
+            v3 = dict(mixed, contract="videomae-window-sampling-v3", status="not_run",
+                      reason="video_action_weights_unavailable", processed_windows=0,
+                      windows=[], decode={"status": "not_run", "reason": "video_action_weights_unavailable",
+                                          "planned_indices": [], "samples": []})
+            page.evaluate("sampling=>{fixture.state.visionResult.action_video_sampling=sampling;fixture.renderVisionCoverage()}", v3)
+            v3_text = page.locator("#vision-action-coverage").inner_text()
+            assert "精确取帧未运行 · 实得 0 / 计划 0 帧" in v3_text
+            assert "本地动作模型权重不可用" in v3_text
+            assert "仍未审核" in v3_text
+            assert page.locator("#vision-action-coverage img").count() == 0
             evidence_dir = os.getenv("TRACE_ANNOTATE_UI_EVIDENCE_DIR")
             if evidence_dir:
                 target = Path(evidence_dir)

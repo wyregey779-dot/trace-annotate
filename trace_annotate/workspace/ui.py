@@ -355,7 +355,8 @@ function renderActionVideoCoverage(sampling,{historicalJobId=null}={}){
  const saved=Boolean(historicalJobId),box=$(saved?'vision-evidence-scope':'vision-coverage');
  const panelId=saved?'vision-action-coverage-saved':'vision-action-coverage';
  const existing=$(panelId);
- if(sampling?.contract!=='videomae-window-sampling-v2'){
+ const v3=sampling?.contract==='videomae-window-sampling-v3';
+ if(!v3&&sampling?.contract!=='videomae-window-sampling-v2'){
   existing?.remove?.();return;
  }
  const panel=existing||document.createElement('section');
@@ -381,12 +382,27 @@ function renderActionVideoCoverage(sampling,{historicalJobId=null}={}){
   fewer_than_16_decoded_samples:'解码样本不足 16 帧',
   global_window_budget:'窗口数量达到上限',
   no_scene_has_eligible_local_window:'没有形成可分析的局部窗口',
+  fewer_than_16_admitted_frames:'局部区间不足 16 个准入帧',
+  local_frame_gap_exceeds_limit:'局部帧间隔超过上限',
+  window_span_exceeds_limit:'局部窗口跨度超过上限',
+  FRAME_DECODE_TIMEOUT:'精确取帧超时',
+  FRAME_DECODE_FAILED:'精确取帧失败',
+  FRAME_TOO_LARGE:'精确取帧超出字节预算',
   outside_successful_window_envelopes:'成功窗口包络之外',
  }[value]||String(value||'原因未知'));
  const summary=document.createElement('p');
  summary.textContent=(incomplete?'局部覆盖；':'')+status+' · 成功 '+success+' / 选中 '+windows.length+' 窗口 · 已处理 '+processed+' 窗口 · 可选镜头 '+(sampling.eligible_scenes??0)+' 个'+(sampling.reason?' · 原因 '+reasonText(sampling.reason):'');
  if(sampling.reason)summary.title=String(sampling.reason);
  panel.append(summary);
+ if(v3){
+  const decode=sampling.decode||{};
+  const decoded=Array.isArray(decode.samples)?decode.samples.length:0;
+  const planned=Array.isArray(decode.planned_indices)?decode.planned_indices.length:0;
+  const decodeStatus={success:'已按准入帧映射核对 PTS 与像素',failed:'精确取帧失败',not_run:'精确取帧未运行'}[decode.status]||'精确取帧状态未知';
+  const receipt=document.createElement('p');
+  receipt.textContent=decodeStatus+' · 实得 '+decoded+' / 计划 '+planned+' 帧'+(decode.reason?' · 原因 '+reasonText(decode.reason):'');
+  panel.append(receipt);
+ }
  const scope=document.createElement('p');scope.textContent='只观察实际解码的抽样帧；窗口时间包络不等于其间逐帧覆盖。结果仍未审核，也不能作为拿起、放下、打开、关闭或递交的动作事实。';panel.append(scope);
  const details=document.createElement('details');details.open=wasOpen;
  const disclosure=document.createElement('summary');disclosure.textContent='查看 '+coverage.length+' 个镜头的未覆盖区间与跳过原因';details.append(disclosure);
