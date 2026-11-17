@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from html.parser import HTMLParser
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -262,3 +263,42 @@ def test_partial_manifest_write_never_promotes_page(observed_vfr, tmp_path, monk
     for name in ("manifest.json", "index.html", "review.css"):
         assert not (output / name).exists()
         assert (output / f"{name}.incomplete").exists()
+
+
+def test_offline_review_page_loads_verified_images_in_chromium(observed_vfr, tmp_path):
+    playwright = pytest.importorskip("playwright.sync_api")
+    source = observed_vfr[0]
+    output = tmp_path / "browser-review-pack"
+    manifest = pack.build_pack(source, output)
+    assert manifest["human_review"] is False
+    evidence_dir = os.getenv("TRACE_ANNOTATE_REVIEW_PAGE_EVIDENCE_DIR")
+    if evidence_dir:
+        Path(evidence_dir).mkdir(parents=True, exist_ok=True)
+    with playwright.sync_playwright() as runtime:
+        browser = runtime.chromium.launch(headless=True, channel="chrome" if os.name == "nt" else None)
+        try:
+            for label, viewport in (("desktop", {"width": 1366, "height": 768}),
+                                    ("mobile", {"width": 390, "height": 844})):
+                page = browser.new_page(viewport=viewport)
+                requests, errors = [], []
+                page.on("request", lambda request: requests.append(request.url))
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.goto((output / "index.html").as_uri(), wait_until="load")
+                if evidence_dir:
+                    page.screenshot(path=str(Path(evidence_dir) / f"review-page-{label}.png"))
+                images = page.locator("article.event .frames img")
+                assert images.count() == 2
+                assert images.evaluate_all(
+                    "nodes=>nodes.every(img=>img.complete && img.naturalWidth>0 && img.naturalHeight>0)")
+                assert page.locator(".frames").evaluate("node=>getComputedStyle(node).display") == "grid"
+                assert "未人工复核" in page.locator(".warning").inner_text()
+                assert page.locator("script").count() == 0
+                assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+                if label == "desktop":
+                    assert images.evaluate_all(
+                        "nodes=>nodes.every(img=>img.getBoundingClientRect().top < window.innerHeight)")
+                assert requests and all(url.startswith("file:") for url in requests), requests
+                assert not errors, errors
+                page.close()
+        finally:
+            browser.close()

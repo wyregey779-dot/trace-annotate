@@ -140,6 +140,13 @@ jobs:
       - name: Install verified media toolchain for browser acceptance
         run: python .github/scripts/install_ci_media.py
 
+      - name: Verify offline reference page and action coverage in Chromium
+        run: |
+          python -c "import shutil, playwright.sync_api; assert shutil.which('ffmpeg') and shutil.which('ffprobe')"
+          python -m pytest tests/test_reference_review_pack.py::test_offline_review_page_loads_verified_images_in_chromium tests/test_workspace_action_video_coverage_ui.py tests/test_workspace_visual_evidence_ui.py -q -rs
+        env:
+          TRACE_ANNOTATE_REVIEW_PAGE_EVIDENCE_DIR: output/reference-review-ci
+
       - name: Validate the general editor in isolated headless Chromium
         run: python scripts/check_general_editor.py --output output/browser-ci
 
@@ -224,4 +231,5 @@ jobs:
             output/installed-enhanced-ci
             output/installed-intake-controls-ci
             output/installed-batch-upload-ci
+            output/reference-review-ci
           if-no-files-found: warn
