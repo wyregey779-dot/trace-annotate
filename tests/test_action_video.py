@@ -21,6 +21,7 @@ from trace_annotate.extractors import action_video as A
 from trace_annotate.workspace import vision_jobs as V
 from trace_annotate.workspace import schema as S
 from trace_annotate.workspace.errors import WorkspaceError
+from trace_annotate.workspace.queue import DurableQueue
 from trace_annotate.workspace.store import WorkspaceStore
 
 
@@ -87,6 +88,9 @@ def test_local_window_policy_is_explicit_opt_in_and_versioned(monkeypatch, tmp_p
     assert v2["contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V2
     assert v2["window_policy"] == V.ACTION_VIDEO_WINDOW_POLICY_V2
     assert V._validate_action_video_configuration(v2) == v2
+    v3 = V._action_video_configuration(root, window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V3)
+    assert v3["contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+    assert V._validate_action_video_configuration(v3) == v3
     incompatible = dict(v2, contract=V.ACTION_VIDEO_EVIDENCE_CONTRACT)
     with pytest.raises(Exception):
         V._validate_action_video_configuration(incompatible)
@@ -138,6 +142,341 @@ def test_two_minute_single_shot_is_not_claimed_from_ninety_six_sparse_frames():
     assert plan["ineligible_scenes"] == [0]
     assert all(item["reason"] == "decoded_sample_gap_exceeds_limit"
                for item in plan["omitted"][0])
+
+
+def test_v3_two_minute_single_shot_plans_local_frames_without_reusing_sparse_content(
+        tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe required")
+    source = tmp_path / "single-shot-120s.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "color=blue:s=64x64:r=30:d=120", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(source)], check=True,
+                   capture_output=True, timeout=120)
+    store = WorkspaceStore(tmp_path / "workspace")
+    store.create()
+    try:
+        store.import_source(source)
+        media_id = store.get_task(store.list_tasks()[0]["task_id"])["media_id"]
+        scenes = [{"start": 0.0, "end": 120.0, "duration": 120.0}]
+        plan = V._action_video_v3_plan(store, media_id, scenes, None,
+                                       cancelled=lambda: False)
+        assert plan["eligible_scenes"] == [0]
+        assert len(plan["planned"]) == V.ACTION_VIDEO_V3_MAX_WINDOWS
+        assert sum(len(item[1]["samples"]) for item in plan["planned"]) == 64
+        assert all(S.rational_value(item[1]["samples"][-1]["seconds"]) -
+                   S.rational_value(item[1]["samples"][0]["seconds"]) <= 6
+                   for item in plan["planned"])
+        exact = V._action_video_v3_decode_plan(store, media_id, plan)
+        assert len(exact["samples"]) == 64 and exact["truncated"] is False
+        assert int(exact["samples"][-1]["frame_index"]) > 3000
+        assert int(exact["samples"][0]["frame_index"]) < 100
+    finally:
+        store.close()
+
+
+def test_v3_candidate_budget_discloses_unattempted_scene(tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe required")
+    source = tmp_path / "nine-scenes.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "color=blue:s=64x64:r=30:d=9", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(source)], check=True,
+                   capture_output=True, timeout=60)
+    store = WorkspaceStore(tmp_path / "workspace")
+    store.create()
+    try:
+        store.import_source(source)
+        media_id = store.get_task(store.list_tasks()[0]["task_id"])["media_id"]
+        scenes = [{"start": float(index), "end": float(index + 1), "duration": 1.0}
+                  for index in range(9)]
+        plan = V._action_video_v3_plan(store, media_id, scenes, None,
+                                       cancelled=lambda: False)
+        assert plan["candidate_windows"] == V.ACTION_VIDEO_V3_MAX_CANDIDATES
+        skipped = [index for index, omitted in plan["omitted"].items()
+                   if any(item["reason"] == "global_candidate_budget"
+                          for item in omitted)]
+        assert skipped == [7]
+        assert plan["omitted"][7] == [{
+            "window_pts": {"start": S.rational(7), "end": S.rational(8)},
+            "reason": "global_candidate_budget"}]
+        assert 7 not in plan["ineligible_scenes"]
+        assert len(plan["eligible_scenes"]) == 8
+    finally:
+        store.close()
+
+
+def test_v3_precommit_failure_leaves_reclaimable_unbound_objects(tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe required")
+    source = tmp_path / "short.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "color=blue:s=32x32:r=5:d=0.4", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(source)], check=True,
+                   capture_output=True, timeout=30)
+    store = WorkspaceStore(tmp_path / "workspace")
+    store.create()
+    try:
+        store.import_source(source)
+        queue = DurableQueue(store)
+        task = store.get_task(store.list_tasks()[0]["task_id"])
+        batch = queue.create_batch(
+            [{"task_id": task["id"], "expected_revision": task["revision"],
+              "expected_sha256": store.task_digest(task)}],
+            operation="v3-precommit-probe", processor_version="test-v1")
+        job_id = batch["jobs"][0]["id"]
+        artifact = store._put_artifact(b"published-before-success-test-only")
+        assert store.unbound_artifacts()["count"] == 1
+
+        def reject_after_pin(_candidate):
+            store.bind_artifact_reference(
+                artifact, owner_kind="evidence", owner_id=job_id,
+                role="v3-action-frame-0001")
+            raise WorkspaceError("INJECTED_PRECOMMIT_FAILURE", "test-only failure")
+
+        failed = queue.execute_once(
+            lambda _job, _context: {"status": "test-only"},
+            precommit=reject_after_pin)
+        assert failed["state"] == "failed"
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM artifact_references WHERE owner_id=?", (job_id,)
+        ).fetchone()[0] == 0
+        assert store.unbound_artifacts()["count"] == 1
+        assert store.sweep_unbound_artifacts(apply=True)["removed"] == 1
+        assert store.unbound_artifacts()["count"] == 0
+    finally:
+        store.close()
+
+
+def test_v3_real_two_minute_redecode_with_fake_model_is_bound_and_unreviewed(
+        monkeypatch, tmp_path):
+    """Actual FFmpeg frame/PTS evidence; deliberately no genuine model inference."""
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe required")
+    source = tmp_path / "single-shot-120s.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "color=blue:s=64x64:r=30:d=120", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(source)], check=True,
+                   capture_output=True, timeout=120)
+    model = tmp_path / "fake-model-test-only"
+    model.mkdir()
+    files = {A.WEIGHTS_FILE: b"fake-test-weights", "config.json": b"{}",
+             "preprocessor_config.json": b"{}"}
+    production_identity = {name: getattr(A, name) for name in
+                           ("WEIGHTS_SIZE", "WEIGHTS_SHA256", "CONFIG_SHA256",
+                            "PROCESSOR_SHA256")}
+    for name, data in files.items():
+        (model / name).write_bytes(data)
+    monkeypatch.setattr(A, "WEIGHTS_SIZE", len(files[A.WEIGHTS_FILE]))
+    monkeypatch.setattr(A, "WEIGHTS_SHA256", hashlib.sha256(files[A.WEIGHTS_FILE]).hexdigest())
+    monkeypatch.setattr(A, "CONFIG_SHA256", hashlib.sha256(files["config.json"]).hexdigest())
+    monkeypatch.setattr(A, "PROCESSOR_SHA256",
+                        hashlib.sha256(files["preprocessor_config.json"]).hexdigest())
+
+    def fake_worker(model_path, values, output, *, top_k, cancelled, timeout_seconds):
+        assert model_path == str(model.resolve()) and top_k == 5
+        assert len(values) == 16 and timeout_seconds > 0 and not cancelled()
+        _, window = A._window(values, cancelled=cancelled)
+        result = _worker_success({"window": window, "frames": window["frames"]},
+                                 actual_pid=os.getpid(), actual_parent_pid=os.getpid())["result"]
+        result.update(A.interpret_logits(logits(46), labels(), top_k=5))
+        result["execution"] = {
+            "contract": A.ISOLATED_CONTRACT, "status": "completed",
+            "request_sha256": "a" * 64, "parent_pid": os.getpid(),
+            "wrapper_pid": os.getpid(), "actual_pid": os.getpid(),
+            "actual_parent_pid": os.getpid(), "peak_working_set_bytes": 1000,
+            "actual_exit_code": 0, "elapsed_seconds": 0.01, "error_code": None}
+        return result
+
+    monkeypatch.setattr(A, "analyze_window_isolated", fake_worker)
+    store = WorkspaceStore(tmp_path / "workspace")
+    store.create()
+    try:
+        store.import_source(source)
+        media_id = store.get_task(store.list_tasks()[0]["task_id"])["media_id"]
+        scenes = [{"start": 0.0, "end": 120.0, "duration": 120.0}]
+        config = V._action_video_configuration(str(model),
+                                               window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V3)
+        assert config["status"] == "available"
+        work = store.root / "tmp" / "vision" / "jobs" / "job-v3-structure" / "1-1" / "action-video"
+        work.parent.mkdir(parents=True)
+        sampling = V._run_action_video_sampling_v3(
+            config, str(model), store, media_id, scenes, None, work,
+            ffmpeg=shutil.which("ffmpeg"), cancelled=lambda: False)
+        assert sampling["status"] == "success", (
+            sampling["reason"], sampling["decode"]["status"],
+            sampling["decode"]["reason"],
+            [(item["status"], item["reason"]) for item in sampling["windows"]])
+        assert sampling["decode"]["status"] == "success"
+        assert len(sampling["decode"]["samples"]) == 64
+        assert len(sampling["windows"]) == 4
+        assert all(item["status"] == "success" for item in sampling["windows"])
+        assert sampling["coverage"][0]["uncovered_intervals"]
+        projected = V._candidate_claims(
+            {"job_id": "job-v3-real-structure", "processor_version": V.VERSION,
+             "action_video_sampling": sampling}, 0, scenes[0], S.rational(0),
+            S.rational(120), {"frame_index": "0", "source_pts": S.rational(0),
+                              "roles": []})
+        hint = next(item for item in projected["claims"]
+                    if item["method"]["id"] == A.PROVIDER)
+        assert hint["claim_type"] == "unspecified"
+        assert hint["method"]["parameters"]["sampling_contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+        assert hint["method"]["parameters"]["review_status"] == "unreviewed"
+        assert hint["subject_ref"] is hint["object_ref"] is hint["recipient_ref"] is None
+        digest = store.get_media(media_id)["playback"]["sha256"]
+        run = V._action_video_model_run("job-v3-real-structure", digest, None, sampling, config)
+        evidence_descriptors = [{
+            "relative_path": path.relative_to(store.root).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "size_bytes": str(path.stat().st_size)}
+            for path in work.rglob("*") if path.is_file()]
+        evidence_hashes = {item["sha256"] for item in evidence_descriptors}
+        V._validate_action_video_sampling_v3(
+            sampling, configuration=config, store=store, media_id=media_id,
+            scenes=scenes, evidence_hashes=evidence_hashes,
+            evidence_descriptors=evidence_descriptors, model_runs=[run],
+            job_id="job-v3-real-structure", digest=digest, window=None)
+        def mutate_frame_map(value):
+            value["decode"]["frame_map_sha256"] = "0" * 64
+
+        def mutate_pts(value):
+            value["decode"]["output_pts"][1] = S.rational(99)
+
+        def mutate_hash(value):
+            value["decode"]["samples"][1]["sha256"] = "0" * 64
+
+        def mutate_order(value):
+            value["decode"]["samples"][1], value["decode"]["samples"][2] = (
+                value["decode"]["samples"][2], value["decode"]["samples"][1])
+
+        def mutate_budget(value):
+            value["decode_frame_budget"] = 65
+
+        def mutate_coverage(value):
+            value["coverage"][0]["uncovered_intervals"] = []
+
+        def mutate_result(value):
+            value["windows"][0]["result"]["window"]["frames"][0]["evidence_sha256"] = "0" * 64
+
+        for mutate in (mutate_frame_map, mutate_pts, mutate_hash, mutate_order,
+                       mutate_budget, mutate_coverage, mutate_result):
+            changed = json.loads(json.dumps(sampling))
+            mutate(changed)
+            changed_run = V._action_video_model_run(
+                "job-v3-real-structure", digest, None, changed, config)
+            with pytest.raises(WorkspaceError) as failure:
+                V._validate_action_video_sampling_v3(
+                    changed, configuration=config, store=store, media_id=media_id,
+                    scenes=scenes, evidence_hashes=evidence_hashes,
+                    evidence_descriptors=evidence_descriptors,
+                    model_runs=[changed_run], job_id="job-v3-real-structure",
+                    digest=digest, window=None)
+            assert failure.value.code == "RECOVERY_REQUIRED"
+        monkeypatch.setenv("TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY",
+                           V.ACTION_VIDEO_WINDOW_POLICY_V3)
+        jobs = V.VisionJobs(store, person_model_path="", landmark_model_path="",
+                            landmark_python="", face_model_path="missing",
+                            clip_model_path="missing", vlm_model_path="missing",
+                            action_video_model_path=str(model))
+
+        def unavailable(thresholds):
+            jobs._extractors = {name: None for name in
+                                ("face", "person", "ocr", "clip", "vlm")}
+
+        monkeypatch.setattr(jobs, "_load_extractors", unavailable)
+        try:
+            task = store.get_task(store.list_tasks()[0]["task_id"])
+            batch = jobs.submit(task["id"], command_id="v3-fake-120s",
+                                expected_revision=task["revision"],
+                                expected_sha256=task["content_sha256"])
+            assert jobs.run_pending()[0]["state"] == "succeeded"
+            candidate = jobs.result(batch["jobs"][0]["id"])
+            assert candidate["action_video_sampling"]["status"] == "success"
+            assert len(candidate["action_video_sampling"]["decode"]["samples"]) == 64
+            for suffix in ("sample-0001.png", "decode.stderr", "select.filter"):
+                descriptor = next(item for item in candidate["evidence"]
+                                  if item["relative_path"].endswith("/action-video/decoded/"
+                                                                     + (".decode-0000/" if suffix != "sample-0001.png" else "")
+                                                                     + suffix))
+                # A committed v3 job reads its pinned immutable copy, not its
+                # disposable decoder workspace under tmp/.
+                evidence_path = store.root / "objects" / descriptor["sha256"]
+                original = evidence_path.read_bytes()
+                try:
+                    damaged = bytearray(original)
+                    damaged[0] ^= 1
+                    evidence_path.write_bytes(damaged)
+                    with pytest.raises(WorkspaceError) as failure:
+                        jobs.result(batch["jobs"][0]["id"])
+                    assert failure.value.code == "RECOVERY_REQUIRED"
+                finally:
+                    evidence_path.write_bytes(original)
+            assert jobs.result(batch["jobs"][0]["id"])["action_video_sampling"]["status"] == "success"
+            saved = jobs.apply(batch["jobs"][0]["id"], command_id="v3-fake-apply",
+                               expected_revision=task["revision"],
+                               expected_sha256=task["content_sha256"], request_body=b"{}")
+            assert saved["applied"] is True
+            assert all(item["review_status"] == "unreviewed"
+                       for item in store.get_task(task["id"])["annotations"])
+            from trace_annotate.workspace.professional_store import export_professional
+            document = json.loads(export_professional(store, task["id"])["data"])
+            hints = [claim for annotation in document["task"]["annotations"]
+                     for claim in annotation["attributes"]["semantic"]["claims"]
+                     if claim["method"]["id"] == A.PROVIDER]
+            assert hints and all(claim["claim_type"] == "unspecified" for claim in hints)
+            assert all(claim["method"]["parameters"]["review_status"] == "unreviewed"
+                       for claim in hints)
+        finally:
+            jobs.close()
+        from trace_annotate.workspace.backup import backup_workspace, restore_workspace
+        backup = tmp_path / "v3-backup"
+        manifest = backup_workspace(store, backup)
+        assert manifest["state"] == "complete"
+        restored_path = tmp_path / "v3-restored"
+        assert restore_workspace(backup, restored_path)["state"] == "complete"
+        restored = WorkspaceStore(restored_path)
+        restored.open()
+        restored_jobs = V.VisionJobs(restored, person_model_path="", landmark_model_path="",
+                                     landmark_python="", face_model_path="missing",
+                                     clip_model_path="missing", vlm_model_path="missing",
+                                     action_video_model_path=str(model))
+        try:
+            recovered = restored_jobs.result(batch["jobs"][0]["id"])
+            assert recovered["action_video_sampling"]["status"] == "success"
+            first = recovered["action_video_sampling"]["decode"]["samples"][0]
+            object_path = restored.root / "objects" / first["sha256"]
+            original = object_path.read_bytes()
+            try:
+                damaged = bytearray(original)
+                damaged[0] ^= 1
+                object_path.write_bytes(damaged)
+                with pytest.raises(WorkspaceError) as failure:
+                    restored_jobs.result(batch["jobs"][0]["id"])
+                assert failure.value.code == "RECOVERY_REQUIRED"
+            finally:
+                object_path.write_bytes(original)
+            assert restored_jobs.result(batch["jobs"][0]["id"])["action_video_sampling"]["status"] == "success"
+        finally:
+            restored_jobs.close()
+            restored.close()
+        for name, production_value in production_identity.items():
+            monkeypatch.setattr(A, name, production_value)
+        store.close()
+        reopened = WorkspaceStore(tmp_path / "workspace")
+        reopened.open()
+        reopened_jobs = V.VisionJobs(reopened, person_model_path="", landmark_model_path="",
+                                     landmark_python="", face_model_path="missing",
+                                     clip_model_path="missing", vlm_model_path="missing",
+                                     action_video_model_path=str(model))
+        try:
+            with pytest.raises(WorkspaceError) as failure:
+                reopened_jobs.result(batch["jobs"][0]["id"])
+            assert failure.value.code in {"RECOVERY_REQUIRED", "VISION_RESUBMIT_REQUIRED"}
+        finally:
+            reopened_jobs.close()
+            reopened.close()
+    finally:
+        store.close()
 
 
 def test_global_window_budget_spreads_work_and_discloses_omitted_intervals():
@@ -489,6 +828,161 @@ def test_v2_real_video_job_preserves_unreviewed_contract_without_model(
                    for item in store.get_task(task["id"])["annotations"])
     finally:
         jobs.close()
+        store.close()
+
+
+def test_v3_real_job_without_model_keeps_local_windows_unobserved(monkeypatch, tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe required")
+    source = tmp_path / "single-shot.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "color=blue:s=64x64:r=30:d=6", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(source)], check=True,
+                   capture_output=True, timeout=60)
+    store = WorkspaceStore(tmp_path / "workspace")
+    store.create()
+    store.import_source(source)
+    monkeypatch.setenv("TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY",
+                       V.ACTION_VIDEO_WINDOW_POLICY_V3)
+    jobs = V.VisionJobs(store, person_model_path="", landmark_model_path="",
+                        landmark_python="", face_model_path="missing",
+                        clip_model_path="missing", vlm_model_path="missing",
+                        action_video_model_path=str(tmp_path / "missing-videomae"))
+
+    def unavailable(thresholds):
+        jobs._extractors = {name: None for name in
+                            ("face", "person", "ocr", "clip", "vlm")}
+
+    monkeypatch.setattr(jobs, "_load_extractors", unavailable)
+    try:
+        task = store.get_task(store.list_tasks()[0]["task_id"])
+        batch = jobs.submit(task["id"], command_id="v3-real-missing",
+                            expected_revision=task["revision"],
+                            expected_sha256=task["content_sha256"])
+        assert jobs.run_pending()[0]["state"] == "succeeded"
+        candidate = jobs.result(batch["jobs"][0]["id"])
+        sampling = candidate["action_video_sampling"]
+        assert sampling["contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+        assert sampling["status"] == "not_run"
+        assert sampling["decode"]["status"] == "not_run"
+        assert sampling["decode"]["samples"] == []
+        assert sampling["windows"] == []
+        assert sampling["coverage"][0]["uncovered_intervals"]
+        saved = jobs.apply(batch["jobs"][0]["id"], command_id="v3-apply",
+                           expected_revision=task["revision"],
+                           expected_sha256=task["content_sha256"], request_body=b"{}")
+        assert saved["applied"] is True
+    finally:
+        jobs.close()
+        store.close()
+    reopened = WorkspaceStore(tmp_path / "workspace")
+    reopened.open()
+    reopened_jobs = V.VisionJobs(reopened, person_model_path="", landmark_model_path="",
+                                 landmark_python="", face_model_path="missing",
+                                 clip_model_path="missing", vlm_model_path="missing",
+                                 action_video_model_path=str(tmp_path / "missing-videomae"))
+    try:
+        persisted = reopened_jobs.result(batch["jobs"][0]["id"])
+        assert persisted["action_video_sampling"]["contract"] == V.ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+        assert persisted["action_video_sampling"]["decode"]["status"] == "not_run"
+    finally:
+        reopened_jobs.close()
+        reopened.close()
+
+
+@pytest.mark.parametrize("scenario", ["disk_budget", "cancel_during_decode"])
+def test_v3_resource_skip_and_cancel_never_publish_partial_semantics(
+        monkeypatch, tmp_path, scenario):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe required")
+    source = tmp_path / "short.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "color=blue:s=64x64:r=30:d=6", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(source)], check=True,
+                   capture_output=True, timeout=60)
+    store = WorkspaceStore(tmp_path / "workspace")
+    store.create()
+    try:
+        store.import_source(source)
+        media_id = store.get_task(store.list_tasks()[0]["task_id"])["media_id"]
+        config = V._action_video_configuration(
+            str(tmp_path / "missing"), window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V3)
+        config["status"], config["reason"] = "available", None
+        monkeypatch.setattr(V, "_validate_action_video_configuration", lambda item: item)
+        calls = []
+        state = {"cancel": False}
+
+        def decode(*args, **kwargs):
+            calls.append(True)
+            state["cancel"] = True
+            raise WorkspaceError("CANCELLED", "test cancellation")
+
+        if scenario == "disk_budget":
+            monkeypatch.setattr(V.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=0))
+        else:
+            monkeypatch.setattr(V.VS, "decode_samples", decode)
+        arguments = (config, str(tmp_path / "fake-model"), store, media_id,
+                     [{"start": 0.0, "end": 6.0, "duration": 6.0}], None,
+                     tmp_path / "action-video")
+        if scenario == "cancel_during_decode":
+            with pytest.raises(WorkspaceError) as exc:
+                V._run_action_video_sampling_v3(*arguments, ffmpeg=shutil.which("ffmpeg"),
+                                                cancelled=lambda: state["cancel"])
+            assert exc.value.code == "CANCELLED" and calls == [True]
+        else:
+            result = V._run_action_video_sampling_v3(
+                *arguments, ffmpeg=shutil.which("ffmpeg"), cancelled=lambda: False)
+            assert result["status"] == "not_run"
+            assert result["reason"] == "video_action_disk_reserve_unavailable"
+            assert result["decode"]["samples"] == [] and result["windows"] == []
+            assert calls == []
+    finally:
+        store.close()
+
+
+def test_v3_deadline_after_last_image_load_skips_worker(monkeypatch, tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe required")
+    source = tmp_path / "short.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "color=blue:s=64x64:r=30:d=6", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(source)], check=True,
+                   capture_output=True, timeout=60)
+    store = WorkspaceStore(tmp_path / "workspace")
+    store.create()
+    try:
+        store.import_source(source)
+        media_id = store.get_task(store.list_tasks()[0]["task_id"])["media_id"]
+        config = V._action_video_configuration(
+            str(tmp_path / "missing"), window_policy=V.ACTION_VIDEO_WINDOW_POLICY_V3)
+        config["status"], config["reason"] = "available", None
+        monkeypatch.setattr(V, "_validate_action_video_configuration", lambda item: item)
+        clock = [0.0]
+        monkeypatch.setattr(V, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+        original_load = V._load_frame
+        loaded = []
+
+        def late_load(path):
+            image = original_load(path)
+            loaded.append(path)
+            if len(loaded) == 16:
+                clock[0] = V.ACTION_VIDEO_V3_PHASE_SECONDS + 1
+            return image
+
+        monkeypatch.setattr(V, "_load_frame", late_load)
+        monkeypatch.setattr(A, "analyze_window_isolated",
+                            lambda *_args, **_kwargs: pytest.fail("worker started after deadline"))
+        result = V._run_action_video_sampling_v3(
+            config, str(tmp_path / "fake-model"), store, media_id,
+            [{"start": 0.0, "end": 6.0, "duration": 6.0}], None,
+            tmp_path / "action-video", ffmpeg=shutil.which("ffmpeg"),
+            cancelled=lambda: False)
+        assert len(loaded) == 16
+        assert result["decode"]["status"] == "success"
+        assert result["status"] == "not_run"
+        assert result["windows"][0]["reason"] == "video_action_phase_budget_exhausted"
+        assert result["windows"][0]["result"] is None
+    finally:
         store.close()
 
 

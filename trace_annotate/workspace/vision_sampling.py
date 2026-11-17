@@ -27,6 +27,8 @@ MAX_UNIFORM = 48
 MAX_BOUNDARY_RADIUS = 8
 DECODE_TIMEOUT = 180
 MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
+MAX_PTS_LOG_BYTES = 2 * 1024 * 1024
+MAX_EXACT_FRAMES = 64
 
 
 class SamplingBudget:
@@ -263,6 +265,30 @@ def _select_expression(indices: List[int]) -> str:
     return "select=" + terms[0]
 
 
+def plan_exact_indices(store: Any, media_id: str,
+                       indices: Sequence[int]) -> Dict[str, Any]:
+    """Make an untruncated, map-bound plan for at most 64 local action frames."""
+    S.require_id(media_id)
+    if (not isinstance(indices, (list, tuple)) or not indices
+            or len(indices) > MAX_EXACT_FRAMES
+            or any(type(index) is not int for index in indices)
+            or list(indices) != sorted(set(indices)) or indices[0] < 0):
+        raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "Exact frame indices must be unique, sorted and bounded")
+    service = _frame_service(store)
+    digest, total = _frame_map_identity(service, media_id)
+    if indices[-1] >= total:
+        raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "Exact frame index exceeds the admitted map")
+    rows = _selected_rows(service, media_id, indices, digest=digest, total=total)
+    samples = [{"frame_index": str(index), "source_pts": rows[index]["source_pts"],
+                "proxy_pts": rows[index]["proxy_pts"], "seconds": rows[index]["seconds"],
+                "roles": ["action_video_local"]} for index in indices]
+    return {"media_id": media_id, "frame_map_sha256": digest,
+            "total_frames": total, "samples": samples,
+            "time_domain": "playback_seconds",
+            "anchor_policy": "exact admitted frame indices for local action windows",
+            "truncated": False, "planned": len(samples), "returned": len(samples)}
+
+
 def _filter_script_option(ffmpeg: str, directory: Path,
                           control: Callable[[], bool]) -> str:
     """FFmpeg 9 removed filter_script; keep the documented 6+ contract."""
@@ -279,7 +305,8 @@ def _filter_script_option(ffmpeg: str, directory: Path,
 def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path, *,
                    timeout: int = DECODE_TIMEOUT, cancelled: Optional[Callable[[], bool]] = None,
                    max_bytes: Optional[int] = None,
-                   ffmpeg: Optional[str] = None) -> Dict[str, Any]:
+                   ffmpeg: Optional[str] = None,
+                   verify_output_pts: bool = False) -> Dict[str, Any]:
     """Decode absolute frame indices once, with owned-process and byte limits."""
     started = time.monotonic()
     limit = MAX_OUTPUT_BYTES if max_bytes is None else max_bytes
@@ -291,6 +318,7 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
     completed_bytes = 0
     current_output = 1
     monitoring = True
+    pts_log = None
 
     def control() -> bool:
         nonlocal completed_bytes, current_output
@@ -309,6 +337,8 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
             active_bytes = active.stat().st_size if active.exists() else 0
             if completed_bytes + active_bytes > limit:
                 raise WorkspaceError("FRAME_TOO_LARGE", "Decoded samples exceed the byte budget")
+            if pts_log is not None and pts_log.exists() and pts_log.stat().st_size > MAX_PTS_LOG_BYTES:
+                raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder PTS evidence exceeds the byte budget")
         return False
 
     control()
@@ -317,6 +347,29 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
     frames = plan["samples"]
     if not frames:
         raise SchemaInvalid("INVALID_SEMANTIC_CLAIM", "No frames were planned")
+    if verify_output_pts:
+        service = _frame_service(store)
+        digest, total = _frame_map_identity(service, media_id)
+        indices = [int(item["frame_index"]) for item in frames]
+        if (plan.get("media_id") != media_id or plan.get("frame_map_sha256") != digest
+                or plan.get("total_frames") != total or len(indices) > 64
+                or indices != sorted(set(indices)) or indices[0] < 0 or indices[-1] >= total):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Exact decode plan is not bound to the admitted frame map")
+        rows = _selected_rows(service, media_id, indices, digest=digest, total=total)
+        if (plan.get("time_domain") != "playback_seconds"
+                or plan.get("truncated") is not False
+                or plan.get("planned") != len(frames)
+                or plan.get("returned") != len(frames)):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Exact decode plan is incomplete or has another time domain")
+        for item, index in zip(frames, indices):
+            if (set(item) != {"frame_index", "source_pts", "proxy_pts", "seconds", "roles"}
+                    or not isinstance(item["roles"], list) or not item["roles"]
+                    or len(item["roles"]) != len(set(item["roles"]))
+                    or any(not isinstance(role, str) or not role for role in item["roles"])):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Exact decode plan sample is malformed")
+            if any(item.get(field) != rows[index][field]
+                   for field in ("source_pts", "proxy_pts", "seconds")):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Exact decode plan frame identity changed")
     ffmpeg = ffmpeg or shutil.which("ffmpeg")
     if not ffmpeg:
         raise DependencyUnavailable("DEPENDENCY_UNAVAILABLE", "FFmpeg is needed to decode samples")
@@ -328,21 +381,27 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
     directory.mkdir(parents=True, exist_ok=True)
     script = directory / "select.filter"
     with script.open("x", encoding="ascii", newline="\n") as stream:
-        stream.write(expression)
+            stream.write(expression + (",format=rgb24,showinfo" if verify_output_pts else ""))
     try:
         script_option = _filter_script_option(ffmpeg, directory, control)
     except (P.MediaPreparationError, OSError) as exc:
         raise WorkspaceError("FRAME_DECODE_FAILED",
                              f"Sample decoder version probe failed: {str(exc)[-600:]}") from exc
-    command = [ffmpeg, "-hide_banner", "-v", "error", "-nostdin", "-n", "-xerror",
+    command = [ffmpeg, "-hide_banner", "-loglevel",
+               "level+info" if verify_output_pts else "error",
+               "-nostats", "-nostdin", "-n", "-xerror",
                "-protocol_whitelist", "file,pipe", "-err_detect", "explode",
                "-threads", "1", "-filter_threads", "1",
                "-i", str(path), "-map", "0:v:0", script_option, str(script),
                "-fps_mode", "passthrough", "-c:v", "png", "-pix_fmt", "rgb24",
                "-threads:v", "1", "-frames:v", str(len(indices)),
                "-f", "image2", str(directory / "frame-%04d.png")]
+    pts_log = directory / "decode.stderr" if verify_output_pts else None
     try:
-        P._run(command, directory, "decode", control)
+        if verify_output_pts:
+            P._run(command, directory, "decode", control, strict=False)
+        else:
+            P._run(command, directory, "decode", control)
     except (P.MediaPreparationError, OSError) as exc:
         diagnostic = str(exc)[-600:]
         raise WorkspaceError("FRAME_DECODE_FAILED",
@@ -354,6 +413,17 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
     if len(produced) != expected:
         raise WorkspaceError("FRAME_DECODE_FAILED",
                              f"Decoder produced {len(produced)} of {expected} planned frames")
+    observed_pts = None
+    observed_checksums = None
+    if verify_output_pts:
+        observed = _observed_output_pts(pts_log, expected)
+        observed_pts = [item[0] for item in observed]
+        observed_checksums = [item[1] for item in observed]
+        proxy_time_base = S.rational_value(media["proxy_time_base"])
+        planned_pts = [int(item["proxy_pts"]) * proxy_time_base for item in frames]
+        if observed_pts != planned_pts:
+            raise WorkspaceError("FRAME_DECODE_FAILED",
+                                 "Decoder output PTS differ from the admitted frame map")
     for position, file in enumerate(produced, start=1):
         control()
         file.replace(Path(output) / f"sample-{position:04d}.png")
@@ -371,17 +441,81 @@ def decode_samples(store: Any, media_id: str, plan: Dict[str, Any], output: Path
             header = stream.read(8)
         if header != b"\x89PNG\r\n\x1a\n":
             raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder output is not PNG")
+        if verify_output_pts:
+            import zlib
+            from PIL import Image
+            try:
+                with Image.open(file) as decoded_image:
+                    if (decoded_image.mode != "RGB" or decoded_image.width * decoded_image.height
+                            > 16_000_000):
+                        raise ValueError("Unexpected decoded image geometry")
+                    pixel_checksum = f"{zlib.adler32(decoded_image.tobytes(), 0) & 0xffffffff:08X}"
+            except (OSError, ValueError) as exc:
+                raise WorkspaceError("FRAME_DECODE_FAILED", "Decoded PNG pixels are invalid") from exc
+            if pixel_checksum != observed_checksums[position - 1]:
+                raise WorkspaceError("FRAME_DECODE_FAILED",
+                                     "Decoded PNG pixels differ from the selected PTS frame")
         evidence.append({"frame_index": item["frame_index"], "source_pts": item["source_pts"],
                          "proxy_pts": item["proxy_pts"], "seconds": item["seconds"],
                          "roles": item["roles"], "path": str(file),
                          "sha256": stream_sha256(file, cancelled=control), "size_bytes": size})
     if stream_sha256(path, cancelled=control) != playback_hash:
         raise WorkspaceError("RECOVERY_REQUIRED", "Playback changed during sample decode")
+    if verify_output_pts:
+        final_digest, final_total = _frame_map_identity(_frame_service(store), media_id)
+        if (final_digest, final_total) != (plan["frame_map_sha256"], plan["total_frames"]):
+            raise WorkspaceError("RECOVERY_REQUIRED", "Frame map changed during exact sample decode")
     return {"media_id": media_id, "frame_map_sha256": plan["frame_map_sha256"],
             "playback_sha256": playback_hash, "decoded": evidence,
             "total_bytes": total_bytes, "command": command,
             "commands": [command],
-            "count_verified": True, "time_domain": plan["time_domain"]}
+            "count_verified": True, "time_domain": plan["time_domain"],
+            **({"output_pts_verified": True,
+                "output_pts": [S.rational(value) for value in observed_pts],
+                "output_pixel_checksums": observed_checksums,
+                "pts_log_sha256": stream_sha256(pts_log, cancelled=control)}
+               if verify_output_pts else {})}
+
+
+def _observed_output_pts(path: Path, expected: int) -> List[Tuple[Any, str]]:
+    """Read bounded FFmpeg showinfo PTS and RGB checksums, rejecting diagnostics."""
+    if path is None or not path.is_file() or path.stat().st_size > MAX_PTS_LOG_BYTES:
+        raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder PTS evidence is missing or too large")
+    return _parse_observed_output_pts(path.read_bytes(), expected)
+
+
+def _parse_observed_output_pts(raw: bytes, expected: int) -> List[Tuple[Any, str]]:
+    """Parse the exact persisted decoder log after its descriptor is verified."""
+    if not isinstance(raw, bytes) or len(raw) > MAX_PTS_LOG_BYTES:
+        raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder PTS evidence exceeds its byte budget")
+    base = None
+    ticks = []
+    checksums = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if line.strip() and ("[info]" not in line or re.search(
+                r"\b(?:invalid|error|failed|corrupt|fatal|warning)\b", line,
+                re.IGNORECASE)):
+            raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder reported an unexpected diagnostic")
+        if "showinfo" not in line:
+            continue
+        match_base = re.search(r"config in time_base:\s*(\d+)/(\d+)", line)
+        if match_base:
+            numerator, denominator = (int(value) for value in match_base.groups())
+            if numerator < 1 or denominator < 1 or base is not None:
+                raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder PTS time base is ambiguous")
+            base = S.rational_value({"n": str(numerator), "d": str(denominator)})
+        match_frame = re.search(
+            r"\bn:\s*(\d+)\s+pts:\s*(-?\d+)\b.*\bfmt:rgb24\b.*\bchecksum:([0-9A-F]{8})\b", line)
+        if match_frame:
+            if int(match_frame[1]) != len(ticks) or len(ticks) >= expected:
+                raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder PTS rows are not aligned")
+            ticks.append(int(match_frame[2]))
+            checksums.append(match_frame[3])
+        elif re.search(r"\bn:\s*\d+\s+pts:", line):
+            raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder RGB checksum is incomplete")
+    if base is None or len(ticks) != expected or len(checksums) != expected:
+        raise WorkspaceError("FRAME_DECODE_FAILED", "Decoder PTS evidence is incomplete")
+    return [(tick * base, checksum) for tick, checksum in zip(ticks, checksums)]
 
 
 def event_comparison_frames(store: Any, media_id: str, *, boundary_frame: int,

@@ -101,10 +101,12 @@ OBJECT_EVIDENCE_CONTRACT = "sparse-object-relations-v1"
 HAND_EVIDENCE_CONTRACT = "hand-landmark-observation-v1"
 ACTION_VIDEO_EVIDENCE_CONTRACT = "videomae-window-sampling-v1"
 ACTION_VIDEO_EVIDENCE_CONTRACT_V2 = "videomae-window-sampling-v2"
+ACTION_VIDEO_EVIDENCE_CONTRACT_V3 = "videomae-window-sampling-v3"
 ACTION_VIDEO_HINT_CONTRACT = "videomae-window-hint-v1"
 ACTION_VIDEO_TOP_K = 5
 ACTION_VIDEO_WINDOW_POLICY_V1 = "per_scene_uniform_decoded_content_samples_v1"
 ACTION_VIDEO_WINDOW_POLICY_V2 = "per_scene_local_decoded_content_windows_v2"
+ACTION_VIDEO_WINDOW_POLICY_V3 = "per_scene_local_redecoded_playback_windows_v3"
 ACTION_VIDEO_V2_MAX_WINDOWS = 8
 ACTION_VIDEO_V2_MAX_WINDOW_SECONDS = 8.0
 ACTION_VIDEO_V2_MAX_SAMPLE_GAP_SECONDS = 0.5
@@ -112,6 +114,11 @@ ACTION_VIDEO_V2_PHASE_SECONDS = 300.0
 ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES = 128 * 1024 * 1024
 ACTION_VIDEO_V2_STAGING_BUDGET_BYTES = 512 * 1024 * 1024
 ACTION_VIDEO_V2_DISK_RESERVE_BYTES = 512 * 1024 * 1024
+ACTION_VIDEO_V3_MAX_CANDIDATES = 8
+ACTION_VIDEO_V3_MAX_WINDOWS = 4
+ACTION_VIDEO_V3_LOCAL_SECONDS = 6
+ACTION_VIDEO_V3_PHASE_SECONDS = 300.0
+ACTION_VIDEO_V3_DECODE_SECONDS = 180.0
 HAND_UNSUPPORTED_ASSERTIONS = (
     "touch", "grasp", "held_by", "pick_up", "put_down", "open", "close", "hand_over")
 MAX_FRAME_BYTES = 16 * 1024 * 1024
@@ -283,7 +290,8 @@ def _action_video_configuration(model_path: Optional[str], *,
     """
     policy = (window_policy or os.getenv("TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY")
               or ACTION_VIDEO_WINDOW_POLICY_V1)
-    if policy not in {ACTION_VIDEO_WINDOW_POLICY_V1, ACTION_VIDEO_WINDOW_POLICY_V2}:
+    if policy not in {ACTION_VIDEO_WINDOW_POLICY_V1, ACTION_VIDEO_WINDOW_POLICY_V2,
+                      ACTION_VIDEO_WINDOW_POLICY_V3}:
         raise SchemaInvalid("SCHEMA_INVALID", "Unsupported video-action window policy")
     root = Path(model_path).resolve(strict=False) if model_path else None
     files = []
@@ -317,9 +325,11 @@ def _action_video_configuration(model_path: Optional[str], *,
     reason = (None if exact else "video_action_weights_unavailable" if missing
               else "unverified_video_action_model_identity")
     return {
-        "contract": (ACTION_VIDEO_EVIDENCE_CONTRACT_V2
-                     if policy == ACTION_VIDEO_WINDOW_POLICY_V2
-                     else ACTION_VIDEO_EVIDENCE_CONTRACT),
+        "contract": (ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+                     if policy == ACTION_VIDEO_WINDOW_POLICY_V3 else
+                     ACTION_VIDEO_EVIDENCE_CONTRACT_V2
+                     if policy == ACTION_VIDEO_WINDOW_POLICY_V2 else
+                     ACTION_VIDEO_EVIDENCE_CONTRACT),
         "provider": AV.PROVIDER,
         "status": status,
         "reason": reason,
@@ -358,7 +368,8 @@ def _validate_action_video_configuration(value: Any) -> Dict[str, Any]:
     if (not isinstance(value, dict) or set(value) != expected_fields
             or (value["contract"], value["window_policy"]) not in {
                 (ACTION_VIDEO_EVIDENCE_CONTRACT, ACTION_VIDEO_WINDOW_POLICY_V1),
-                (ACTION_VIDEO_EVIDENCE_CONTRACT_V2, ACTION_VIDEO_WINDOW_POLICY_V2)}
+                (ACTION_VIDEO_EVIDENCE_CONTRACT_V2, ACTION_VIDEO_WINDOW_POLICY_V2),
+                (ACTION_VIDEO_EVIDENCE_CONTRACT_V3, ACTION_VIDEO_WINDOW_POLICY_V3)}
             or value["provider"] != AV.PROVIDER
             or value["status"] not in {"available", "unavailable", "invalid"}
             or value["reason"] not in {None, "video_action_weights_unavailable",
@@ -1342,6 +1353,300 @@ def _action_video_result(value: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _action_video_v3_plan(store: Any, media_id: str,
+                          scenes: Sequence[Dict[str, Any]],
+                          requested: Optional[Dict[str, Any]], *, cancelled) -> Dict[str, Any]:
+    """Bound planning to eight local probes and four independently decoded windows."""
+    media_end = S.rational_value(store.get_media(media_id)["duration"])
+    scene_windows = []
+    potential = []
+    omitted: Dict[int, List[Dict[str, Any]]] = {index: [] for index in range(len(scenes))}
+    for scene_index, scene in enumerate(scenes):
+        interval = _action_video_v2_scene_window(scene, requested)
+        left = S.rational_value(interval["start"])
+        right = min(S.rational_value(interval["end"]), media_end)
+        if right <= left:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Video-action scene exceeds admitted media")
+        interval = {"start": S.rational(left), "end": S.rational(right)}
+        scene_windows.append(interval)
+        span = right - left
+        count = min(ACTION_VIDEO_V3_MAX_CANDIDATES,
+                    max(1, math.ceil(span / ACTION_VIDEO_V3_LOCAL_SECONDS)))
+        for position in range(count):
+            start = (left if span <= ACTION_VIDEO_V3_LOCAL_SECONDS else
+                     left + (span - ACTION_VIDEO_V3_LOCAL_SECONDS) * position / (count - 1))
+            end = min(right, start + ACTION_VIDEO_V3_LOCAL_SECONDS)
+            potential.append((scene_index, {"start": S.rational(start),
+                                            "end": S.rational(end)}))
+    selected_candidates = _spread(list(enumerate(potential)), ACTION_VIDEO_V3_MAX_CANDIDATES)
+    selected_indices = {position for position, _ in selected_candidates}
+    candidates = [item for _, item in selected_candidates]
+    for position, (scene_index, interval) in enumerate(potential):
+        if position not in selected_indices:
+            omitted[scene_index].append({"window_pts": interval,
+                                         "reason": "global_candidate_budget"})
+    eligible = []
+    attempted_scenes = {scene_index for scene_index, _ in candidates}
+    for scene_index, interval in candidates:
+        if cancelled():
+            raise WorkspaceError("CANCELLED", "Video action planning was cancelled")
+        try:
+            sample_plan = VS.plan_samples(
+                store, media_id, window=interval, uniform=AV.NUM_FRAMES,
+                budget=VS.SamplingBudget(max_frames=AV.NUM_FRAMES,
+                                         max_uniform=AV.NUM_FRAMES,
+                                         boundary_radius=0))
+        except SchemaInvalid:
+            omitted[scene_index].append({"window_pts": interval,
+                                         "reason": "fewer_than_16_admitted_frames"})
+            continue
+        samples = sample_plan["samples"]
+        pts = [S.rational_value(item["seconds"]) for item in samples]
+        if sample_plan["truncated"] or len(samples) != AV.NUM_FRAMES:
+            reason = "fewer_than_16_admitted_frames"
+        elif any(right <= left or right - left > ACTION_VIDEO_V2_MAX_SAMPLE_GAP_SECONDS
+                 for left, right in zip(pts, pts[1:])):
+            reason = "local_frame_gap_exceeds_limit"
+        elif pts[-1] - pts[0] > ACTION_VIDEO_V2_MAX_WINDOW_SECONDS:
+            reason = "window_span_exceeds_limit"
+        else:
+            reason = None
+        if reason:
+            omitted[scene_index].append({"window_pts": interval, "reason": reason})
+        else:
+            eligible.append((scene_index, sample_plan))
+    planned = _spread(eligible, ACTION_VIDEO_V3_MAX_WINDOWS)
+    selected = {(scene_index, tuple(item["frame_index"] for item in sample_plan["samples"]))
+                for scene_index, sample_plan in planned}
+    for scene_index, sample_plan in eligible:
+        identity = (scene_index, tuple(item["frame_index"] for item in sample_plan["samples"]))
+        if identity not in selected:
+            omitted[scene_index].append({"window_pts": sample_plan["window"],
+                                         "reason": "global_window_budget"})
+    return {"planned": planned,
+            "eligible_scenes": sorted({scene_index for scene_index, _ in eligible}),
+            "ineligible_scenes": sorted(attempted_scenes -
+                                        {scene_index for scene_index, _ in eligible}),
+            "omitted": omitted, "scene_windows": scene_windows,
+            "candidate_windows": len(candidates)}
+
+
+def _action_video_v3_decode_plan(store: Any, media_id: str,
+                                 plan: Dict[str, Any]) -> Dict[str, Any]:
+    indices = sorted({int(item["frame_index"])
+                      for _, sample_plan in plan["planned"]
+                      for item in sample_plan["samples"]})
+    if not indices or len(indices) > VS.MAX_EXACT_FRAMES:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Local action frame budget is inconsistent")
+    return VS.plan_exact_indices(store, media_id, indices)
+
+
+def _run_action_video_sampling_v3(configuration: Dict[str, Any],
+                                  model_path: Optional[str], store: Any,
+                                  media_id: str, scenes: Sequence[Dict[str, Any]],
+                                  requested: Optional[Dict[str, Any]], work: Path, *,
+                                  ffmpeg: Optional[str], cancelled) -> Dict[str, Any]:
+    """Opt-in local re-decode; sparse content samples never become action input."""
+    from . import resource_budget as resources
+
+    config = _validate_action_video_configuration(configuration)
+    plan = _action_video_v3_plan(store, media_id, scenes, requested, cancelled=cancelled)
+    media = store.get_media(media_id)
+    decode_plan = (_action_video_v3_decode_plan(store, media_id, plan)
+                   if plan["planned"] else None)
+    playback_sha = media["playback"]["sha256"]
+    decode = {"status": "not_run", "reason": None, "media_id": media_id,
+              "playback_sha256": playback_sha,
+              "frame_map_sha256": decode_plan["frame_map_sha256"] if decode_plan else None,
+              "plan_fingerprint": VS.samples_fingerprint(decode_plan) if decode_plan else None,
+              "planned_indices": [item["frame_index"] for item in decode_plan["samples"]]
+              if decode_plan else [],
+              "samples": [], "total_bytes": 0, "pts_log_sha256": None,
+              "filter_sha256": None, "command_sha256": None,
+              "command_log_sha256": None,
+              "output_pts": [], "output_pixel_checksums": []}
+    deadline = time.monotonic() + ACTION_VIDEO_V3_PHASE_SECONDS
+
+    def phase_cancelled() -> bool:
+        return bool(cancelled() or time.monotonic() >= deadline)
+
+    windows = []
+    verified_success_bytes = 0
+    staged_bytes = 0
+    if config["status"] != "available":
+        decode["status"] = "not_run" if config["status"] == "unavailable" else "failed"
+        decode["reason"] = config["reason"]
+    elif decode_plan is None:
+        decode["reason"] = "no_scene_has_eligible_local_window"
+    elif not model_path:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Available video-action identity has no local path")
+    elif (media["source_width"] * media["source_height"] * 3 * AV.NUM_FRAMES
+          > ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES):
+        decode["reason"] = "video_action_window_byte_budget_exhausted"
+    elif shutil.disk_usage(work.parent).free < (ACTION_VIDEO_V2_DISK_RESERVE_BYTES +
+                                               ACTION_VIDEO_V2_STAGING_BUDGET_BYTES):
+        decode["reason"] = "video_action_disk_reserve_unavailable"
+    else:
+        try:
+            work.mkdir(parents=True, exist_ok=False)
+            decoded = VS.decode_samples(
+                store, media_id, decode_plan, work / "decoded",
+                cancelled=phase_cancelled, ffmpeg=ffmpeg, verify_output_pts=True,
+                max_bytes=ACTION_VIDEO_V2_STAGING_BUDGET_BYTES,
+                timeout=min(ACTION_VIDEO_V3_DECODE_SECONDS,
+                            max(0.001, deadline - time.monotonic())))
+            if cancelled():
+                raise WorkspaceError("CANCELLED", "Video action analysis was cancelled")
+            decode.update(status="success", reason=None, total_bytes=decoded["total_bytes"],
+                          pts_log_sha256=decoded["pts_log_sha256"],
+                          filter_sha256=stream_sha256(work / "decoded" / ".decode-0000" / "select.filter"),
+                          command_sha256=S.sha256_text(decoded["command"]),
+                          command_log_sha256=stream_sha256(work / "decoded" / ".decode-0000" / "commands.jsonl"),
+                          output_pts=decoded["output_pts"],
+                          output_pixel_checksums=decoded["output_pixel_checksums"],
+                          samples=[{key: item[key] for key in (
+                              "frame_index", "source_pts", "proxy_pts", "seconds", "sha256",
+                              "size_bytes")} for item in decoded["decoded"]])
+        except WorkspaceError as exc:
+            if exc.code in {"LEASE_LOST", "RECOVERY_REQUIRED"} or (exc.code == "CANCELLED" and cancelled()):
+                raise
+            decode["status"] = "not_run" if exc.code in {
+                "CANCELLED", "FRAME_DECODE_TIMEOUT", "FRAME_TOO_LARGE"} else "failed"
+            decode["reason"] = ("video_action_phase_budget_exhausted"
+                                if exc.code == "CANCELLED" else exc.code)
+        except InterruptedError as exc:
+            if cancelled():
+                raise WorkspaceError("CANCELLED", "Video action decoding was cancelled") from exc
+            decode["status"], decode["reason"] = (
+                ("not_run", "video_action_phase_budget_exhausted")
+                if time.monotonic() >= deadline else ("failed", "video_action_decode_interrupted"))
+        except Exception as exc:
+            decode["status"], decode["reason"] = "failed", type(exc).__name__
+    if decode["status"] == "success":
+        decoded_by_index = {item["frame_index"]: item for item in decoded["decoded"]}
+        worker_limit = float(resources.policy()["phase_seconds"])
+        for ordinal, (scene_index, sample_plan) in enumerate(plan["planned"]):
+            if cancelled():
+                raise WorkspaceError("CANCELLED", "Video action analysis was cancelled")
+            selected = [{"frame_index": item["frame_index"], "pts": item["seconds"],
+                         "evidence_sha256": decoded_by_index[item["frame_index"]]["sha256"]}
+                        for item in sample_plan["samples"]]
+            descriptor = _action_video_input(selected)
+            result = None
+            if time.monotonic() >= deadline:
+                status, reason = "not_run", "video_action_phase_budget_exhausted"
+            else:
+                try:
+                    worker_samples = []
+                    window_bytes = 0
+                    skip_reason = None
+                    for item in selected:
+                        if phase_cancelled():
+                            skip_reason = "video_action_phase_budget_exhausted"
+                            break
+                        image = _load_frame(Path(decoded_by_index[item["frame_index"]]["path"]))
+                        window_bytes += int(image.nbytes)
+                        if window_bytes > ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES:
+                            skip_reason = "video_action_window_byte_budget_exhausted"
+                            break
+                        if staged_bytes + window_bytes > ACTION_VIDEO_V2_STAGING_BUDGET_BYTES:
+                            skip_reason = "video_action_staging_byte_budget_exhausted"
+                            break
+                        worker_samples.append({"scene_index": scene_index,
+                                               "frame_index": item["frame_index"],
+                                               "pts": item["pts"],
+                                               "evidence_sha256": item["evidence_sha256"],
+                                               "image": image})
+                    if skip_reason:
+                        status, reason = "not_run", skip_reason
+                    elif shutil.disk_usage(work.parent).free < (
+                            window_bytes + ACTION_VIDEO_V2_DISK_RESERVE_BYTES):
+                        status, reason = "not_run", "video_action_disk_reserve_unavailable"
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            status, reason = "not_run", "video_action_phase_budget_exhausted"
+                        else:
+                            staged_bytes += window_bytes
+                            raw = AV.analyze_window_isolated(
+                                str(Path(model_path).resolve(strict=False)), worker_samples,
+                                (work / f"scene-{scene_index}-window-{ordinal}").resolve(),
+                                top_k=ACTION_VIDEO_TOP_K, cancelled=phase_cancelled,
+                                timeout_seconds=min(remaining, worker_limit))
+                            result = _action_video_result(raw)
+                            if (result["status"] == "success" and
+                                    (result.get("window") or {}).get("total_input_bytes") != window_bytes):
+                                raise WorkspaceError("MODEL_WORKER_PROTOCOL",
+                                                     "Video-action worker input byte count changed")
+                            status, reason = result["status"], result["reason"]
+                            if status == "success":
+                                verified_success_bytes += window_bytes
+                except WorkspaceError as exc:
+                    if exc.code == "CANCELLED" and not cancelled() and time.monotonic() >= deadline:
+                        status, reason = "not_run", "video_action_phase_budget_exhausted"
+                    elif exc.code in {"CANCELLED", "LEASE_LOST", "RECOVERY_REQUIRED"}:
+                        raise
+                    else:
+                        status, reason = "failed", exc.code
+                except InterruptedError as exc:
+                    if cancelled():
+                        raise WorkspaceError("CANCELLED", "Video action analysis was cancelled") from exc
+                    status, reason = (("not_run", "video_action_phase_budget_exhausted")
+                                      if time.monotonic() >= deadline else
+                                      ("failed", "video_action_worker_interrupted"))
+                except Exception as exc:
+                    status, reason = "failed", type(exc).__name__
+            windows.append({"scene_index": scene_index, "input": descriptor,
+                            "status": status, "reason": str(reason)[:240] if reason else None,
+                            "result": result})
+    statuses = {item["status"] for item in windows}
+    if decode["status"] != "success":
+        status, reason = decode["status"], decode["reason"]
+    elif statuses == {"success"}:
+        status, reason = "success", None
+    elif statuses == {"not_run"}:
+        status, reason = "not_run", next(
+            (item["reason"] for item in windows if item["reason"]),
+            "video_action_runtime_unavailable")
+    else:
+        status, reason = "failed", next(
+            (item["reason"] for item in windows if item["status"] == "failed" and item["reason"]),
+            "incomplete_video_action_windows")
+    grouped = {index: [] for index in range(len(scenes))}
+    for scene_index, sample_plan in plan["planned"]:
+        grouped[scene_index].extend(sample_plan["samples"] if decode["status"] == "success" else [])
+    return {
+        "contract": ACTION_VIDEO_EVIDENCE_CONTRACT_V3, "status": status,
+        "reason": reason, "provider": AV.PROVIDER,
+        "authority": "auxiliary_window_semantics_only", "review_status": "unreviewed",
+        "score_kind": "softmax_score_uncalibrated", "num_frames": AV.NUM_FRAMES,
+        "top_k": ACTION_VIDEO_TOP_K, "window_policy": ACTION_VIDEO_WINDOW_POLICY_V3,
+        "configuration_sha256": S.sha256_text(config),
+        "eligible_scenes": len(plan["eligible_scenes"]),
+        "processed_scenes": len({item["scene_index"] for item in windows if item["result"] is not None}),
+        "ineligible_scenes": plan["ineligible_scenes"],
+        "candidate_budget": ACTION_VIDEO_V3_MAX_CANDIDATES,
+        "candidate_windows": plan["candidate_windows"],
+        "window_budget": ACTION_VIDEO_V3_MAX_WINDOWS,
+        "decode_frame_budget": VS.MAX_EXACT_FRAMES,
+        "phase_budget_seconds": ACTION_VIDEO_V3_PHASE_SECONDS,
+        "decode_budget_seconds": ACTION_VIDEO_V3_DECODE_SECONDS,
+        "local_window_seconds": ACTION_VIDEO_V3_LOCAL_SECONDS,
+        "max_window_seconds": ACTION_VIDEO_V2_MAX_WINDOW_SECONDS,
+        "max_sample_gap_seconds": ACTION_VIDEO_V2_MAX_SAMPLE_GAP_SECONDS,
+        "max_window_input_bytes": ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES,
+        "staging_byte_budget": ACTION_VIDEO_V2_STAGING_BUDGET_BYTES,
+        "disk_reserve_bytes": ACTION_VIDEO_V2_DISK_RESERVE_BYTES,
+        "verified_success_input_bytes": verified_success_bytes,
+        "processed_windows": sum(item["result"] is not None for item in windows),
+        "omitted_windows": sum(len(items) for items in plan["omitted"].values()),
+        "coverage": _action_video_v2_coverage(plan, windows, grouped),
+        "supported_hints": list(config["supported_hints"]),
+        "unsupported_actions": list(config["unsupported_actions"]),
+        "decode": decode, "windows": windows,
+    }
+
+
 def _run_action_video_sampling_v2(configuration: Dict[str, Any],
                                   model_path: Optional[str],
                                   scene_samples: Dict[int, List[Dict[str, Any]]],
@@ -1493,9 +1798,17 @@ def _run_action_video_sampling(configuration: Dict[str, Any], model_path: Option
                                scene_samples: Dict[int, List[Dict[str, Any]]],
                                work: Path, *, cancelled,
                                scenes: Optional[Sequence[Dict[str, Any]]] = None,
-                               requested: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                               requested: Optional[Dict[str, Any]] = None,
+                               store: Any = None, media_id: Optional[str] = None,
+                               ffmpeg: Optional[str] = None) -> Dict[str, Any]:
     """Run one owned worker for every scene with a canonical 16-frame window."""
     config = _validate_action_video_configuration(configuration)
+    if config["window_policy"] == ACTION_VIDEO_WINDOW_POLICY_V3:
+        if scenes is None or store is None or media_id is None:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Local action re-decode inputs are missing")
+        return _run_action_video_sampling_v3(
+            config, model_path, store, media_id, scenes, requested, work,
+            ffmpeg=ffmpeg, cancelled=cancelled)
     if config["window_policy"] == ACTION_VIDEO_WINDOW_POLICY_V2:
         if scenes is None:
             raise WorkspaceError("RECOVERY_REQUIRED", "Local video-action scenes are missing")
@@ -1614,11 +1927,15 @@ def _run_action_video_sampling(configuration: Dict[str, Any], model_path: Option
 def _action_video_model_input(digest: str, window: Optional[Dict[str, Any]],
                               sampling: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "basis": "registered_playback_decoded_content_windows",
+        "basis": ("registered_playback_locally_redecoded_exact_pts_windows"
+                  if sampling["contract"] == ACTION_VIDEO_EVIDENCE_CONTRACT_V3 else
+                  "registered_playback_decoded_content_windows"),
         "file_sha256": digest,
         "window": window,
         "time_domain": DOMAIN,
         "configuration_sha256": sampling["configuration_sha256"],
+        **({"decode": sampling["decode"]}
+           if sampling["contract"] == ACTION_VIDEO_EVIDENCE_CONTRACT_V3 else {}),
         "windows": [{"scene_index": item["scene_index"], "input": item["input"]}
                     for item in sampling["windows"]],
     }
@@ -1641,9 +1958,11 @@ def _action_video_model_run(job_id: str, digest: str,
         model_version=AV.UPSTREAM_REVISION if exact else "unavailable",
         weights_sha256=weights,
         license=AV.WEIGHTS_LICENSE if exact else "not declared",
-        preprocessing={"input": ("exactly 16 locally selected decoded BGR content samples per window"
-                                 if sampling["window_policy"] == ACTION_VIDEO_WINDOW_POLICY_V2
-                                 else "exactly 16 uniformly selected decoded BGR content samples per scene"),
+        preprocessing={"input": ("exactly 16 local re-decoded exact-PTS BGR playback frames per window"
+                                 if sampling["window_policy"] == ACTION_VIDEO_WINDOW_POLICY_V3 else
+                                 "exactly 16 locally selected decoded BGR content samples per window"
+                                 if sampling["window_policy"] == ACTION_VIDEO_WINDOW_POLICY_V2 else
+                                 "exactly 16 uniformly selected decoded BGR content samples per scene"),
                        "time_domain": DOMAIN,
                        "window_policy": sampling["window_policy"],
                        "num_frames": AV.NUM_FRAMES,
@@ -1663,6 +1982,341 @@ def _action_video_model_run(job_id: str, digest: str,
         status=sampling["status"], failure_reason=sampling["reason"],
         code_version=f"vision_jobs={VERSION}; action_video={AV.ISOLATED_CONTRACT}",
         score_kind="softmax")
+
+
+def _validate_action_video_sampling_v3(value: Any, *, configuration: Dict[str, Any],
+                                       store: Any, media_id: str,
+                                       scenes: Sequence[Dict[str, Any]],
+                                       evidence_hashes: set[str],
+                                       evidence_descriptors: Sequence[Dict[str, Any]],
+                                       model_runs: Sequence[Dict[str, Any]],
+                                       job_id: str, digest: str,
+                                       window: Optional[Dict[str, Any]]) -> None:
+    """Recompute the opt-in local plan and refuse missing exact decode receipts."""
+    def invalid(message: str) -> None:
+        raise WorkspaceError("RECOVERY_REQUIRED", message)
+
+    config = _validate_action_video_configuration(configuration)
+    if config["contract"] != ACTION_VIDEO_EVIDENCE_CONTRACT_V3:
+        invalid("Local action configuration is not v3")
+    base = {"contract", "status", "reason", "provider", "authority", "review_status",
+            "score_kind", "num_frames", "top_k", "window_policy", "configuration_sha256",
+            "eligible_scenes", "processed_scenes", "ineligible_scenes", "supported_hints",
+            "unsupported_actions", "windows", "candidate_budget", "candidate_windows",
+            "window_budget", "decode_frame_budget", "phase_budget_seconds",
+            "decode_budget_seconds", "local_window_seconds", "max_window_seconds",
+            "max_sample_gap_seconds", "max_window_input_bytes", "staging_byte_budget",
+            "disk_reserve_bytes", "verified_success_input_bytes", "processed_windows",
+            "omitted_windows", "coverage", "decode"}
+    if not isinstance(value, dict) or set(value) != base:
+        invalid("Local action sampling fields are inconsistent")
+    plan = _action_video_v3_plan(store, media_id, scenes, window, cancelled=lambda: False)
+    decode_plan = (_action_video_v3_decode_plan(store, media_id, plan)
+                   if plan["planned"] else None)
+    limits = {
+        "candidate_budget": ACTION_VIDEO_V3_MAX_CANDIDATES,
+        "candidate_windows": plan["candidate_windows"],
+        "window_budget": ACTION_VIDEO_V3_MAX_WINDOWS,
+        "decode_frame_budget": VS.MAX_EXACT_FRAMES,
+        "phase_budget_seconds": ACTION_VIDEO_V3_PHASE_SECONDS,
+        "decode_budget_seconds": ACTION_VIDEO_V3_DECODE_SECONDS,
+        "local_window_seconds": ACTION_VIDEO_V3_LOCAL_SECONDS,
+        "max_window_seconds": ACTION_VIDEO_V2_MAX_WINDOW_SECONDS,
+        "max_sample_gap_seconds": ACTION_VIDEO_V2_MAX_SAMPLE_GAP_SECONDS,
+        "max_window_input_bytes": ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES,
+        "staging_byte_budget": ACTION_VIDEO_V2_STAGING_BUDGET_BYTES,
+        "disk_reserve_bytes": ACTION_VIDEO_V2_DISK_RESERVE_BYTES,
+    }
+    if (any(value[key] != expected for key, expected in limits.items())
+            or value["contract"] != ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+            or value["provider"] != AV.PROVIDER
+            or value["authority"] != "auxiliary_window_semantics_only"
+            or value["review_status"] != "unreviewed"
+            or value["score_kind"] != "softmax_score_uncalibrated"
+            or value["num_frames"] != AV.NUM_FRAMES
+            or value["top_k"] != ACTION_VIDEO_TOP_K
+            or value["window_policy"] != ACTION_VIDEO_WINDOW_POLICY_V3
+            or value["configuration_sha256"] != S.sha256_text(config)
+            or value["supported_hints"] != config["supported_hints"]
+            or value["unsupported_actions"] != config["unsupported_actions"]
+            or value["eligible_scenes"] != len(plan["eligible_scenes"])
+            or value["ineligible_scenes"] != plan["ineligible_scenes"]
+            or value["omitted_windows"] != sum(len(items) for items in plan["omitted"].values())
+            or not isinstance(value["windows"], list)
+            or not isinstance(value["decode"], dict)):
+        invalid("Local action configuration, plan or scene coverage changed")
+    decode = value["decode"]
+    decode_fields = {"status", "reason", "media_id", "playback_sha256",
+                     "frame_map_sha256", "plan_fingerprint", "planned_indices",
+                     "samples", "total_bytes", "pts_log_sha256", "filter_sha256",
+                     "command_sha256", "command_log_sha256", "output_pts",
+                     "output_pixel_checksums"}
+    if (set(decode) != decode_fields or decode["status"] not in {"success", "not_run", "failed"}
+            or decode["media_id"] != media_id or decode["playback_sha256"] != digest
+            or decode["frame_map_sha256"] != (decode_plan["frame_map_sha256"] if decode_plan else None)
+            or decode["plan_fingerprint"] != (VS.samples_fingerprint(decode_plan)
+                                              if decode_plan else None)
+            or decode["planned_indices"] != ([item["frame_index"]
+                                                for item in decode_plan["samples"]]
+                                               if decode_plan else [])
+            or type(decode["total_bytes"]) is not int or not 0 <= decode["total_bytes"] <= ACTION_VIDEO_V2_STAGING_BUDGET_BYTES
+            or not isinstance(decode["samples"], list)
+            or not isinstance(decode["output_pts"], list)
+            or not isinstance(decode["output_pixel_checksums"], list)):
+        invalid("Local action exact decode identity is inconsistent")
+    if decode["status"] != "success":
+        if (decode["samples"] or decode["total_bytes"] or decode["output_pts"]
+                or decode["output_pixel_checksums"] or value["windows"]
+                or any(decode[key] is not None for key in
+                       ("pts_log_sha256", "filter_sha256", "command_sha256",
+                        "command_log_sha256"))):
+            invalid("Unexecuted local action decode published frame evidence")
+        allowed_not_run = {"no_scene_has_eligible_local_window",
+                           "video_action_window_byte_budget_exhausted",
+                           "video_action_disk_reserve_unavailable",
+                           "video_action_phase_budget_exhausted",
+                           "FRAME_DECODE_TIMEOUT", "FRAME_TOO_LARGE"}
+        if (config["status"] != "available"
+                and (decode["status"], decode["reason"]) !=
+                    (("not_run" if config["status"] == "unavailable" else "failed"), config["reason"])):
+            invalid("Unavailable action model has inconsistent status")
+        if config["status"] == "available" and (
+                decode["status"] == "not_run" and decode["reason"] not in allowed_not_run or
+                decode["status"] == "failed" and not decode["reason"]):
+            invalid("Runnable action decode has an invalid failure reason")
+        if config["status"] == "available" and decode_plan is None and (
+                decode["status"], decode["reason"]) != (
+                    "not_run", "no_scene_has_eligible_local_window"):
+            invalid("No eligible local window cannot report a decoder execution")
+    else:
+        if config["status"] != "available" or decode_plan is None:
+            invalid("Unavailable action model published decoded frames")
+        expected = decode_plan["samples"]
+        if (len(decode["samples"]) != len(expected)
+                or len(decode["output_pts"]) != len(expected)
+                or len(decode["output_pixel_checksums"]) != len(expected)
+                or any(S.HASH_RE.fullmatch(str(decode[key])) is None for key in
+                       ("pts_log_sha256", "filter_sha256", "command_sha256",
+                        "command_log_sha256"))
+                or decode["pts_log_sha256"] not in evidence_hashes
+                or decode["filter_sha256"] not in evidence_hashes):
+            invalid("Local action PTS or filter receipts are missing")
+        evidence_by_suffix = {item["relative_path"].split("/action-video/decoded/", 1)[-1]: item
+                              for item in evidence_descriptors
+                              if "/action-video/decoded/" in item["relative_path"]}
+        for suffix, digest_value in (
+                (".decode-0000/decode.stderr", decode["pts_log_sha256"]),
+                (".decode-0000/select.filter", decode["filter_sha256"]),
+                (".decode-0000/commands.jsonl", decode["command_log_sha256"])):
+            if evidence_by_suffix.get(suffix, {}).get("sha256") != digest_value:
+                invalid("Local action diagnostic path is not bound to its digest")
+        receipt = evidence_by_suffix[".decode-0000/commands.jsonl"]
+        try:
+            raw = _read_v3_decode_evidence_bytes(store, receipt, job_id)
+            commands = [json.loads(line) for line in raw.splitlines()]
+            decode_commands = [item["args"] for item in commands
+                               if item.get("name") == "decode" and item.get("exit_code") == 0]
+        except (WorkspaceError, KeyError, ValueError, TypeError) as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Local action command receipt is invalid") from exc
+        if len(decode_commands) != 1 or S.sha256_text(decode_commands[0]) != decode["command_sha256"]:
+            invalid("Local action decoder command digest changed")
+        try:
+            pts_log = _read_v3_decode_evidence_bytes(
+                store, evidence_by_suffix[".decode-0000/decode.stderr"], job_id)
+            _read_v3_decode_evidence_bytes(
+                store, evidence_by_suffix[".decode-0000/select.filter"], job_id)
+            observed = VS._parse_observed_output_pts(pts_log, len(expected))
+        except WorkspaceError as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Local action decoder evidence is missing or changed") from exc
+        if ([S.rational(item[0]) for item in observed] != decode["output_pts"]
+                or [item[1] for item in observed] != decode["output_pixel_checksums"]):
+            invalid("Local action saved PTS or RGB checksum differs from decoder evidence")
+        proxy_base = S.rational_value(store.get_media(media_id)["proxy_time_base"])
+        total_bytes = 0
+        for ordinal, (actual, planned, pts, checksum) in enumerate(zip(
+                decode["samples"], expected, decode["output_pts"],
+                decode["output_pixel_checksums"]), start=1):
+            if (not isinstance(actual, dict)
+                    or set(actual) != {"frame_index", "source_pts", "proxy_pts",
+                                       "seconds", "sha256", "size_bytes"}
+                    or any(actual[key] != planned[key] for key in
+                           ("frame_index", "source_pts", "proxy_pts", "seconds"))
+                    or S.HASH_RE.fullmatch(str(actual["sha256"])) is None
+                    or actual["sha256"] not in evidence_hashes
+                    or type(actual["size_bytes"]) is not int or actual["size_bytes"] < 1
+                    or pts != S.rational(int(planned["proxy_pts"]) * proxy_base)
+                    or not isinstance(checksum, str)
+                    or re.fullmatch(r"[0-9A-F]{8}", checksum) is None):
+                invalid("Local action decoded frame is not bound to admitted PTS and evidence")
+            total_bytes += actual["size_bytes"]
+            image_receipt = evidence_by_suffix.get(f"sample-{ordinal:04d}.png", {})
+            if (image_receipt.get("sha256") != actual["sha256"]
+                    or image_receipt.get("size_bytes") != str(actual["size_bytes"])):
+                invalid("Local action decoded PNG order or size changed")
+            try:
+                _read_v3_decode_evidence_bytes(store, image_receipt, job_id)
+            except WorkspaceError as exc:
+                raise WorkspaceError("RECOVERY_REQUIRED", "Local action saved PNG is missing or changed") from exc
+        if total_bytes != decode["total_bytes"]:
+            invalid("Local action decoded byte total is inconsistent")
+    expected_windows = []
+    grouped = {index: [] for index in range(len(scenes))}
+    if decode["status"] == "success":
+        decoded_by_index = {item["frame_index"]: item for item in decode["samples"]}
+        for scene_index, sample_plan in plan["planned"]:
+            selected = [{"frame_index": sample["frame_index"], "pts": sample["seconds"],
+                         "evidence_sha256": decoded_by_index[sample["frame_index"]]["sha256"]}
+                        for sample in sample_plan["samples"]]
+            expected_windows.append((scene_index, _action_video_input(selected)))
+            grouped[scene_index].extend(sample_plan["samples"])
+    if (len(value["windows"]) != len(expected_windows)
+            or type(value["verified_success_input_bytes"]) is not int
+            or not 0 <= value["verified_success_input_bytes"] <= ACTION_VIDEO_V2_STAGING_BUDGET_BYTES
+            or type(value["processed_windows"]) is not int
+            or type(value["processed_scenes"]) is not int
+            or type(value["omitted_windows"]) is not int):
+        invalid("Local action window count or byte budget is inconsistent")
+    result_count = 0
+    verified_success_bytes = 0
+    for item, (scene_index, descriptor) in zip(value["windows"], expected_windows):
+        if (not isinstance(item, dict)
+                or set(item) != {"scene_index", "input", "status", "reason", "result"}
+                or item["scene_index"] != scene_index or item["input"] != descriptor
+                or item["status"] not in {"success", "failed", "not_run"}):
+            invalid("Local action window input is inconsistent")
+        result = item["result"]
+        if result is None:
+            if item["status"] == "success" or item["reason"] not in {
+                    "video_action_phase_budget_exhausted", "video_action_window_byte_budget_exhausted",
+                    "video_action_staging_byte_budget_exhausted",
+                    "video_action_disk_reserve_unavailable"} and item["status"] != "failed":
+                invalid("Local action worker omitted a runnable result")
+            continue
+        result_count += 1
+        execution = result.get("execution") if isinstance(result, dict) else None
+        execution_fields = {"contract", "status", "request_sha256", "parent_pid",
+                            "wrapper_pid", "actual_pid", "actual_parent_pid",
+                            "peak_working_set_bytes", "actual_exit_code", "elapsed_seconds",
+                            "error_code"}
+        if (not isinstance(result, dict)
+                or set(result) != {"status", "reason", "decision", "semantic_hints", "ranked",
+                                   "score_kind", "review_status", "authority", "unsupported_actions",
+                                   "provider", "model_identity", "window", "subject_ref", "object_ref",
+                                   "recipient_ref", "uncertainty", "execution"}
+                or result["status"] != item["status"]
+                or result["review_status"] != "unreviewed"
+                or result["authority"] != "auxiliary_window_semantics_only"
+                or any(result[name] is not None for name in
+                       ("subject_ref", "object_ref", "recipient_ref"))
+                or not isinstance(execution, dict)
+                or set(execution) != execution_fields
+                or execution.get("contract") != AV.ISOLATED_CONTRACT
+                or execution.get("status") != "completed"
+                or execution.get("actual_exit_code") != 0
+                or S.HASH_RE.fullmatch(str(execution.get("request_sha256"))) is None
+                or any(type(execution.get(key)) is not int or execution[key] <= 0
+                       for key in ("parent_pid", "wrapper_pid", "actual_pid", "actual_parent_pid"))
+                or (execution["peak_working_set_bytes"] is not None and
+                    (type(execution["peak_working_set_bytes"]) is not int or
+                     execution["peak_working_set_bytes"] < 0))
+                or isinstance(execution["elapsed_seconds"], bool)
+                or not isinstance(execution["elapsed_seconds"], (int, float))
+                or not math.isfinite(float(execution["elapsed_seconds"]))
+                or execution["elapsed_seconds"] < 0
+                or execution["error_code"] is not None):
+            invalid("Local action owned worker result is inconsistent")
+        if result["status"] != "success":
+            if (result["decision"] != "not_run" or result["semantic_hints"] != []
+                    or result["ranked"] != [] or result["window"] is not None
+                    or result["score_kind"] is not None
+                    or result["provider"] is not None
+                    or result["model_identity"] is not None
+                    or result["uncertainty"] is not None
+                    or result["unsupported_actions"] != []):
+                invalid("Failed local action worker emitted semantics")
+            continue
+        identity = result["model_identity"]
+        actual = result["window"]
+        if (result["provider"] != AV.PROVIDER
+                or not isinstance(identity, dict) or set(identity) != AV.MODEL_IDENTITY_FIELDS
+                or identity.get("provider") != "transformers"
+                or identity.get("model_name") != AV.PROVIDER
+                or identity.get("upstream_model") != AV.UPSTREAM_MODEL
+                or identity.get("upstream_revision") != AV.UPSTREAM_REVISION
+                or identity.get("weights_sha256") != AV.WEIGHTS_SHA256
+                or identity.get("config_sha256") != AV.CONFIG_SHA256
+                or identity.get("preprocessor_config_sha256") != AV.PROCESSOR_SHA256
+                or identity.get("weights_license") != AV.WEIGHTS_LICENSE
+                or identity.get("weights_license_source") != AV.WEIGHTS_LICENSE_SOURCE
+                or identity.get("local_files_only") is not True
+                or identity.get("num_frames") != AV.NUM_FRAMES
+                or identity.get("authority") != "auxiliary_window_semantics_only"
+                or identity.get("supported_hints") != config["supported_hints"]
+                or identity.get("unsupported_actions") != config["unsupported_actions"]
+                or result["unsupported_actions"] != config["unsupported_actions"]
+                or result["score_kind"] != "softmax_score_uncalibrated"
+                or result["decision"] not in {"auxiliary_candidate", "reject", "unknown"}
+                or not set(result["semantic_hints"]) <= set(config["supported_hints"])
+                or not isinstance(result["uncertainty"], str)
+                or not result["uncertainty"].strip()
+                or not isinstance(actual, dict)
+                or {key: actual.get(key) for key in
+                    ("start_frame", "end_frame", "window_pts", "scene_index")}
+                != {**{key: descriptor[key] for key in
+                       ("start_frame", "end_frame", "window_pts")}, "scene_index": scene_index}
+                or len(actual.get("frames", [])) != AV.NUM_FRAMES):
+            invalid("Local action success does not match its verified input")
+        try:
+            AV._validate_ranked_result(result, top_k=ACTION_VIDEO_TOP_K)
+        except (TypeError, ValueError) as exc:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Local action ranking is invalid") from exc
+        window_bytes = 0
+        for returned, frame in zip(actual["frames"], descriptor["frames"]):
+            if (not isinstance(returned, dict)
+                    or set(returned) != {"frame_index", "pts", "scene_index",
+                                         "evidence_sha256", "pixel_sha256", "shape"}
+                    or {key: returned[key] for key in
+                        ("frame_index", "pts", "evidence_sha256")} != frame
+                    or returned["scene_index"] != scene_index
+                    or S.HASH_RE.fullmatch(str(returned["pixel_sha256"])) is None
+                    or not isinstance(returned["shape"], list)
+                    or len(returned["shape"]) != 3
+                    or any(type(size) is not int or size <= 0 for size in returned["shape"])):
+                invalid("Local action worker frame identity changed")
+            height, width, channels = returned["shape"]
+            if channels != 3 or height * width > AV.MAX_FRAME_PIXELS:
+                invalid("Local action worker frame geometry is unbounded")
+            window_bytes += height * width * channels
+        if (type(actual.get("total_input_bytes")) is not int
+                or actual["total_input_bytes"] != window_bytes
+                or window_bytes > ACTION_VIDEO_V2_MAX_WINDOW_INPUT_BYTES):
+            invalid("Local action worker byte receipt changed")
+        verified_success_bytes += window_bytes
+    if (value["processed_windows"] != result_count
+            or value["processed_scenes"] != len({item["scene_index"] for item in value["windows"]
+                                                  if item["result"] is not None})
+            or value["verified_success_input_bytes"] != verified_success_bytes
+            or value["coverage"] != _action_video_v2_coverage(plan, value["windows"], grouped)):
+        invalid("Local action coverage or worker counts are inconsistent")
+    statuses = {item["status"] for item in value["windows"]}
+    if decode["status"] != "success":
+        expected_status, expected_reason = decode["status"], decode["reason"]
+    elif statuses == {"success"}:
+        expected_status, expected_reason = "success", None
+    elif statuses == {"not_run"}:
+        expected_status, expected_reason = "not_run", next(
+            (item["reason"] for item in value["windows"] if item["reason"]),
+            "video_action_runtime_unavailable")
+    else:
+        expected_status, expected_reason = "failed", next(
+            (item["reason"] for item in value["windows"] if item["status"] == "failed"
+             and item["reason"]), "incomplete_video_action_windows")
+    if (value["status"], value["reason"]) != (expected_status, expected_reason):
+        invalid("Local action aggregate status is inconsistent")
+    run = next((item for item in model_runs
+                if item.get("id") == _module_run_id(job_id, "action_video")), None)
+    if run != _action_video_model_run(job_id, digest, window, value, config):
+        invalid("Local action model-run fingerprint changed")
 
 
 def _validate_action_video_sampling(value: Any, *, configuration: Dict[str, Any],
@@ -3295,6 +3949,7 @@ class VisionJobs:
         self._runners = set()
         self._active_jobs = set()
         self._heartbeats = set()
+        self._v3_published_ids = set()
         self._drainer = None
         self._drainer_error = None
         self.poll_seconds, self.slot_wait_seconds = float(poll_seconds), float(slot_wait_seconds)
@@ -3908,7 +4563,9 @@ class VisionJobs:
                     action_video_sampling = _run_action_video_sampling(
                         action_video_configuration, self.action_video_model_path,
                         action_video_inputs, (work / "action-video").resolve(),
-                        cancelled=cancelled, scenes=scenes, requested=window)
+                        cancelled=cancelled, scenes=scenes, requested=window,
+                        store=self.store, media_id=job["media_snapshot"]["id"],
+                        ffmpeg=ffmpeg)
                 try:
                     acoustics_sampling = _measure_audio(
                         Path(source), ffmpeg, work, window=window,
@@ -4153,6 +4810,14 @@ class VisionJobs:
                     action_video_sampling, action_video_configuration)
                 self._validate_candidate(candidate, job)
                 context.raise_if_cancelled()
+                def remember_published(artifact_id: str) -> None:
+                    with self._condition:
+                        self._v3_published_ids.add(artifact_id)
+
+                _publish_v3_decode_evidence(
+                    self.store, candidate, cancelled=cancelled,
+                    registered=remember_published)
+                context.raise_if_cancelled()
                 return candidate
             finally:
                 # Evidence has already been hashed; the work directory remains
@@ -4182,7 +4847,10 @@ class VisionJobs:
                         with slot.hold(closing=self.is_closing, timeout=self.slot_wait_seconds):
                             if self.is_closing():
                                 break
-                            result = self.queue.execute_once(self._processor, batch_id=ident, worker_id=worker_id)
+                            result = self.queue.execute_once(
+                                self._processor, batch_id=ident, worker_id=worker_id,
+                                precommit=lambda candidate: _bind_v3_decode_evidence(
+                                    self.store, candidate))
                     except (SlotClosed, SlotTimeout):
                         return results
                     if result is None:
@@ -4192,7 +4860,19 @@ class VisionJobs:
         finally:
             with self._condition:
                 self._runners.discard(token)
+                cleanup_ids = (list(self._v3_published_ids)
+                               if not self._runners else [])
                 self._condition.notify_all()
+            if cleanup_ids:
+                try:
+                    self.store.sweep_unbound_artifacts(
+                        apply=True, artifact_ids=cleanup_ids)
+                except Conflict as exc:
+                    if exc.code != "GC_ACTIVE_WORK":
+                        raise
+                else:
+                    with self._condition:
+                        self._v3_published_ids.difference_update(cleanup_ids)
 
     def start(self) -> "VisionJobs":
         with self._condition:
@@ -4269,7 +4949,8 @@ class VisionJobs:
                           .get("contract") == HAND_EVIDENCE_CONTRACT)
         requires_action_video = (parameters["job_identity"]["config"].get("action_video", {})
                                  .get("contract") in {ACTION_VIDEO_EVIDENCE_CONTRACT,
-                                                      ACTION_VIDEO_EVIDENCE_CONTRACT_V2})
+                                                      ACTION_VIDEO_EVIDENCE_CONTRACT_V2,
+                                                      ACTION_VIDEO_EVIDENCE_CONTRACT_V3})
         if requires_action_video:
             expected.add("action_video_sampling")
         object_fields = {"object_sampling", "object_relations"}
@@ -4449,12 +5130,20 @@ class VisionJobs:
                                   model_runs=model_runs, evidence_hashes=evidence_hashes)
         action_video_run_id = _module_run_id(job["id"], "action_video")
         if requires_action_video:
-            _validate_action_video_sampling(
-                value["action_video_sampling"],
-                configuration=parameters["job_identity"]["config"]["action_video"],
-                scenes=value["scenes"], content_frames=content_frames,
-                evidence_hashes=evidence_hashes, model_runs=model_runs,
-                job_id=job["id"], digest=value["file_sha256"], window=value["window"])
+            action_config = parameters["job_identity"]["config"]["action_video"]
+            if action_config["contract"] == ACTION_VIDEO_EVIDENCE_CONTRACT_V3:
+                _validate_action_video_sampling_v3(
+                    value["action_video_sampling"], configuration=action_config,
+                    store=self.store, media_id=value["media_id"], scenes=value["scenes"],
+                    evidence_hashes=evidence_hashes,
+                    evidence_descriptors=value["evidence"], model_runs=model_runs,
+                    job_id=job["id"], digest=value["file_sha256"], window=value["window"])
+            else:
+                _validate_action_video_sampling(
+                    value["action_video_sampling"], configuration=action_config,
+                    scenes=value["scenes"], content_frames=content_frames,
+                    evidence_hashes=evidence_hashes, model_runs=model_runs,
+                    job_id=job["id"], digest=value["file_sha256"], window=value["window"])
             if (value["module_status"].get("action_video")
                     != value["action_video_sampling"]["status"]
                     or value["module_status"].get("action_video_reason")
@@ -5423,6 +6112,118 @@ def _build_model_runs(job: Dict[str, Any], extractors: Dict[str, Any],
     return runs
 
 
+def _v3_decode_evidence_role(relative_path: str) -> str:
+    """Give each required local decode file one stable job-owned artifact role."""
+    marker = "/action-video/decoded/"
+    if not isinstance(relative_path, str) or relative_path.count(marker) != 1:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Local action evidence path is invalid")
+    suffix = relative_path.split(marker, 1)[1]
+    if re.fullmatch(r"sample-\d{4}\.png", suffix):
+        return "v3-action-frame-" + suffix[7:11]
+    role = {
+        ".decode-0000/decode.stderr": "v3-action-pts-log",
+        ".decode-0000/select.filter": "v3-action-filter",
+        ".decode-0000/commands.jsonl": "v3-action-command-log",
+    }.get(suffix)
+    if role is None:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Local action evidence role is invalid")
+    return role
+
+
+def _v3_decode_evidence_descriptors(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Select only the bounded files required to replay a successful v3 result."""
+    sampling = candidate.get("action_video_sampling") or {}
+    decode = sampling.get("decode") or {}
+    if (sampling.get("contract") != ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+            or decode.get("status") != "success"):
+        return []
+    samples = decode.get("samples")
+    if not isinstance(samples, list) or not 1 <= len(samples) <= VS.MAX_EXACT_FRAMES:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Local action durable frame count is invalid")
+    expected = [f"sample-{index:04d}.png" for index in range(1, len(samples) + 1)]
+    expected += [".decode-0000/decode.stderr", ".decode-0000/select.filter",
+                 ".decode-0000/commands.jsonl"]
+    evidence = candidate.get("evidence") or []
+    selected = []
+    for suffix in expected:
+        matches = [item for item in evidence if isinstance(item, dict)
+                   and isinstance(item.get("relative_path"), str)
+                   and item["relative_path"].endswith("/action-video/decoded/" + suffix)]
+        if len(matches) != 1:
+            raise WorkspaceError("RECOVERY_REQUIRED", "Local action durable evidence is incomplete")
+        selected.append(matches[0])
+    return selected
+
+
+def _publish_v3_decode_evidence(store, candidate: Dict[str, Any], *, cancelled,
+                                registered=None) -> None:
+    """Register the exact decode closure; the queue commit pins it atomically."""
+    descriptors = _v3_decode_evidence_descriptors(candidate)
+    if not descriptors:
+        return
+    total = sum(int(item["size_bytes"]) for item in descriptors)
+    if (total > ACTION_VIDEO_V2_STAGING_BUDGET_BYTES + VS.MAX_PTS_LOG_BYTES + 1024 * 1024
+            or shutil.disk_usage(store.root).free < total + ACTION_VIDEO_V2_DISK_RESERVE_BYTES):
+        raise WorkspaceError("ANALYSIS_LIMIT_EXCEEDED", "Local action durable evidence exceeds disk budget")
+    with store._evidence_publication_scope():
+        for descriptor in descriptors:
+            if cancelled():
+                raise WorkspaceError("CANCELLED", "Local action evidence publication was cancelled")
+            _read_stable_evidence_bytes(store, descriptor)
+            source = store.root / descriptor["relative_path"]
+            with store._mutex:
+                existed = store.conn.execute(
+                    "SELECT 1 FROM artifacts WHERE id=?",
+                    (S.make_id("art", descriptor["sha256"]),)).fetchone() is not None
+            artifact = store._put_file(source)
+            if not existed and registered is not None:
+                registered(artifact["id"])
+            if (artifact["sha256"] != descriptor["sha256"]
+                    or artifact["size_bytes"] != descriptor["size_bytes"]):
+                raise WorkspaceError("RECOVERY_REQUIRED", "Local action evidence changed during publication")
+        if cancelled():
+            raise WorkspaceError("CANCELLED", "Local action evidence publication was cancelled")
+
+
+def _bind_v3_decode_evidence(store, candidate: Dict[str, Any]) -> None:
+    """Pin registered v3 bytes in the same transaction as queue success."""
+    job_id = S.require_id(candidate["job_id"])
+    for descriptor in _v3_decode_evidence_descriptors(candidate):
+        digest = descriptor["sha256"]
+        artifact = {"id": S.make_id("art", digest),
+                    "relative_path": "objects/" + digest, "sha256": digest,
+                    "size_bytes": descriptor["size_bytes"]}
+        store.bind_artifact_reference(
+            artifact, owner_kind="evidence", owner_id=job_id,
+            role=_v3_decode_evidence_role(descriptor["relative_path"]),
+            owner_revision="0")
+
+
+def _read_v3_decode_evidence_bytes(store, descriptor: Dict[str, Any],
+                                   job_id: str) -> bytes:
+    """Read pinned immutable bytes for committed jobs; local tmp for in-flight jobs."""
+    if not store.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone():
+        return _read_stable_evidence_bytes(store, descriptor)
+    row = store.conn.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None or row[0] != "succeeded":
+        return _read_stable_evidence_bytes(store, descriptor)
+    digest, size = descriptor["sha256"], descriptor["size_bytes"]
+    ident = S.make_id("art", digest)
+    role = _v3_decode_evidence_role(descriptor["relative_path"])
+    registration = store.conn.execute(
+        "SELECT rel_path,sha256,size_bytes FROM artifacts WHERE id=?", (ident,)).fetchone()
+    pin = store.conn.execute(
+        "SELECT 1 FROM artifact_references WHERE artifact_id=? AND owner_kind='evidence' "
+        "AND owner_id=? AND owner_revision='0' AND role=?",
+        (ident, job_id, role)).fetchone()
+    if registration != ("objects/" + digest, digest, int(size)) or pin is None:
+        raise WorkspaceError("RECOVERY_REQUIRED", "Local action durable evidence is unregistered")
+    return _read_stable_evidence_bytes(store, {
+        "relative_path": "objects/" + digest, "sha256": digest,
+        "size_bytes": size})
+
+
 def _read_stable_evidence_bytes(store, descriptor: Dict[str, Any]) -> bytes:
     """Read one bounded job-evidence file without following replacement races."""
     try:
@@ -5535,6 +6336,10 @@ def _prepare_candidate_evidence(store, candidate: Dict[str, Any],
                 "ANALYSIS_LIMIT_EXCEEDED",
                 "Evidence preparation exceeds the cumulative input byte budget")
         preparation_input_bytes += size
+        action_sampling = candidate.get("action_video_sampling") or {}
+        if (action_sampling.get("contract") == ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+                and "/action-video/decoded/sample-" in descriptor["relative_path"]):
+            return _read_v3_decode_evidence_bytes(store, descriptor, candidate["job_id"])
         return _read_stable_evidence_bytes(store, descriptor)
 
     def preview_bytes(descriptor: Dict[str, Any]) -> bytes:
@@ -5584,6 +6389,7 @@ def _prepare_candidate_evidence(store, candidate: Dict[str, Any],
     transitions_by_scene: Dict[int, List[Dict[str, Any]]] = {}
     keyframes_by_key: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
     content_by_key: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+    action_by_key: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
     for frame in frames:
         frames_by_scene.setdefault(frame.get("scene_index"), []).append(frame)
     for frame in boundary_frames:
@@ -5594,6 +6400,21 @@ def _prepare_candidate_evidence(store, candidate: Dict[str, Any],
     for frame in content_frames:
         content_by_key[(frame["scene_index"], str(frame["frame_index"]),
                         frame["evidence_sha256"])] = frame
+    action_sampling = candidate.get("action_video_sampling") or {}
+    if (action_sampling.get("contract") == ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+            and (action_sampling.get("decode") or {}).get("status") == "success"):
+        decoded_by_index = {item["frame_index"]: item
+                            for item in action_sampling["decode"]["samples"]}
+        for action_window in action_sampling["windows"]:
+            scene_index = action_window["scene_index"]
+            for sample in action_window["input"]["frames"]:
+                row = decoded_by_index.get(sample["frame_index"])
+                if (row is None or row["sha256"] != sample["evidence_sha256"]
+                        or row["seconds"] != sample["pts"]):
+                    raise WorkspaceError("VISION_EVIDENCE_UNAVAILABLE",
+                                         "Local action frame has no matching decoded evidence")
+                action_by_key[(scene_index, row["frame_index"], row["sha256"])] = {
+                    **row, "scene_index": scene_index, "evidence_sha256": row["sha256"]}
     portable_projection_frames: set[Tuple[int, str, str]] = set()
     for index, annotation in enumerate(annotations):
         scene_frames = frames_by_scene.get(index, [])
@@ -5668,12 +6489,13 @@ def _prepare_candidate_evidence(store, candidate: Dict[str, Any],
                 if position < 0 or position >= len(frame_samples):
                     continue
                 sample = frame_samples[position]
-                match = content_by_key.get((index, str(sample.get("frame_index")),
-                                            sample.get("evidence_sha256")))
+                key = (index, str(sample.get("frame_index")), sample.get("evidence_sha256"))
+                match = (action_by_key if action_sampling.get("contract") ==
+                         ACTION_VIDEO_EVIDENCE_CONTRACT_V3 else content_by_key).get(key)
                 if match is None or match.get("seconds") != sample.get("pts"):
                     raise WorkspaceError(
                         "VISION_EVIDENCE_UNAVAILABLE",
-                        "Video-action hint has no matching decoded content sample")
+                        "Video-action hint has no matching decoded frame sample")
                 if not any(str(frame["frame_index"]) == str(match["frame_index"])
                            and frame["evidence_sha256"] == match["evidence_sha256"]
                            for frame in selected):
@@ -6219,10 +7041,14 @@ def _candidate_claims(candidate: Dict[str, Any], index: int, scene: Dict[str, An
                                "authority": result.get("authority"),
                                "review_status": result.get("review_status"),
                                "participant_binding": "none",
-                               **({"sampling_contract": ACTION_VIDEO_EVIDENCE_CONTRACT_V2,
-                                   "window_policy": ACTION_VIDEO_WINDOW_POLICY_V2}
-                                  if action_video.get("contract") == ACTION_VIDEO_EVIDENCE_CONTRACT_V2
-                                  else {}),
+                               **({"sampling_contract": action_video["contract"],
+                                   "window_policy": action_video.get("window_policy") or (
+                                       ACTION_VIDEO_WINDOW_POLICY_V3
+                                       if action_video["contract"] == ACTION_VIDEO_EVIDENCE_CONTRACT_V3
+                                       else ACTION_VIDEO_WINDOW_POLICY_V2)}
+                                  if action_video.get("contract") in {
+                                      ACTION_VIDEO_EVIDENCE_CONTRACT_V2,
+                                      ACTION_VIDEO_EVIDENCE_CONTRACT_V3} else {}),
                                "supported_hints": list(action_video.get("supported_hints") or []),
                                "unsupported_actions": list(action_video.get("unsupported_actions") or []),
                            }},

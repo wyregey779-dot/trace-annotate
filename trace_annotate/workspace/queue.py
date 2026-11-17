@@ -370,7 +370,8 @@ class DurableQueue:
         self.store.conn.execute("UPDATE attempts SET state=?,ended_at=?,error_code=?,error_message=? WHERE job_id=? AND attempt=?",
                                 (state, self._now(), error_code, error_message, job["id"], job["attempt"]))
 
-    def finish(self, job_id: str, lease_generation: int, worker_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    def finish(self, job_id: str, lease_generation: int, worker_id: str, result: Dict[str, Any], *,
+               precommit: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         if type(lease_generation) is not int or lease_generation < 1:
             raise SchemaInvalid("SCHEMA_INVALID", "Invalid lease_generation")
         _ident(worker_id, "worker_id")
@@ -392,6 +393,10 @@ class DurableQueue:
             if job["state"] == "cancel_requested":
                 raise Conflict("CANCELLED", "Cancellation was accepted before result commit")
             current = self.store.get_task(job["task_id"])
+            if precommit is not None:
+                # The callback may pin already registered evidence. Its writes
+                # share this exact transaction with the successful job commit.
+                precommit(result)
             artifact = self.store._put_artifact(data)
             commit = {"id": "commit-" + uuid.uuid4().hex, "job_id": job_id, "task_id": job["task_id"],
                       "input_revision": job["input_revision"], "input_sha256": job["input_sha256"],
@@ -567,7 +572,8 @@ class DurableQueue:
             return changes
 
     def execute_once(self, processor: Callable[[Dict[str, Any], WorkerContext], Dict[str, Any]], *,
-                     worker_id: str = "worker-local", batch_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                     worker_id: str = "worker-local", batch_id: Optional[str] = None,
+                     precommit: Optional[Callable[[Dict[str, Any]], None]] = None) -> Optional[Dict[str, Any]]:
         """Execute one claim; callers may create at most the configured worker count.
 
         A stalled processor cannot be killed safely by this API. It must implement
@@ -586,7 +592,8 @@ class DurableQueue:
             # A processor receives its own copy so edits to its input dictionary
             # cannot change the lease identity used by the runner's commit path.
             result = processor(json.loads(_json(job)), context)
-            self.finish(job["id"], job["lease_generation"], worker_id, result)
+            self.finish(job["id"], job["lease_generation"], worker_id, result,
+                        precommit=precommit)
         except Exception as exc:
             with self.store.transaction():
                 current = self._job(job["id"])

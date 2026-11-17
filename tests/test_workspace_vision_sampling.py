@@ -557,3 +557,140 @@ def test_bounded_single_thread_decode_matches_original_png_bytes(tmp_path, varia
             item["sha256"] for item in evidence["decoded"]]
     finally:
         project.close()
+
+
+@pytest.mark.parametrize("variable", [False, True], ids=["cfr", "vfr"])
+def test_exact_decode_rechecks_map_and_actual_output_pts(tmp_path, variable):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe are required for exact PTS verification")
+    source = tmp_path / "source.mp4"
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+               "testsrc2=s=64x64:r=10:d=2"]
+    if variable:
+        command += ["-vf", "select=not(eq(n\\,3)+eq(n\\,7)+eq(n\\,12))",
+                    "-fps_mode", "vfr"]
+    command += ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(source)]
+    subprocess.run(command, check=True, capture_output=True, timeout=60)
+    project = WorkspaceStore(tmp_path / "workspace")
+    project.create()
+    try:
+        project.import_source(source)
+        media_id = _media(project)
+        plan = VSmp.plan_samples(project, media_id, uniform=8,
+                                 budget=VSmp.SamplingBudget(max_frames=8))
+        evidence = VSmp.decode_samples(
+            project, media_id, plan, tmp_path / "exact", verify_output_pts=True,
+            max_bytes=16 * 1024 * 1024, timeout=120)
+        assert evidence["output_pts_verified"] is True
+        base = S.rational_value(project.get_media(media_id)["proxy_time_base"])
+        assert evidence["output_pts"] == [S.rational(int(item["proxy_pts"]) * base)
+                                          for item in plan["samples"]]
+        assert len(evidence["pts_log_sha256"]) == 64
+        assert len(evidence["output_pixel_checksums"]) == len(plan["samples"])
+        changed = json.loads(json.dumps(plan))
+        changed["samples"][0]["proxy_pts"] = S.rational(99)
+        with pytest.raises(WorkspaceError, match="identity changed"):
+            VSmp.decode_samples(project, media_id, changed, tmp_path / "forged",
+                                verify_output_pts=True)
+        assert not (tmp_path / "forged" / ".decode-0000").exists()
+    finally:
+        project.close()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "reversed", "wrong_pts",
+                                       "error", "warning", "invalid"])
+def test_exact_output_pts_parser_fails_closed(tmp_path, mutation):
+    path = tmp_path / "decode.stderr"
+    lines = ["[Parsed_showinfo_2 @ 0x1] [info] config in time_base: 1/1000, frame_rate: 10/1",
+             "[Parsed_showinfo_2 @ 0x1] [info] n:   0 pts:      0 pts_time:0 fmt:rgb24 checksum:00000000",
+             "[Parsed_showinfo_2 @ 0x1] [info] n:   1 pts:    100 pts_time:0.1 fmt:rgb24 checksum:00000001"]
+    if mutation == "missing":
+        lines.pop()
+    elif mutation == "duplicate":
+        lines.append(lines[-1])
+    elif mutation == "reversed":
+        lines[1], lines[2] = lines[2], lines[1]
+    elif mutation == "wrong_pts":
+        lines[-1] = lines[-1].replace("100 pts_time", "101 pts_time")
+    elif mutation == "error":
+        lines.append("[error] Decoder reported corrupt input")
+    elif mutation == "warning":
+        lines.append("[warning] Decoder concealed timing discontinuity")
+    else:
+        lines.append("[info] Invalid frame metadata")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    if mutation == "wrong_pts":
+        assert [item[0] for item in VSmp._observed_output_pts(path, 2)] != [
+            S.rational_value(0), S.rational_value({"n": "1", "d": "10"})]
+    else:
+        with pytest.raises(WorkspaceError) as exc:
+            VSmp._observed_output_pts(path, 2)
+        assert exc.value.code == "FRAME_DECODE_FAILED"
+
+
+def test_exact_decode_rejects_swapped_png_after_ffmpeg(store, monkeypatch, tmp_path):
+    media_id = _media(store)
+    plan = VSmp.plan_samples(store, media_id, uniform=3,
+                             budget=VSmp.SamplingBudget(max_frames=3))
+    original = P._run
+
+    def swap(command, directory, name, cancelled, **kwargs):
+        result = original(command, directory, name, cancelled, **kwargs)
+        if name == "decode":
+            first, second = directory / "frame-0001.png", directory / "frame-0002.png"
+            hold = directory / "hold.png"
+            first.replace(hold)
+            second.replace(first)
+            hold.replace(second)
+        return result
+
+    monkeypatch.setattr(P, "_run", swap)
+    with pytest.raises(WorkspaceError, match="pixels differ") as exc:
+        VSmp.decode_samples(store, media_id, plan, tmp_path / "swapped",
+                            verify_output_pts=True, max_bytes=16 * 1024 * 1024)
+    assert exc.value.code == "FRAME_DECODE_FAILED"
+
+
+def test_exact_decode_uses_proxy_clock_for_nonzero_source_origin_and_vfr(tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg and ffprobe required")
+    source = tmp_path / "offset-vfr.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                    "testsrc2=s=64x64:r=10:d=2", "-vf",
+                    "select=not(eq(n\\,3)+eq(n\\,7)),setpts=PTS+10/TB",
+                    "-fps_mode", "vfr", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    str(source)], check=True, capture_output=True, timeout=60)
+    project = WorkspaceStore(tmp_path / "workspace")
+    project.create()
+    try:
+        project.import_source(source)
+        media_id = _media(project)
+        media = project.get_media(media_id)
+        assert S.rational_value(media["common_origin"]) == 10
+        plan = VSmp.plan_samples(project, media_id, uniform=8,
+                                 budget=VSmp.SamplingBudget(max_frames=8))
+        evidence = VSmp.decode_samples(
+            project, media_id, plan, tmp_path / "exact-offset",
+            verify_output_pts=True, max_bytes=16 * 1024 * 1024)
+        base = S.rational_value(media["proxy_time_base"])
+        assert evidence["output_pts"] == [S.rational(int(item["proxy_pts"]) * base)
+                                          for item in plan["samples"]]
+        assert plan["samples"][0]["source_pts"] != plan["samples"][0]["proxy_pts"]
+    finally:
+        project.close()
+
+
+def test_exact_decode_rejects_nonzero_ffmpeg_exit_even_with_info_stderr(
+        store, monkeypatch, tmp_path):
+    media_id = _media(store)
+    plan = VSmp.plan_samples(store, media_id, uniform=3,
+                             budget=VSmp.SamplingBudget(max_frames=3))
+    # -vf treats the filter-script path as an expression and FFmpeg exits nonzero.
+    monkeypatch.setattr(VSmp, "_filter_script_option", lambda *_args: "-vf")
+    with pytest.raises(WorkspaceError) as failure:
+        VSmp.decode_samples(store, media_id, plan, tmp_path / "bad-filter",
+                            verify_output_pts=True, max_bytes=16 * 1024 * 1024)
+    assert failure.value.code == "FRAME_DECODE_FAILED"
+    records = [json.loads(line) for line in
+               (tmp_path / "bad-filter" / ".decode-0000" / "commands.jsonl").read_text().splitlines()]
+    assert records[-1]["exit_code"] != 0

@@ -82,6 +82,50 @@ sampling contract leaves the `videomae-window-hint-v1` authority and its
 `action-candidate-v3` interaction fact. Historic v1 results retain their exact
 original validation and projection behavior.
 
+An additional, explicitly opt-in `videomae-window-sampling-v3` policy uses
+`TRACE_ANNOTATE_ACTION_VIDEO_WINDOW_POLICY=per_scene_local_redecoded_playback_windows_v3`.
+It is a separate job identity and does not reinterpret existing v1/v2 records.
+For up to eight candidate local intervals, the planner takes at most four
+six-second scene/request intersections. Each selected interval must contain
+sixteen distinct admitted frame-map entries with strictly increasing playback
+PTS, adjacent gaps no greater than 0.5 seconds and an endpoint span no greater
+than eight seconds. At most 64 unique frames are re-decoded from the registered
+playback in one cancellable FFmpeg pass. The decoder verifies each output PTS
+against `proxy_pts × proxy_time_base`, plus the decoded RGB checksum against
+the corresponding PNG pixels. The frozen result records the playback and frame
+map SHA-256 values, exact source/proxy PTS, PNG hashes, sample-plan fingerprint,
+filter and decoder log hashes, and command digest. Source PTS can have a
+different origin and is never substituted for playback PTS.
+Intervals skipped before frame inspection are listed with
+`global_candidate_budget`; they are not mislabeled as ineligible scenes.
+
+The decode phase has a 180-second limit inside a 300-second action phase,
+a 512 MiB decoded-PNG cap, a separate 512 MiB staged worker-input cap and a
+512 MiB free-disk reserve. Each worker
+window is capped at 128 MiB of uint8 BGR input. Missing weights or an
+ineligible interval yields `not_run` without decoding; cancellation or lost
+lease cannot publish a partial semantic success. The `coverage` object lists
+successful sampled envelopes, omitted candidates and unobserved intervals;
+neither an envelope nor a negative hint proves continuous observation or
+absence of an action. V3 retains the same unreviewed, `unspecified`
+`videomae-window-hint-v1` export with null participant references. The
+checkpoint's non-commercial license and unknown independent accuracy remain
+unchanged. A fake-model structural test does not count as a real forward pass,
+human truth or per-action accuracy evidence.
+
+For a committed successful v3 job, the exact decoder PNGs and PTS/filter/command
+receipts are registered as immutable `objects/<sha256>` artifacts. Their pins
+commit atomically with queue success; `result()` rehashes these objects and
+reparses the decoder PTS receipt, including after a formal workspace backup
+and restore. A cancelled or failed attempt may leave registered but unowned
+objects if interrupted between publication and commit. They are measurable
+with `unbound_artifacts()` and reclaimable through the existing explicit
+`sweep_unbound_artifacts(apply=True)` gate after all processors exit. The
+backup closure preserves the committed v3 result, but this does not establish
+that every unrelated temporary keyframe/content artifact needed to **apply an
+unapplied candidate after restore** is portable; that older workflow requires
+separate evidence-closure work and must not be claimed as verified here.
+
 Every vision action candidate binds its source frames, reduced PTS values, exact decoded-sample SHA-256 values, provider id and action model-run id. On import, each referenced sample is rehashed before a compact immutable preview is projected. The complete semantic document is validated against the projected content-addressed artifact ids before those objects are published.
 
 ## Optional model licensing and distribution

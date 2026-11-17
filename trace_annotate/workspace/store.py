@@ -1053,7 +1053,8 @@ class WorkspaceStore:
         return {"count": len(items), "artifacts": items,
                 "total_bytes": str(sum(int(item["size_bytes"]) for item in items))}
 
-    def sweep_unbound_artifacts(self, *, apply: bool = False) -> Dict[str, Any]:
+    def sweep_unbound_artifacts(self, *, apply: bool = False,
+                                artifact_ids=None) -> Dict[str, Any]:
         """Commit a durable tombstone before physical deletion, under one lock.
 
         File deletion cannot roll back with SQL. Once a tombstone commits the
@@ -1061,6 +1062,14 @@ class WorkspaceStore:
         This operation may not run inside a caller's transaction.
         """
         measured = self.unbound_artifacts()
+        if artifact_ids is not None:
+            if (not isinstance(artifact_ids, (list, tuple, set))
+                    or len(artifact_ids) > 1024):
+                raise SchemaInvalid("SCHEMA_INVALID", "Scoped cleanup IDs must be a bounded collection")
+            requested = {S.require_id(item, "artifact_id") for item in artifact_ids}
+            selected = [item for item in measured["artifacts"] if item["id"] in requested]
+            measured = {"count": len(selected), "artifacts": selected,
+                        "total_bytes": str(sum(int(item["size_bytes"]) for item in selected))}
         if not apply:
             return {**measured, "applied": False, "removed": 0}
         with self._mutex:
