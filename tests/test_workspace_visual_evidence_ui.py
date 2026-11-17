@@ -24,6 +24,8 @@ def test_visual_evidence_viewer_bounds_and_rejects_mismatched_pts():
     playwright = pytest.importorskip("playwright.sync_api", reason="Chromium is needed for image and SVG evidence")
     source = UI.read_text(encoding="utf-8")
     panel = re.search(r'<section id="vision-evidence".*?</section>', source, re.DOTALL).group()
+    coverage_script = source[source.index("function renderActionVideoCoverage("):
+                             source.index("function renderVisionRetry(")]
     script = source[source.index("const VISION_EVIDENCE_PAGE_SIZE="):source.index("function bind(){")]
     candidate_script = source[source.index("function renderVisionCandidates("):source.index("async function refreshVisionStatus(")]
     png = BytesIO()
@@ -33,6 +35,7 @@ def test_visual_evidence_viewer_bounds_and_rejects_mismatched_pts():
 const $=id=>document.getElementById(id);
 const state={{task:null,media:null,visionJob:null,visionResult:null,visionEvidencePage:0,visionEvidenceToken:0,visionEvidenceBlob:null}};
 const showTime=r=>String(Number(r.n)/Number(r.d));
+{coverage_script}
 async function selectAnnotation(id){{state.selected=id;}}
 async function json(path){{throw new Error('No geometry fixture for '+path);}}
 const pixels=Uint8Array.from(atob('{encoded}'),char=>char.charCodeAt(0));
@@ -64,9 +67,18 @@ window.fixture={{state,renderVisionEvidence,loadVisionEvidenceFrame,clearVisionE
         "scope": "registered_playback_only; candidate_not_applied",
         "sampling": {"planned": 20, "returned": 13, "truncated": True, "frame_map_sha256": "map-1"},
         "keyframes": frames,
-        "action_video_sampling": {"windows": [{"input": {"frames": [{"frame_index": "0"}]},
-                                               "status": "success", "result": {"decision": "unknown",
-                                                                                 "reason": "outside_supported_mapping"}}]},
+        "action_video_sampling": {"contract": "videomae-window-sampling-v2", "status": "not_run",
+                                  "reason": "video_action_weights_unavailable", "eligible_scenes": 1,
+                                  "processed_windows": 0,
+                                  "coverage": [{"scene_index": 0,
+                                                "scene_window": {"start": {"n": "0", "d": "1"}, "end": {"n": "13", "d": "1"}},
+                                                "decoded_samples": 13, "selected_windows": 1,
+                                                "processed_windows": 0, "successful_windows": 0,
+                                                "uncovered_intervals": [{"window_pts": {"start": {"n": "0", "d": "1"}, "end": {"n": "13", "d": "1"}}}],
+                                                "omitted_window_envelopes": []}],
+                                  "windows": [{"scene_index": 0, "input": {"frames": [{"frame_index": "0"}],
+                                                                                "window_pts": {"start": {"n": "0", "d": "1"}, "end": {"n": "13", "d": "1"}}},
+                                               "status": "not_run", "reason": "video_action_weights_unavailable", "result": None}]},
     }
     with playwright.sync_playwright() as runtime:
         browser = runtime.chromium.launch(headless=True, channel="chrome" if os.name == "nt" else None)
@@ -83,7 +95,7 @@ window.fixture={{state,renderVisionEvidence,loadVisionEvidenceFrame,clearVisionE
             assert page.locator("#vision-evidence-overlay circle").count() == 84
             assert page.locator("#vision-evidence-notes img").count() == 0
             assert "未采样后段" in page.locator("#vision-evidence-loss").inner_text()
-            assert "outside_supported_mapping" in page.locator("#vision-evidence-notes").inner_text()
+            assert "video_action_weights_unavailable" in page.locator("#vision-evidence-notes").inner_text()
             assert "preview-png-hash" in page.locator("#vision-evidence-identity").inner_text()
             assert "c" * 64 in page.locator("#vision-evidence-identity").inner_text()
             page.evaluate("()=>{fixture.state.visionEvidencePage=1;fixture.renderVisionEvidence();}")
@@ -100,8 +112,11 @@ window.fixture={{state,renderVisionEvidence,loadVisionEvidenceFrame,clearVisionE
             playwright.expect(page.locator("#vision-evidence-image")).to_be_visible()
             assert page.evaluate("fixture.state.visionEvidenceReviewJob?.id") == "job-1"
             assert "d" * 64 in page.locator("#vision-evidence-identity").inner_text()
+            assert "来源作业 job-1" in page.locator("#vision-action-coverage-saved").inner_text()
+            assert "成功 0 / 选中 1 窗口" in page.locator("#vision-action-coverage-saved").inner_text()
             race = page.evaluate("async()=>{const s=fixture.state;let release;window.json=()=>new Promise(resolve=>{release=resolve});const ann=s.task.annotations[0];const pending=fixture.openVisionEvidenceForCandidate(ann);s.task={id:'task-2',annotations:[]};fixture.clearVisionEvidence();release({job_id:'job-1',task_id:'task-1',state:'succeeded',has_candidate:true});await pending;return {review:s.visionEvidenceReviewJob,panelHidden:document.getElementById('vision-evidence').hidden};}")
             assert race == {"review": None, "panelHidden": True}
+            assert page.locator("#vision-action-coverage-saved").count() == 0
             assert not errors, errors
         finally:
             browser.close()

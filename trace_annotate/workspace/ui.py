@@ -93,6 +93,13 @@ dialog:modal{overscroll-behavior:contain}dialog::backdrop{overflow:hidden;oversc
 .vision-window-help,.vision-window-error,.vision-coverage{font-size:11px;line-height:1.65;margin-top:8px;overflow-wrap:anywhere}
 .vision-window-help{color:var(--muted)}.vision-window-error{color:var(--danger)}
 .vision-coverage{padding:0 15px 12px;color:var(--muted)}
+.vision-action-coverage{margin:0 15px 12px;padding:12px;border:1px solid #755c36;border-radius:7px;background:#1c1a19;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
+.vision-action-coverage h4{margin:0 0 5px;font-size:14px}
+.vision-action-coverage p{margin:5px 0}
+.vision-action-coverage details{margin-top:8px}
+.vision-action-coverage summary{cursor:pointer;min-height:30px}
+.vision-action-coverage ol{margin:7px 0 0;padding-left:20px;max-height:260px;overflow:auto}
+.vision-action-coverage li{margin-bottom:7px}
 @media(max-width:520px){.vision-window-grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -330,6 +337,7 @@ function selectedVisionWindow(){
 }
 function renderVisionCoverage(){
  const box=$('vision-coverage'),job=state.visionJob,result=state.visionResult;
+ renderActionVideoCoverage(job?result?.action_video_sampling:null);
  if(!job){box.textContent='尚未运行。请选择起止时间；长片需分段分析，候选仍需逐条核对。';return;}
  const window=result?.window||job.requested_window;
  const range=window?'请求区间 '+showTime(window.start)+'–'+showTime(window.end)+' 秒（不含终点）':'旧作业请求整段媒体';
@@ -342,6 +350,63 @@ function renderVisionCoverage(){
  if(failures.length)parts.push('未完成模块 '+failures.slice(0,8).join('、')+(failures.length>8?'等 '+failures.length+' 项':''));
  parts.push('以上只说明已保存的稀疏样本，不证明逐帧覆盖或标注准确。');
  box.textContent=parts.join(' · ');
+}
+function renderActionVideoCoverage(sampling,{historicalJobId=null}={}){
+ const saved=Boolean(historicalJobId),box=$(saved?'vision-evidence-scope':'vision-coverage');
+ const panelId=saved?'vision-action-coverage-saved':'vision-action-coverage';
+ const existing=$(panelId);
+ if(sampling?.contract!=='videomae-window-sampling-v2'){
+  existing?.remove?.();return;
+ }
+ const panel=existing||document.createElement('section');
+ if(!existing){panel.id=panelId;panel.className='vision-action-coverage';box.after(panel);}
+ const wasOpen=panel.querySelector('details')?.open||false;
+ panel.replaceChildren();
+ const heading=document.createElement('h4');heading.textContent=(saved?'已保存候选 · ':'')+'动作窗口抽样覆盖（只读）';panel.append(heading);
+ if(saved){const identity=document.createElement('p');identity.textContent='来源作业 '+historicalJobId+'；本段证据只对应这个已保存候选。';panel.append(identity);}
+ const coverage=Array.isArray(sampling.coverage)?sampling.coverage:[];
+ const windows=Array.isArray(sampling.windows)?sampling.windows:[];
+ const success=windows.filter(item=>item.status==='success').length;
+ const processed=Number.isInteger(sampling.processed_windows)?sampling.processed_windows:windows.filter(item=>item.result!=null).length;
+ const incomplete=sampling.status!=='success'||success!==windows.length||coverage.some(item=>(item.uncovered_intervals||[]).length||(item.omitted_window_envelopes||[]).length);
+ const status={success:'模型窗口已运行',failed:'部分失败或未完成',not_run:'未运行'}[sampling.status]||'状态未知';
+ const reasonText=value=>({
+  video_action_weights_unavailable:'本地动作模型权重不可用',
+  video_action_runtime_unavailable:'本地动作模型运行环境不可用',
+  video_action_phase_budget_exhausted:'分析时间预算用尽',
+  video_action_window_byte_budget_exhausted:'单窗口内存预算用尽',
+  video_action_staging_byte_budget_exhausted:'本轮累计内存预算用尽',
+  video_action_disk_reserve_unavailable:'磁盘预留空间不足',
+  decoded_sample_gap_exceeds_limit:'相邻解码样本间隔过大',
+  fewer_than_16_decoded_samples:'解码样本不足 16 帧',
+  global_window_budget:'窗口数量达到上限',
+  no_scene_has_eligible_local_window:'没有形成可分析的局部窗口',
+  outside_successful_window_envelopes:'成功窗口包络之外',
+ }[value]||String(value||'原因未知'));
+ const summary=document.createElement('p');
+ summary.textContent=(incomplete?'局部覆盖；':'')+status+' · 成功 '+success+' / 选中 '+windows.length+' 窗口 · 已处理 '+processed+' 窗口 · 可选镜头 '+(sampling.eligible_scenes??0)+' 个'+(sampling.reason?' · 原因 '+reasonText(sampling.reason):'');
+ if(sampling.reason)summary.title=String(sampling.reason);
+ panel.append(summary);
+ const scope=document.createElement('p');scope.textContent='只观察实际解码的抽样帧；窗口时间包络不等于其间逐帧覆盖。结果仍未审核，也不能作为拿起、放下、打开、关闭或递交的动作事实。';panel.append(scope);
+ const details=document.createElement('details');details.open=wasOpen;
+ const disclosure=document.createElement('summary');disclosure.textContent='查看 '+coverage.length+' 个镜头的未覆盖区间与跳过原因';details.append(disclosure);
+ const scenes=document.createElement('ol');
+ const interval=value=>value?.start&&value?.end?'['+showTime(value.start)+', '+showTime(value.end)+') 秒':'区间未知';
+ for(const item of coverage){
+  const selected=windows.filter(window=>window.scene_index===item.scene_index);
+  const unresolved=selected.filter(window=>window.status!=='success');
+  const omitted=Array.isArray(item.omitted_window_envelopes)?item.omitted_window_envelopes:[];
+  const uncovered=Array.isArray(item.uncovered_intervals)?item.uncovered_intervals:[];
+  const line=document.createElement('li');
+  line.textContent='镜头 '+(Number(item.scene_index)+1)+' '+interval(item.scene_window)+'：已解码 '+item.decoded_samples+' 帧；成功 '+item.successful_windows+' / 选中 '+item.selected_windows+'，已处理 '+item.processed_windows+'。'
+   +(uncovered.length?' 窗口包络之外未覆盖：'+uncovered.map(part=>interval(part.window_pts)).join('、')+'。':' 窗口包络之外无未覆盖区间，包络内仍仅有抽样帧证据。')
+   +(omitted.length?' 未选/跳过：'+omitted.map(part=>interval(part.window_pts)+' '+reasonText(part.reason)).join('；')+'。':'')
+   +(unresolved.length?' 未成功窗口：'+unresolved.map(part=>interval(part.input?.window_pts)+' '+({failed:'失败',not_run:'未运行'}[part.status]||part.status)+' '+reasonText(part.reason)).join('；')+'。':'')
+   +(!item.selected_windows&&!omitted.length?' 未形成可选窗口。':'');
+  line.title=[...omitted,...unresolved].map(part=>part.reason).filter(Boolean).join('；');
+  scenes.append(line);
+ }
+ details.append(scenes);panel.append(details);
 }
 function renderVisionRetry(){const button=$('vision-retry');const retryable=Boolean(state.visionJob&&['failed','cancelled'].includes(state.visionJob.state)&&state.visionJob.error_code!=='VISION_RESUBMIT_REQUIRED');button.hidden=!retryable;button.disabled=Boolean(!retryable||state.busy||state.pending||state.loadingTask||state.dirty||visionInputIsStale());}
 function visionRetryKey(job){return 'traceannotate-vision-retry:'+state.snapshot.project_id+':'+job.id;}
@@ -990,6 +1055,7 @@ function clearVisionEvidence(){
  state.visionEvidenceReviewJob=null;state.visionEvidenceReviewResult=null;state.visionEvidenceReviewAnnotation=null;
  releaseVisionEvidenceFrame();state.visionEvidencePage=0;
  if(typeof document==='undefined')return;
+ $('vision-action-coverage-saved')?.remove?.();
  $('vision-evidence').hidden=true;$('vision-evidence-frame').replaceChildren();
  $('vision-evidence-status').textContent='';
  $('vision-hand-object-status').textContent='尚未加载几何证据。';
@@ -1075,9 +1141,10 @@ function renderVisionEvidence(){
  if(typeof document==='undefined')return;
  releaseVisionEvidenceFrame();
  const panel=$('vision-evidence'),result=state.visionEvidenceReviewResult||state.visionResult,job=state.visionEvidenceReviewJob||state.visionJob,media=state.media,task=state.task;
- if(!result||!job||!task||!media){panel.hidden=true;return;}
+ if(!result||!job||!task||!media){$('vision-action-coverage-saved')?.remove?.();panel.hidden=true;return;}
  panel.hidden=false;
  if(result.job_id!==job.id||result.task_id!==task.id||result.media_id!==media.id||result.input_sha256!==job.input_sha256||result.file_sha256!==media.playback?.sha256){
+  $('vision-action-coverage-saved')?.remove?.();
   state.visionHandObjectToken++;state.visionHandObject=null;state.visionHandObjectKey=null;
   $('vision-evidence-status').textContent='候选结果与当前任务或媒体身份不一致，已拒绝显示帧证据。';
   $('vision-hand-object-status').textContent='作业身份不一致，已拒绝显示几何证据。';
@@ -1085,6 +1152,7 @@ function renderVisionEvidence(){
   $('vision-evidence-frame').replaceChildren();return;
  }
  $('vision-evidence-scope').textContent='范围：'+(result.scope||'未声明')+'。模型框、手部点和动作结论均为未复核候选；此视图不证明准确率或人工签核。';
+ if(typeof renderActionVideoCoverage==='function')renderActionVideoCoverage(state.visionEvidenceReviewResult?result.action_video_sampling:null,{historicalJobId:job.id});
  $('vision-evidence-loss').textContent=visionEvidenceLossText(result,job.id);
  ensureHandObjectEvidence(job,result,task,media);
  const keyframes=Array.isArray(result.keyframes)?result.keyframes:[];
