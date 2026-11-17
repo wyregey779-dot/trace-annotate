@@ -84,6 +84,9 @@ browser-test = [
 [project.scripts]
 trace-annotate = "trace_annotate.cli:main"
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["trace_annotate*"]

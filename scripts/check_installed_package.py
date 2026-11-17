@@ -18,6 +18,7 @@ from importlib import metadata, resources
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import trace_annotate
+import trace_annotate.models as bundled_models
 
 source_root = Path(__import__("sys").argv[1]).resolve()
 installed_path = Path(trace_annotate.__file__).resolve()
@@ -27,7 +28,11 @@ site_roots = {Path(sysconfig.get_path(key)).resolve() for key in ("purelib", "pl
 assert any(root in installed_path.parents for root in site_roots), f"Not installed in site-packages: {installed_path}"
 assert metadata.version("trace-annotate") == trace_annotate.__version__
 package = resources.files("trace_annotate")
-yunet_license = package.joinpath("models", "YUNET-LICENSE.txt").read_bytes()
+assert bundled_models.__file__ is not None and Path(bundled_models.__file__).name == "__init__.py"
+models = resources.files(bundled_models)
+yunet_model = models.joinpath("face_detection_yunet_2023mar.onnx").read_bytes()
+assert __import__("hashlib").sha256(yunet_model).hexdigest() == "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+yunet_license = models.joinpath("YUNET-LICENSE.txt").read_bytes()
 assert __import__("hashlib").sha256(yunet_license).hexdigest() == "c83b8120c50ccbd4c4f96edf53141bdd566ebb8f8e9227e415326aa1b1aba958"
 distribution = metadata.distribution("trace-annotate")
 license_entries = [item for item in distribution.files or []

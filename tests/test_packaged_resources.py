@@ -1,6 +1,7 @@
 """Check runtime resource contents; CI also checks a separately installed wheel."""
 import hashlib
 import json
+from importlib import import_module
 from importlib import resources
 import xml.etree.ElementTree as ET
 
@@ -25,7 +26,9 @@ def test_runtime_resources_are_readable():
 
 
 def test_bundled_yunet_retains_its_complete_upstream_license():
-    package = resources.files("trace_annotate").joinpath("models")
+    models = import_module("trace_annotate.models")
+    assert models.__file__ is not None and models.__file__.endswith("__init__.py")
+    package = resources.files(models)
     model = package.joinpath("face_detection_yunet_2023mar.onnx").read_bytes()
     license_bytes = package.joinpath("YUNET-LICENSE.txt").read_bytes()
     assert hashlib.sha256(model).hexdigest() == "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
