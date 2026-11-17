@@ -41,6 +41,9 @@ def _completed_job(tmp_path):
                         expected_revision=task["revision"],
                         expected_sha256=task["content_sha256"])
     job_id = batch["jobs"][0]["id"]
+    queued_status = jobs.job_status(job_id)
+    assert queued_status["state"] == "queued"
+    assert queued_status["result_sha256"] is None
     jobs.run_pending()
     return store, jobs, task, job_id
 
@@ -59,6 +62,10 @@ def test_geometry_service_and_authenticated_http_are_read_only_and_hash_bound(tm
         assert derived["source"]["input_revision"] == original_task["revision"]
         assert derived["source"]["vision_result_sha256"] == S.sha256_text(result)
         assert derived["source"]["vision_result_sha256"] == jobs.queue.get_job(job_id)["commit"]["artifact"]["sha256"]
+        completed_status = jobs.job_status(job_id)
+        assert completed_status["state"] == "succeeded"
+        assert completed_status["has_candidate"] is True
+        assert completed_status["result_sha256"] == derived["source"]["vision_result_sha256"]
         assert derived["geometry"]["status"] == "not_run"
         assert derived["geometry"]["pairs"] == []
         assert derived["omission"]["sampled_module_coverage_complete"] is False
@@ -74,6 +81,11 @@ def test_geometry_service_and_authenticated_http_are_read_only_and_hash_bound(tm
                f"{job_id}/hand-object-geometry")
         headers = {"Host": f"127.0.0.1:{port}",
                    "Origin": f"http://127.0.0.1:{port}", TOKEN_HEADER: server.token}
+        status_url = (f"http://127.0.0.1:{port}/api/v1/projects/current/jobs/"
+                      f"{job_id}/vision-status")
+        with urllib.request.urlopen(urllib.request.Request(
+                status_url, headers=headers), timeout=30) as response:
+            assert json.loads(response.read())["result_sha256"] == completed_status["result_sha256"]
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
             assert response.status == 200
             assert response.headers["Cache-Control"] == "no-store"
@@ -87,6 +99,24 @@ def test_geometry_service_and_authenticated_http_are_read_only_and_hash_bound(tm
         assert store.get_task(original_task["id"]) == original_task
 
         descriptor = jobs.queue.get_job(job_id)["commit"]["artifact"]
+        commit_id = jobs.queue.get_job(job_id)["commit"]["id"]
+        with store.transaction():
+            original_commit = store.conn.execute(
+                "SELECT body FROM durable_commits WHERE id=?", (commit_id,)).fetchone()[0]
+            store.conn.execute("UPDATE durable_commits SET body=? WHERE id=?",
+                               ("{malformed-json", commit_id))
+        with pytest.raises(WorkspaceError) as malformed:
+            jobs.job_status(job_id)
+        assert malformed.value.code == "RECOVERY_REQUIRED"
+        with pytest.raises(urllib.error.HTTPError) as malformed_http:
+            urllib.request.urlopen(urllib.request.Request(status_url, headers=headers), timeout=30)
+        assert malformed_http.value.code == 500
+        assert json.loads(malformed_http.value.read())["error"]["code"] == "RECOVERY_REQUIRED"
+        with store.transaction():
+            store.conn.execute("UPDATE durable_commits SET body=? WHERE id=?",
+                               (original_commit, commit_id))
+        assert jobs.job_status(job_id)["result_sha256"] == descriptor["sha256"]
+
         path = store.root / descriptor["relative_path"]
         original_bytes = path.read_bytes()
         path.write_bytes(b"x" + original_bytes[1:])
@@ -97,6 +127,12 @@ def test_geometry_service_and_authenticated_http_are_read_only_and_hash_bound(tm
             urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30)
         assert rejected.value.code == 500
         assert json.loads(rejected.value.read())["error"]["code"] == "RECOVERY_REQUIRED"
+        with store.transaction():
+            store.conn.execute("UPDATE artifacts SET sha256=? WHERE id=?",
+                               ("b" * 64, descriptor["id"]))
+        with pytest.raises(WorkspaceError) as invalid_commit:
+            jobs.job_status(job_id)
+        assert invalid_commit.value.code == "RECOVERY_REQUIRED"
         assert store.get_task(original_task["id"]) == original_task
     finally:
         if server is not None:

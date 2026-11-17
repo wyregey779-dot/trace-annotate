@@ -34,6 +34,7 @@ const $=id=>document.getElementById(id);
 const state={{task:null,media:null,visionJob:null,visionResult:null,visionEvidencePage:0,visionEvidenceToken:0,visionEvidenceBlob:null}};
 const showTime=r=>String(Number(r.n)/Number(r.d));
 async function selectAnnotation(id){{state.selected=id;}}
+async function json(path){{throw new Error('No geometry fixture for '+path);}}
 const pixels=Uint8Array.from(atob('{encoded}'),char=>char.charCodeAt(0));
 async function verifiedFramePng(index){{
  const url=URL.createObjectURL(new Blob([pixels],{{type:'image/png'}}));

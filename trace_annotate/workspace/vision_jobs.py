@@ -4182,13 +4182,25 @@ class VisionJobs:
             if job["operation"] != OPERATION:
                 raise Conflict("UNSUPPORTED_PROCESSOR", "Job is not a vision job")
             attempt = (job.get("attempts") or [{}])[-1] if job.get("attempts") else {}
+            result_sha256 = None
+            if job["state"] == "succeeded":
+                if job.get("commit") is None:
+                    raise WorkspaceError("RECOVERY_REQUIRED",
+                                         "Successful vision job has no committed candidate")
+                try:
+                    result_sha256 = self._capture_result_snapshot(job_id)["artifact"]["sha256"]
+                except (OSError, ValueError, KeyError, TypeError, IndexError,
+                        RecursionError, sqlite3.DatabaseError, SchemaInvalid) as exc:
+                    raise WorkspaceError("RECOVERY_REQUIRED",
+                                         "Vision committed status is corrupt") from exc
             return {"job_id": job_id, "task_id": job["task_id"], "state": job["state"],
                     "attempt": job.get("attempt"), "processor_version": job["processor_version"],
                     "input_revision": job["input_revision"], "input_sha256": job["input_sha256"],
                     "job_identity": job["parameters"].get("job_identity"),
                     "cancel_requested": job["state"] == "cancel_requested",
                     "error_code": job.get("error_code") or attempt.get("error_code"),
-                    "has_candidate": job.get("commit") is not None}
+                    "has_candidate": job.get("commit") is not None,
+                    "result_sha256": result_sha256}
 
     def result(self, job_id: str) -> Dict[str, Any]:
         S.require_id(job_id)

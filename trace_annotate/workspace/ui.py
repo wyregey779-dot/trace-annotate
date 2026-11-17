@@ -79,6 +79,11 @@ dialog:modal{overscroll-behavior:contain}dialog::backdrop{overflow:hidden;oversc
 .vision-evidence-notes{margin:7px 0 0;padding-left:18px;max-height:170px;overflow:auto;font-size:11px;line-height:1.55}
 .vision-evidence-notes li{overflow-wrap:anywhere}
 .vision-evidence-hash{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}
+.vision-hand-object{margin-top:12px;padding:10px;border:1px solid #355064;border-radius:7px;background:#101f2c}
+.vision-hand-object h5{margin:0;font-size:12px}
+.vision-hand-object .vision-evidence-notes{max-height:160px;font-size:12px;line-height:1.65}
+.vision-hand-object .vision-evidence-notes li{margin-bottom:6px}
+.geometry-identity{display:block;color:var(--muted);font-size:10px;word-break:break-all}
 .vision-window-form{padding:0 15px 12px;border-bottom:1px solid var(--line)}
 .vision-window-fields legend{font-size:12px;font-weight:600;margin-bottom:8px}
 .vision-window-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
@@ -156,7 +161,7 @@ dialog:modal{overscroll-behavior:contain}dialog::backdrop{overflow:hidden;oversc
    </section>
   </div>
   <section class="panel segment-panel" aria-labelledby="segments-title"><div class="panel-head"><h3 id="segments-title">已保存片段</h3><span class="muted" id="revision-label"></span></div><div class="table-wrap"><table id="segments"><thead><tr><th scope="col">标签 / 选择</th><th scope="col">时间区间</th><th scope="col">内容</th><th scope="col">轨道</th><th scope="col">审核</th></tr></thead><tbody></tbody></table><p id="no-segments" class="empty-small">尚无片段。播放视频后，填写起止时间并保存。</p></div></section>
-  <section class="panel" id="vision-panel" aria-labelledby="vision-title"><div class="panel-head"><h3 id="vision-title">视觉辅助候选</h3><span class="muted" id="vision-options">正在读取能力…</span></div><p class="empty-small">只在已准入的播放媒体上运行；候选默认未审核，必须由你逐条核对后才算人工结论。模型推断不会写成事实。</p><form id="vision-window-form" class="vision-window-form" method="post" action="" novalidate><fieldset class="vision-window-fields" aria-describedby="vision-window-help"><legend>本次分析区间</legend><div class="vision-window-grid"><label for="vision-window-start">起点（秒）<input id="vision-window-start" name="start" type="text" inputmode="decimal" required aria-invalid="false" aria-describedby="vision-window-help" placeholder="0"></label><label for="vision-window-end">终点（秒，不包含）<input id="vision-window-end" name="end" type="text" inputmode="decimal" required aria-invalid="false" aria-describedby="vision-window-help" placeholder="30"></label></div><p id="vision-window-help" class="vision-window-help">每次最多分析 120 秒；长片请分段提交。输入十进制秒或分数，例如 1.25 或 5/4。这里只生成稀疏候选，不代表逐帧识别。</p><p id="vision-window-error" class="vision-window-error" role="alert" hidden></p></fieldset><div class="form-actions"><button id="vision-run" class="primary" type="submit" disabled>分析选定区间</button><button id="vision-refresh" type="button" class="quiet">刷新状态</button><button id="vision-apply" type="button" disabled hidden>应用为候选片段</button><button id="vision-cancel" type="button" class="danger" disabled hidden>取消任务</button><button id="vision-retry" type="button" disabled hidden>重试任务</button></div></form><div id="vision-coverage" class="vision-coverage" role="status" aria-live="polite"></div><div id="vision-job" class="empty-small" hidden></div><section id="vision-evidence" class="vision-evidence" aria-labelledby="vision-evidence-title" hidden><h4 id="vision-evidence-title">逐帧证据检查（只读）</h4><p id="vision-evidence-scope"></p><p id="vision-evidence-loss"></p><div class="vision-evidence-controls"><button id="vision-evidence-prev" type="button" class="quiet" aria-label="上一组视觉采样帧">上一组</button><label for="vision-evidence-frame">采样帧</label><select id="vision-evidence-frame"></select><button id="vision-evidence-next" type="button" class="quiet" aria-label="下一组视觉采样帧">下一组</button><span id="vision-evidence-page" class="muted"></span></div><p id="vision-evidence-status" role="status" aria-live="polite"></p><div class="vision-evidence-stage"><img id="vision-evidence-image" alt="" hidden><svg id="vision-evidence-overlay" aria-hidden="true" hidden></svg></div><p id="vision-evidence-identity" class="vision-evidence-hash"></p><ol id="vision-evidence-notes" class="vision-evidence-notes"></ol></section><div class="candidate-review-fields"><label for="vision-actor-type">实际操作主体</label><select id="vision-actor-type"><option value="">请选择</option><option value="human">本人（仅自声明）</option><option value="assistant">助手</option><option value="tool">其他工具</option></select><label for="vision-actor-id">主体标识</label><input id="vision-actor-id" type="text" required maxlength="96" pattern="[A-Za-z][A-Za-z0-9_-]{0,95}" placeholder="如 reviewer-1 或 assistant-1"><label for="vision-diff-summary">修改摘要（仅采纳编辑时填写）</label><textarea id="vision-diff-summary" rows="2" maxlength="500" placeholder="说明哪些字段因逐帧核对而修改"></textarea><p class="muted">身份由操作者自声明，并非身份认证；助手或工具的决定仍是未审核，不会记为人工签核。拒绝会移除活动候选，但保留来源与证据记录。</p></div><div class="table-wrap"><table id="vision-candidates" hidden><thead><tr><th scope="col">候选</th><th scope="col">时间区间</th><th scope="col">来源</th><th scope="col">审核</th><th scope="col">操作</th></tr></thead><tbody></tbody></table></div></section>
+  <section class="panel" id="vision-panel" aria-labelledby="vision-title"><div class="panel-head"><h3 id="vision-title">视觉辅助候选</h3><span class="muted" id="vision-options">正在读取能力…</span></div><p class="empty-small">只在已准入的播放媒体上运行；候选默认未审核，必须由你逐条核对后才算人工结论。模型推断不会写成事实。</p><form id="vision-window-form" class="vision-window-form" method="post" action="" novalidate><fieldset class="vision-window-fields" aria-describedby="vision-window-help"><legend>本次分析区间</legend><div class="vision-window-grid"><label for="vision-window-start">起点（秒）<input id="vision-window-start" name="start" type="text" inputmode="decimal" required aria-invalid="false" aria-describedby="vision-window-help" placeholder="0"></label><label for="vision-window-end">终点（秒，不包含）<input id="vision-window-end" name="end" type="text" inputmode="decimal" required aria-invalid="false" aria-describedby="vision-window-help" placeholder="30"></label></div><p id="vision-window-help" class="vision-window-help">每次最多分析 120 秒；长片请分段提交。输入十进制秒或分数，例如 1.25 或 5/4。这里只生成稀疏候选，不代表逐帧识别。</p><p id="vision-window-error" class="vision-window-error" role="alert" hidden></p></fieldset><div class="form-actions"><button id="vision-run" class="primary" type="submit" disabled>分析选定区间</button><button id="vision-refresh" type="button" class="quiet">刷新状态</button><button id="vision-apply" type="button" disabled hidden>应用为候选片段</button><button id="vision-cancel" type="button" class="danger" disabled hidden>取消任务</button><button id="vision-retry" type="button" disabled hidden>重试任务</button></div></form><div id="vision-coverage" class="vision-coverage" role="status" aria-live="polite"></div><div id="vision-job" class="empty-small" hidden></div><section id="vision-evidence" class="vision-evidence" aria-labelledby="vision-evidence-title" hidden><h4 id="vision-evidence-title">逐帧证据检查（只读）</h4><p id="vision-evidence-scope"></p><p id="vision-evidence-loss"></p><div class="vision-evidence-controls"><button id="vision-evidence-prev" type="button" class="quiet" aria-label="上一组视觉采样帧">上一组</button><label for="vision-evidence-frame">采样帧</label><select id="vision-evidence-frame"></select><button id="vision-evidence-next" type="button" class="quiet" aria-label="下一组视觉采样帧">下一组</button><span id="vision-evidence-page" class="muted"></span></div><p id="vision-evidence-status" role="status" aria-live="polite"></p><div class="vision-evidence-stage"><img id="vision-evidence-image" alt="" hidden><svg id="vision-evidence-overlay" aria-hidden="true" hidden></svg></div><p id="vision-evidence-identity" class="vision-evidence-hash"></p><ol id="vision-evidence-notes" class="vision-evidence-notes"></ol><div id="vision-hand-object" class="vision-hand-object" role="group" aria-labelledby="vision-hand-object-title"><h5 id="vision-hand-object-title">同帧手与物体几何（只读）</h5><p id="vision-hand-object-status" role="status" aria-live="polite">尚未加载几何证据。</p><p id="vision-hand-object-coverage"></p><ol id="vision-hand-object-pairs" class="vision-evidence-notes"></ol></div></section><div class="candidate-review-fields"><label for="vision-actor-type">实际操作主体</label><select id="vision-actor-type"><option value="">请选择</option><option value="human">本人（仅自声明）</option><option value="assistant">助手</option><option value="tool">其他工具</option></select><label for="vision-actor-id">主体标识</label><input id="vision-actor-id" type="text" required maxlength="96" pattern="[A-Za-z][A-Za-z0-9_-]{0,95}" placeholder="如 reviewer-1 或 assistant-1"><label for="vision-diff-summary">修改摘要（仅采纳编辑时填写）</label><textarea id="vision-diff-summary" rows="2" maxlength="500" placeholder="说明哪些字段因逐帧核对而修改"></textarea><p class="muted">身份由操作者自声明，并非身份认证；助手或工具的决定仍是未审核，不会记为人工签核。拒绝会移除活动候选，但保留来源与证据记录。</p></div><div class="table-wrap"><table id="vision-candidates" hidden><thead><tr><th scope="col">候选</th><th scope="col">时间区间</th><th scope="col">来源</th><th scope="col">审核</th><th scope="col">操作</th></tr></thead><tbody></tbody></table></div></section>
   <p class="footer-note"><span class="connected"></span>本机持久化 · 稀疏片段标注 · 导出为开发版工作区快照，不含媒体文件，也不是可直接导入的便携项目包。</p>
  </section>
 </main>
@@ -175,7 +180,7 @@ function showTime(r){const n=BigInt(r.n),d=BigInt(r.d);let q=d;while(q%2n===0n)q
 function compareTime(a,b){const x=BigInt(a.n)*BigInt(b.d)-BigInt(b.n)*BigInt(a.d);return x<0n?-1:x>0n?1:0;}
 function seconds(r){return Number(r.n)/Number(r.d);}
 function clone(v){return JSON.parse(JSON.stringify(v));}
-const state={snapshot:null,intakes:[],task:null,media:null,selected:null,original:null,dirty:false,busy:false,loadingTask:false,playGeneration:0,playIntent:false,playWaiting:false,playError:null,segmentPlayback:null,segmentStartClock:null,playRAF:null,pending:null,conflict:false,sequence:0,frameSequence:0,frame:null,frameBlob:null,loadingFrame:false,importing:false,stopImport:false,maxUpload:512*1024*1024,uploadRows:[],anchors:{},formBase:null,anchorBase:null,intakeCommands:[],intakePoll:null,batch:null,batchRunId:null,batchController:null,statusUnavailable:false,visionScene:false,visionJob:null,visionResult:null,visionTimer:null,visionGeneration:0,visionAbort:null,visionEvidencePage:0,visionEvidenceToken:0,visionEvidenceLoadToken:0,visionEvidenceBlob:null,visionEvidenceReviewJob:null,visionEvidenceReviewResult:null,visionEvidenceReviewAnnotation:null,visionCandidateDigests:{},compareToken:0,compareBlobs:[]};
+const state={snapshot:null,intakes:[],task:null,media:null,selected:null,original:null,dirty:false,busy:false,loadingTask:false,playGeneration:0,playIntent:false,playWaiting:false,playError:null,segmentPlayback:null,segmentStartClock:null,playRAF:null,pending:null,conflict:false,sequence:0,frameSequence:0,frame:null,frameBlob:null,loadingFrame:false,importing:false,stopImport:false,maxUpload:512*1024*1024,uploadRows:[],anchors:{},formBase:null,anchorBase:null,intakeCommands:[],intakePoll:null,batch:null,batchRunId:null,batchController:null,statusUnavailable:false,visionScene:false,visionJob:null,visionResult:null,visionTimer:null,visionGeneration:0,visionAbort:null,visionEvidencePage:0,visionEvidenceToken:0,visionEvidenceLoadToken:0,visionEvidenceBlob:null,visionEvidenceDisplayedFrame:null,visionHandObject:null,visionHandObjectKey:null,visionHandObjectToken:0,visionEvidenceReviewJob:null,visionEvidenceReviewResult:null,visionEvidenceReviewAnnotation:null,visionCandidateDigests:{},compareToken:0,compareBlobs:[]};
 // Read-only observability for the browser control script: the exact command id
 // a button click used, so a terminal-state replay can be checked against the
 // persisted receipt instead of guessing an id.
@@ -966,22 +971,29 @@ async function importFiles(){const files=Array.from($('file-input').files||[]);$
 const VISION_EVIDENCE_PAGE_SIZE=12;
 const VISION_EVIDENCE_OBJECT_LIMIT=24;
 const VISION_EVIDENCE_HAND_LIMIT=4;
+const VISION_HAND_OBJECT_LIMIT=8;
 const VISION_SVG_NS='http://www.w3.org/2000/svg';
 function releaseVisionEvidenceFrame(){
  state.visionEvidenceToken=(state.visionEvidenceToken||0)+1;
+ state.visionEvidenceDisplayedFrame=null;
  if(state.visionEvidenceBlob){URL.revokeObjectURL(state.visionEvidenceBlob);state.visionEvidenceBlob=null;}
  if(typeof document==='undefined')return;
  const image=$('vision-evidence-image'),overlay=$('vision-evidence-overlay');
  image.removeAttribute('src');image.hidden=true;overlay.replaceChildren();overlay.hidden=true;
  $('vision-evidence-identity').textContent='';$('vision-evidence-notes').replaceChildren();
+ $('vision-hand-object-pairs').replaceChildren();
 }
 function clearVisionEvidence(){
  state.visionEvidenceLoadToken=(state.visionEvidenceLoadToken||0)+1;
+ state.visionHandObjectToken=(state.visionHandObjectToken||0)+1;
+ state.visionHandObject=null;state.visionHandObjectKey=null;
  state.visionEvidenceReviewJob=null;state.visionEvidenceReviewResult=null;state.visionEvidenceReviewAnnotation=null;
  releaseVisionEvidenceFrame();state.visionEvidencePage=0;
  if(typeof document==='undefined')return;
  $('vision-evidence').hidden=true;$('vision-evidence-frame').replaceChildren();
  $('vision-evidence-status').textContent='';
+ $('vision-hand-object-status').textContent='尚未加载几何证据。';
+ $('vision-hand-object-coverage').textContent='';
 }
 function visionProjectionManifest(jobId){
  for(const annotation of state.task?.annotations||[]){
@@ -1006,6 +1018,59 @@ function visionEvidenceLossText(result,jobId){
  }else parts.push('尚无当前作业的专业 JSON 投影清单；本页展示原始候选的有界视图，不代表导出无损。');
  return parts.join(' ');
 }
+function renderHandObjectEvidence(){
+ const status=$('vision-hand-object-status'),list=$('vision-hand-object-pairs'),payload=state.visionHandObject;
+ list.replaceChildren();
+ if(!payload)return;
+ const geometry=payload.geometry,frame=state.visionEvidenceDisplayedFrame;
+ if(geometry.status==='not_run'){
+  status.textContent='未运行同帧几何：'+geometry.reason+'。不能据此判断没有手、物体或动作。';return;
+ }
+ if(!frame){status.textContent='几何结果已核验；正在核对所选帧图像和 PTS。';return;}
+ const matches=geometry.pairs.filter(pair=>pair.frame_index===frame.frame_index);
+ if(matches.some(pair=>pair.scene_index!==frame.scene_index||pair.pts?.n!==frame.timestamp?.n||pair.pts?.d!==frame.timestamp?.d||pair.evidence_sha256!==frame.evidence_sha256)){
+  status.textContent='本帧几何出处与采样帧身份不一致，已拒绝展示。';return;
+ }
+ const bounded=geometry.coverage?.truncated||Number(geometry.coverage?.omitted_pairs)>0;
+ status.textContent=matches.length?'本帧有 '+matches.length+' 条未复核像素配对；距离与重叠不证明触碰、持有或动作。':bounded?'本帧在有界结果中未列出配对；可能有被上限省略的观测，不能推断画面没有手或物体。':'本帧未列出同帧配对；可能是模型未检出、模块未运行或采样不足，不能推断画面没有手或物体。';
+ for(const pair of matches.slice(0,VISION_HAND_OBJECT_LIMIT)){
+  const item=document.createElement('li');
+  const metrics=document.createElement('strong');metrics.textContent='最近手关键点到物体框 '+pair.landmark_to_object_box_pixels+' px · 框间距 '+pair.hand_box_to_object_box_pixels+' px · 框 IoU '+pair.box_iou+' · 未审核';
+  const identity=document.createElement('small');identity.className='geometry-identity';identity.textContent='配对 '+pair.id+' · 手 '+pair.hand_observation_id+' · 物 '+pair.object_observation_id;
+  item.append(metrics,identity);
+  list.append(item);
+ }
+ if(matches.length>VISION_HAND_OBJECT_LIMIT){const item=document.createElement('li');item.textContent='本帧另有 '+(matches.length-VISION_HAND_OBJECT_LIMIT)+' 条配对未在界面列出；原始只读结果保留在作业接口。';list.append(item);}
+}
+function ensureHandObjectEvidence(job,result,task,media){
+ const status=$('vision-hand-object-status'),coverage=$('vision-hand-object-coverage');
+ const hash=job.result_sha256;
+ if(typeof hash!=='string'||!/^[0-9a-f]{64}$/.test(hash)){
+  state.visionHandObjectToken++;state.visionHandObjectKey=null;state.visionHandObject=null;
+  $('vision-hand-object-pairs').replaceChildren();
+  status.textContent='作业未提供可核验的结果哈希，已暂停显示同帧几何。';coverage.textContent='';return;
+ }
+ const key=job.id+'|'+hash;
+ if(state.visionHandObjectKey===key){renderHandObjectEvidence();return;}
+ state.visionHandObjectKey=key;state.visionHandObject=null;
+ const nonce=++state.visionHandObjectToken;
+ status.textContent='正在读取并核对同帧几何出处…';coverage.textContent='';$('vision-hand-object-pairs').replaceChildren();
+ const current=()=>nonce===state.visionHandObjectToken&&state.visionHandObjectKey===key&&state.task?.id===task.id&&state.media?.id===media.id&&(state.visionEvidenceReviewJob||state.visionJob)?.id===job.id&&(state.visionEvidenceReviewResult||state.visionResult)===result;
+ const signal=typeof AbortSignal.timeout==='function'?AbortSignal.timeout(15000):undefined;
+ json('/jobs/'+encodeURIComponent(job.id)+'/hand-object-geometry',{signal}).then(payload=>{
+  if(!current())return;
+  const source=payload?.source,geometry=payload?.geometry;
+  if(payload.kind!=='traceannotate.hand-object-geometry'||payload.version!==1||source?.job_id!==job.id||source.task_id!==task.id||source.input_revision!==result.input_revision||source.playback_sha256!==media.playback?.sha256||source.vision_result_sha256!==hash||!geometry||!['success','not_run'].includes(geometry.status)||!Array.isArray(geometry.pairs)||geometry.pairs.length>1024||(geometry.status==='not_run'&&geometry.pairs.length))throw new Error('几何结果与持久作业、任务或媒体身份不一致');
+  state.visionHandObject=payload;
+  const counts=geometry.coverage||{};
+  const omissions=['配对省略 '+(counts.omitted_pairs??0)+' 条','物体检测已知遗漏 '+(counts.object_detection_omissions??0)+' 条'];
+  if((counts.object_detection_omissions_unknown_keyframes??0)>0)omissions.push('另有 '+counts.object_detection_omissions_unknown_keyframes+' 帧遗漏数量未知');
+  if((counts.object_truncated_keyframes??0)>0)omissions.push('物体结果截断 '+counts.object_truncated_keyframes+' 帧');
+  if(counts.truncated)omissions.push('配对结果已截断');
+  coverage.textContent='仅覆盖已准入的 '+(counts.total_keyframes??0)+' 个采样帧：手部模块成功 '+(counts.hand_successful_keyframes??0)+' 帧、物体模块成功 '+(counts.object_successful_keyframes??0)+' 帧；配对 '+geometry.pairs.length+' 条；'+omissions.join('、')+'；'+(counts.sampled_module_coverage_complete?'采样帧模块输出齐全':'部分采样模块输出不完整')+'。这不是全视频覆盖或动作识别。';
+  renderHandObjectEvidence();
+ }).catch(error=>{if(current()){state.visionHandObject=null;state.visionHandObjectKey=null;status.textContent='几何证据不可用：'+String(error.message||error)+'；可重新打开候选重试。';coverage.textContent='';$('vision-hand-object-pairs').replaceChildren();}});
+}
 function renderVisionEvidence(){
  if(typeof document==='undefined')return;
  releaseVisionEvidenceFrame();
@@ -1013,11 +1078,15 @@ function renderVisionEvidence(){
  if(!result||!job||!task||!media){panel.hidden=true;return;}
  panel.hidden=false;
  if(result.job_id!==job.id||result.task_id!==task.id||result.media_id!==media.id||result.input_sha256!==job.input_sha256||result.file_sha256!==media.playback?.sha256){
+  state.visionHandObjectToken++;state.visionHandObject=null;state.visionHandObjectKey=null;
   $('vision-evidence-status').textContent='候选结果与当前任务或媒体身份不一致，已拒绝显示帧证据。';
+  $('vision-hand-object-status').textContent='作业身份不一致，已拒绝显示几何证据。';
+  $('vision-hand-object-coverage').textContent='';
   $('vision-evidence-frame').replaceChildren();return;
  }
  $('vision-evidence-scope').textContent='范围：'+(result.scope||'未声明')+'。模型框、手部点和动作结论均为未复核候选；此视图不证明准确率或人工签核。';
  $('vision-evidence-loss').textContent=visionEvidenceLossText(result,job.id);
+ ensureHandObjectEvidence(job,result,task,media);
  const keyframes=Array.isArray(result.keyframes)?result.keyframes:[];
  const pages=Math.ceil(keyframes.length/VISION_EVIDENCE_PAGE_SIZE);
  state.visionEvidencePage=Math.max(0,Math.min(state.visionEvidencePage||0,Math.max(0,pages-1)));
@@ -1126,6 +1195,7 @@ async function loadVisionEvidenceFrame(){
   for(const hand of hands.slice(0,VISION_EVIDENCE_HAND_LIMIT))visionEvidenceNote('未复核手部点：'+(hand.handedness_raw||'方向未知')+' · '+(hand.landmarks_pixel?.length||0)+' 个点；左右手镜像假设未核实。');
   if(hands.length>VISION_EVIDENCE_HAND_LIMIT)visionEvidenceNote('本帧另有 '+(hands.length-VISION_EVIDENCE_HAND_LIMIT)+' 只手未在界面列出或叠加。');
   visionEvidenceOverlay(frame,probe.naturalWidth,probe.naturalHeight);
+  state.visionEvidenceDisplayedFrame=frame;renderHandObjectEvidence();
  }catch(error){
   if(nonce===state.visionEvidenceToken){releaseVisionEvidenceFrame();$('vision-evidence-status').textContent='帧证据核对失败，未显示画面或叠加：'+String(error.message||error);}
  }finally{if(preview?.url)URL.revokeObjectURL(preview.url);}

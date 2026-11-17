@@ -109,6 +109,10 @@ The query does not change the task or its review decisions. Its source hash
 identifies the complete vision result used for the calculation. Missing hand
 or object providers return `not_run`; a valid sampled result with no comparable
 pairs returns an empty `success` result. Coverage is limited to sampled frames.
+The workspace frame evidence panel loads these measurements only after the
+completed job reports a committed result hash. It checks job, task, revision,
+playback, result and selected-frame identities before displaying a pair. Values
+remain labeled as unreviewed geometry, including when boxes overlap.
 The result retains at most three nearest object boxes per hand and 1,024 pairs
 overall, with omitted counts and explicit markers for unavailable or truncated
 provider output. This derived view is not stored in the candidate or included
