@@ -381,6 +381,7 @@ function renderActionVideoCoverage(sampling,{historicalJobId=null}={}){
   decoded_sample_gap_exceeds_limit:'相邻解码样本间隔过大',
   fewer_than_16_decoded_samples:'解码样本不足 16 帧',
   global_window_budget:'窗口数量达到上限',
+  global_candidate_budget:'候选分析数量达到上限',
   no_scene_has_eligible_local_window:'没有形成可分析的局部窗口',
   fewer_than_16_admitted_frames:'局部区间不足 16 个准入帧',
   local_frame_gap_exceeds_limit:'局部帧间隔超过上限',

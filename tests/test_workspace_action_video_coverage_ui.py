@@ -79,10 +79,16 @@ const showTime=value=>String(Number(value.n)/Number(value.d));
                       reason="video_action_weights_unavailable", processed_windows=0,
                       windows=[], decode={"status": "not_run", "reason": "video_action_weights_unavailable",
                                           "planned_indices": [], "samples": []})
+            v3["coverage"] = [mixed["coverage"][0],
+                              dict(mixed["coverage"][1], omitted_window_envelopes=[{
+                                  "window_pts": {"start": {"n": "4", "d": "1"},
+                                                 "end": {"n": "5", "d": "1"}},
+                                  "reason": "global_candidate_budget"}])]
             page.evaluate("sampling=>{fixture.state.visionResult.action_video_sampling=sampling;fixture.renderVisionCoverage()}", v3)
             v3_text = page.locator("#vision-action-coverage").inner_text()
             assert "精确取帧未运行 · 实得 0 / 计划 0 帧" in v3_text
             assert "本地动作模型权重不可用" in v3_text
+            assert "候选分析数量达到上限" in v3_text
             assert "仍未审核" in v3_text
             assert page.locator("#vision-action-coverage img").count() == 0
             evidence_dir = os.getenv("TRACE_ANNOTATE_UI_EVIDENCE_DIR")
