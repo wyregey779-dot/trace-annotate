@@ -45,6 +45,7 @@ LOGS_DIR = "logs"
 PUBLICATION_JOURNAL_DIR = "artifact-publications"
 MAX_PUBLICATION_JOURNALS = 4096
 MAX_PUBLICATION_JOURNAL_BYTES = 1024
+MAX_SCOPED_CLEANUP_IDS = 1024
 
 DEFAULT_TEMPLATE = {
     "id": "generic-segment",
@@ -671,7 +672,7 @@ class WorkspaceStore:
             return
         self.conn.execute("INSERT INTO templates VALUES(?,?,?)", (body["id"], body["version"], encoded))
 
-    def _publish_stream(self, stream):
+    def _publish_stream(self, stream, *, on_new=None):
         _safe(self.tmp_dir)
         _safe(self.objects_dir)
         handle, name = tempfile.mkstemp(dir=self.tmp_dir, suffix=".part")
@@ -735,6 +736,10 @@ class WorkspaceStore:
                     raise
                 if not outer_transaction:
                     self._discard_unregistered_publications([record])
+            # Existing registrations return above. Report only the winning
+            # publisher, outside the store mutex and before leaving its scope.
+            if on_new is not None:
+                on_new(ident)
             return descriptor
         finally:
             temporary.unlink(missing_ok=True)
@@ -1064,7 +1069,7 @@ class WorkspaceStore:
         measured = self.unbound_artifacts()
         if artifact_ids is not None:
             if (not isinstance(artifact_ids, (list, tuple, set))
-                    or len(artifact_ids) > 1024):
+                    or len(artifact_ids) > MAX_SCOPED_CLEANUP_IDS):
                 raise SchemaInvalid("SCHEMA_INVALID", "Scoped cleanup IDs must be a bounded collection")
             requested = {S.require_id(item, "artifact_id") for item in artifact_ids}
             selected = [item for item in measured["artifacts"] if item["id"] in requested]

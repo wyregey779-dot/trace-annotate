@@ -76,7 +76,7 @@ from .errors import Conflict, SchemaInvalid, WorkspaceError, revision_conflict
 from .http_media import resolve_media_object
 from .queue import DurableQueue, MAX_RESULT_BYTES
 from .slots import SlotClosed, SlotTimeout, get_prepare_slot
-from .store import _safe
+from .store import MAX_SCOPED_CLEANUP_IDS, _safe
 
 OPERATION = "vision-media"
 VERSION = "1.1"
@@ -4832,6 +4832,23 @@ class VisionJobs:
                 self._active_jobs.discard(job["id"])
                 self._condition.notify_all()
 
+    def _sweep_finished_evidence(self) -> None:
+        with self._condition:
+            pending = list(self._v3_published_ids)
+            self._v3_published_ids.clear()
+        for start in range(0, len(pending), MAX_SCOPED_CLEANUP_IDS):
+            try:
+                self.store.sweep_unbound_artifacts(
+                    apply=True, artifact_ids=pending[start:start + MAX_SCOPED_CLEANUP_IDS])
+            except BaseException as exc:
+                # Another publisher or queue processor may still own a file.
+                # Return the unfinished portion to the next task or idle poll.
+                with self._condition:
+                    self._v3_published_ids.update(pending[start:])
+                if isinstance(exc, Conflict) and exc.code == "GC_ACTIVE_WORK":
+                    return
+                raise
+
     def run_pending(self, *, batch_id: Optional[str] = None, worker_id: str = "vision-local") -> List[Dict[str, Any]]:
         with self._condition:
             if self.is_closing():
@@ -4841,6 +4858,7 @@ class VisionJobs:
         results = []
         slot = get_prepare_slot(self.store.root)
         try:
+            self._sweep_finished_evidence()  # also retries deferred cleanup on idle polls
             for ident in self._batches(batch_id):
                 while not self.is_closing():
                     try:
@@ -4851,6 +4869,8 @@ class VisionJobs:
                                 self._processor, batch_id=ident, worker_id=worker_id,
                                 precommit=lambda candidate: _bind_v3_decode_evidence(
                                     self.store, candidate))
+                            if result is not None:
+                                self._sweep_finished_evidence()
                     except (SlotClosed, SlotTimeout):
                         return results
                     if result is None:
@@ -4860,19 +4880,7 @@ class VisionJobs:
         finally:
             with self._condition:
                 self._runners.discard(token)
-                cleanup_ids = (list(self._v3_published_ids)
-                               if not self._runners else [])
                 self._condition.notify_all()
-            if cleanup_ids:
-                try:
-                    self.store.sweep_unbound_artifacts(
-                        apply=True, artifact_ids=cleanup_ids)
-                except Conflict as exc:
-                    if exc.code != "GC_ACTIVE_WORK":
-                        raise
-                else:
-                    with self._condition:
-                        self._v3_published_ids.difference_update(cleanup_ids)
 
     def start(self) -> "VisionJobs":
         with self._condition:
@@ -6171,13 +6179,8 @@ def _publish_v3_decode_evidence(store, candidate: Dict[str, Any], *, cancelled,
                 raise WorkspaceError("CANCELLED", "Local action evidence publication was cancelled")
             _read_stable_evidence_bytes(store, descriptor)
             source = store.root / descriptor["relative_path"]
-            with store._mutex:
-                existed = store.conn.execute(
-                    "SELECT 1 FROM artifacts WHERE id=?",
-                    (S.make_id("art", descriptor["sha256"]),)).fetchone() is not None
-            artifact = store._put_file(source)
-            if not existed and registered is not None:
-                registered(artifact["id"])
+            with source.open("rb") as stream:
+                artifact = store._publish_stream(stream, on_new=registered)
             if (artifact["sha256"] != descriptor["sha256"]
                     or artifact["size_bytes"] != descriptor["size_bytes"]):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Local action evidence changed during publication")

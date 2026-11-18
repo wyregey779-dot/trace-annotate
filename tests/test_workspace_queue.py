@@ -6,6 +6,7 @@ synthetic; these tests establish persistence and race semantics only.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import json
 from pathlib import Path
 import shutil
@@ -18,6 +19,7 @@ import pytest
 from trace_annotate.workspace.errors import WorkspaceError
 from trace_annotate.workspace.queue import DurableQueue, read_queue_snapshot
 from trace_annotate.workspace.store import WorkspaceStore
+from trace_annotate.workspace.vision_jobs import OPERATION as VISION_OPERATION, VisionJobs
 
 
 @pytest.fixture(scope="module")
@@ -67,6 +69,60 @@ def code(expected, call):
     with pytest.raises(WorkspaceError) as error:
         call()
     assert error.value.code == expected
+
+
+def test_vision_reclaims_failed_evidence_before_next_claim(store, monkeypatch):
+    vision = VisionJobs(store)
+    existing = store._put_artifact(b"preexisting unowned evidence")
+    registered = []
+    observations = []
+
+    def processor(job, _context):
+        if not registered:
+            def remember(ident):
+                registered.append(ident)
+                vision._v3_published_ids.add(ident)
+
+            for payload in (b"preexisting unowned evidence", b"failed attempt"):
+                store._publish_stream(BytesIO(payload), on_new=remember)
+            raise WorkspaceError("TEST_FAILURE", "After registration, before commit")
+        observations.append({a["id"] for a in store.unbound_artifacts()["artifacts"]})
+        return {"job_id": job["id"]}
+
+    monkeypatch.setattr(vision, "_processor", processor)
+    try:
+        for sequence in range(2):
+            vision.queue.create_batch([item(store)], operation=VISION_OPERATION,
+                                      processor_version="test", parameters={"seq": sequence})
+        results = vision.run_pending()
+        assert [result["state"] for result in results] == ["failed", "succeeded"]
+        assert len(registered) == 1
+        assert observations == [{existing["id"]}]
+    finally:
+        vision.close()
+
+
+def test_idle_vision_drain_retries_large_backlog_after_other_publication(store):
+    vision = VisionJobs(store)
+    owned = store._put_artifact(b"committed elsewhere")
+    store.bind_artifact_reference(owned, owner_kind="evidence", owner_id="job-other",
+                                  role="sample")
+    discarded = store._put_artifact(b"obsolete attempt")
+    untouched = store._put_artifact(b"unrelated unowned artifact")
+    pending = {f"art-{n:064x}" for n in range(1024)} | {owned["id"], discarded["id"]}
+    vision._v3_published_ids.update(pending)
+    try:
+        with store._evidence_publication_scope():
+            assert vision.run_pending() == []
+            assert vision._v3_published_ids == pending
+            assert (store.root / discarded["relative_path"]).is_file()
+        assert vision.run_pending() == []
+        assert not vision._v3_published_ids
+        assert not (store.root / discarded["relative_path"]).exists()
+        assert (store.root / owned["relative_path"]).read_bytes() == b"committed elsewhere"
+        assert (store.root / untouched["relative_path"]).read_bytes() == b"unrelated unowned artifact"
+    finally:
+        vision.close()
 
 
 def test_enqueue_freezes_input_deduplicates_and_records_command(store):

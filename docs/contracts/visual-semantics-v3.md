@@ -117,10 +117,13 @@ For a committed successful v3 job, the exact decoder PNGs and PTS/filter/command
 receipts are registered as immutable `objects/<sha256>` artifacts. Their pins
 commit atomically with queue success; `result()` rehashes these objects and
 reparses the decoder PTS receipt, including after a formal workspace backup
-and restore. A cancelled or failed attempt may leave registered but unowned
-objects if interrupted between publication and commit. They are measurable
-with `unbound_artifacts()` and reclaimable through the existing explicit
-`sweep_unbound_artifacts(apply=True)` gate after all processors exit. The
+and restore. After each video job finishes, the runner checks the objects it
+newly registered. It reclaims unowned objects before claiming the next job.
+An active publisher or processor defers cleanup until another task finishes or
+the runner polls again. Each cleanup request covers at most 1,024 object IDs.
+A process crash between registration and cleanup can leave unowned objects.
+Use `unbound_artifacts()` to inspect them and `sweep_unbound_artifacts(apply=True)`
+after processors exit to reclaim them. The
 backup closure preserves the committed v3 result, but this does not establish
 that every unrelated temporary keyframe/content artifact needed to **apply an
 unapplied candidate after restore** is portable; that older workflow requires
