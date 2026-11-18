@@ -19,7 +19,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # Ubuntu 24.04 still provides the Python 3.9 toolcache build.
+        os: [ubuntu-24.04, windows-latest]
         python-version: ["3.9", "3.11", "3.13"]
 
     steps:
@@ -88,15 +89,16 @@ jobs:
         run: python scripts/check_installed_package.py
 
       - name: Run test suite
+        id: test_suite
         run: |
           python -m pytest tests -v -rs
 
       - name: Retain reproducible timing diagnostics after a failure
-        if: failure()
+        if: failure() && steps.test_suite.outcome == 'failure'
         run: python scripts/diagnose_media_timing.py --output output/media-timing-diagnostics
 
       - name: Upload media timing failure evidence
-        if: failure()
+        if: failure() && steps.test_suite.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
           name: media-timing-${{ matrix.os }}-py${{ matrix.python-version }}
@@ -110,7 +112,7 @@ jobs:
           python examples/run_quickstart.py --output output/quickstart-ci
 
   browser:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -130,10 +132,8 @@ jobs:
       - name: Check draft recovery and timeline layout without a browser
         run: node --test tests/temporal_draft_recovery.test.mjs tests/workspace_draft_recovery.test.mjs tests/workspace_timeline_layout.test.mjs tests/workspace_analysis_ui.test.mjs tests/workspace_render_ui.test.mjs
 
-      - name: Install synthetic media and browser test dependencies
+      - name: Install browser test dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
           python -m pip install ".[dev,browser-test]"
           python -m playwright install --with-deps chromium
 

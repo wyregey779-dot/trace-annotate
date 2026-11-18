@@ -12,10 +12,10 @@ import subprocess
 import tarfile
 import urllib.request
 
-URL = ('https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-23-13-04/'
-       'ffmpeg-n9.0.2-35-g9a9b70bb8c-linux64-gpl-9.0.tar.xz')
-SHA256 = '143e31ca53d65d95bde12cc861e331fd2275e48a6ca988e62c46e8f5b77b9811'
-PREFIX = 'ffmpeg-n9.0.2-35-g9a9b70bb8c-linux64-gpl-9.0'
+URL = ('https://github.com/mrkbac/portable-ffmpeg/releases/download/ffmpeg-9.0.2-1/'
+       'ffmpeg-9.0.2-linux-amd64.tar.xz')
+SHA256 = 'f78d9e9833dc773cd45ef03f20368b8cd67fd353fd8e85bb61c6aabb69ef0148'
+VERSION = 'n9.0.2-39-g7adfbe40dc-20261031'
 
 
 def main():
@@ -24,6 +24,7 @@ def main():
     archive = output / 'toolchain.tar.xz'
     digest = hashlib.sha256()
     request = urllib.request.Request(URL, headers={'User-Agent': 'TraceAnnotate-CI'})
+    print('Downloading ' + URL, flush=True)
     total = 0
     with urllib.request.urlopen(request, timeout=60) as response, archive.open('xb') as target:
         while True:
@@ -42,8 +43,8 @@ def main():
     versions = {}
     with tarfile.open(archive, 'r:xz') as bundle:
         for name in ('ffmpeg', 'ffprobe'):
-            member = bundle.getmember(PREFIX + '/bin/' + name)
-            if not member.isfile() or member.size > 500_000_000:
+            member = bundle.getmember(name)
+            if not member.isfile() or not 0 < member.size <= 500_000_000:
                 raise RuntimeError('Unexpected binary archive entry')
             source = bundle.extractfile(member)
             if source is None:
@@ -54,10 +55,10 @@ def main():
             path.chmod(0o755)
             result = subprocess.run([str(path), '-version'], capture_output=True, text=True, check=True, timeout=30)
             versions[name] = result.stdout.splitlines()[0]
-            if not versions[name].startswith(name + ' version n9.0.2-35-g9a9b70bb8c'):
+            if not versions[name].startswith(name + ' version ' + VERSION + ' '):
                 raise RuntimeError('Unexpected toolchain version: ' + versions[name])
     record = {'url': URL, 'sha256': SHA256, 'bytes': total, 'versions': versions,
-              'provider': 'BtbN/FFmpeg-Builds; GPL binaries are CI-only, not redistributed with TraceAnnotate'}
+              'provider': 'portable-ffmpeg immutable release of BtbN/FFmpeg-Builds; CI-only'}
     (output / 'provenance.json').write_text(json.dumps(record, indent=2), encoding='utf-8')
     with Path(os.environ['GITHUB_PATH']).open('a', encoding='utf-8') as environment:
         environment.write(str(binaries) + '\n')
