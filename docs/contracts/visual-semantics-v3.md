@@ -121,6 +121,9 @@ and restore. After each video job finishes, the runner checks the objects it
 newly registered. It reclaims unowned objects before claiming the next job.
 An active publisher or processor defers cleanup until another task finishes or
 the runner polls again. Each cleanup request covers at most 1,024 object IDs.
+Shutdown retries pending cleanup after the other workers have stopped. If
+an active writer still prevents cleanup, closing reports the pending count
+and the workspace can be closed again when the writer finishes.
 A process crash between registration and cleanup can leave unowned objects.
 Use `unbound_artifacts()` to inspect them and `sweep_unbound_artifacts(apply=True)`
 after processors exit to reclaim them. The

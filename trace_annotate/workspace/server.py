@@ -178,9 +178,16 @@ class WorkspaceHTTPServer(ThreadingHTTPServer):
         super().server_close()
         if hasattr(self, "image_service"):
             self.image_service.close()
+        # Intake, render or an in-flight request could still own an object
+        # during the first vision close. Retry after their shutdown barriers.
+        vision_report = report.get("vision_worker", {})
+        if vision_report.get("workers_stopped") and vision_report.get("pending_cleanup_count"):
+            report["vision_worker"] = vision_jobs.close(timeout=CLOSE_WORKER_SECONDS)
         if report.get("analysis_worker", {}).get("stopped") is False:
             raise Conflict("WORKSPACE_BUSY", "Analysis worker has not stopped; preserve its open workspace and retry shutdown")
         if report.get("vision_worker", {}).get("stopped") is False:
+            if report["vision_worker"].get("workers_stopped"):
+                raise Conflict("WORKSPACE_BUSY", "Vision evidence cleanup is pending; finish active writes and retry shutdown")
             raise Conflict("WORKSPACE_BUSY", "Vision worker has not stopped; preserve its open workspace and retry shutdown")
         if report.get("render_worker", {}).get("stopped") is False:
             raise Conflict("WORKSPACE_BUSY", "Render worker has not stopped; preserve its open workspace and retry shutdown")

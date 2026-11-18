@@ -125,6 +125,75 @@ def test_idle_vision_drain_retries_large_backlog_after_other_publication(store):
         vision.close()
 
 
+def test_competing_vision_runner_waits_for_inflight_cleanup_before_processing(store, monkeypatch):
+    vision = VisionJobs(store)
+    stale = store._put_artifact(b"unowned evidence from previous failed attempt")
+    stale_path = store.root / stale["relative_path"]
+    vision._v3_published_ids.add(stale["id"])
+    first, second = [
+        vision.queue.create_batch([item(store)], operation=VISION_OPERATION,
+                                  processor_version="test", parameters={"seq": seq})
+        for seq in range(2)]
+    vision.queue.pause(first["id"])
+    sweep_entered, release_sweep = threading.Event(), threading.Event()
+    competing_entered, processor_entered = threading.Event(), threading.Event()
+    seen_unowned = []
+    actual_sweep = store.sweep_unbound_artifacts
+
+    def hold_sweep(**kwargs):
+        sweep_entered.set()
+        assert release_sweep.wait(5)
+        return actual_sweep(**kwargs)
+
+    def competing_runner():
+        competing_entered.set()
+        return vision.run_pending(batch_id=second["id"], worker_id="competing-runner")
+
+    def processor(job, _context):
+        seen_unowned.append(stale_path.exists())
+        processor_entered.set()
+        return {"job_id": job["id"]}
+
+    monkeypatch.setattr(store, "sweep_unbound_artifacts", hold_sweep)
+    monkeypatch.setattr(vision, "_processor", processor)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            idle = executor.submit(vision.run_pending, batch_id=first["id"])
+            try:
+                assert sweep_entered.wait(5)
+                other = executor.submit(competing_runner)
+                assert competing_entered.wait(5)
+                assert not processor_entered.wait(.25)
+            finally:
+                release_sweep.set()
+            assert idle.result(timeout=5) == []
+            assert [job["state"] for job in other.result(timeout=5)] == ["succeeded"]
+        assert seen_unowned == [False]
+    finally:
+        vision.close()
+
+
+def test_vision_close_reports_deferred_cleanup_and_reclaims_on_retry(store):
+    vision = VisionJobs(store)
+    stale = store._put_artifact(b"discarded evidence deferred during shutdown")
+    unrelated = store._put_artifact(b"unrelated preexisting evidence")
+    vision._v3_published_ids.add(stale["id"])
+    try:
+        with store._evidence_publication_scope():
+            assert vision.run_pending() == []
+            busy = vision.close(timeout=0)
+            assert busy["stopped"] is False
+            assert busy["pending_cleanup_count"] == 1
+            assert (store.root / stale["relative_path"]).is_file()
+        completed = vision.close(timeout=5)
+        assert completed["stopped"] is True
+        assert completed["pending_cleanup_count"] == 0
+        assert not (store.root / stale["relative_path"]).exists()
+        assert {a["id"] for a in store.unbound_artifacts()["artifacts"]} == {unrelated["id"]}
+    finally:
+        vision.close()
+
+
 def test_enqueue_freezes_input_deduplicates_and_records_command(store):
     queue = DurableQueue(store)
     config = {"threshold": 0.3, "tracks": ["main"]}

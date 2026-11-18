@@ -3950,6 +3950,7 @@ class VisionJobs:
         self._active_jobs = set()
         self._heartbeats = set()
         self._v3_published_ids = set()
+        self._evidence_sweep_lock = threading.Lock()
         self._drainer = None
         self._drainer_error = None
         self.poll_seconds, self.slot_wait_seconds = float(poll_seconds), float(slot_wait_seconds)
@@ -4833,21 +4834,21 @@ class VisionJobs:
                 self._condition.notify_all()
 
     def _sweep_finished_evidence(self) -> None:
-        with self._condition:
-            pending = list(self._v3_published_ids)
-            self._v3_published_ids.clear()
-        for start in range(0, len(pending), MAX_SCOPED_CLEANUP_IDS):
-            try:
-                self.store.sweep_unbound_artifacts(
-                    apply=True, artifact_ids=pending[start:start + MAX_SCOPED_CLEANUP_IDS])
-            except BaseException as exc:
-                # Another publisher or queue processor may still own a file.
-                # Return the unfinished portion to the next task or idle poll.
-                with self._condition:
-                    self._v3_published_ids.update(pending[start:])
-                if isinstance(exc, Conflict) and exc.code == "GC_ACTIVE_WORK":
-                    return
-                raise
+        # A terminal task must wait for an idle poll that already took its IDs.
+        with self._evidence_sweep_lock:
+            with self._condition:
+                pending = list(self._v3_published_ids)
+                self._v3_published_ids.clear()
+            for start in range(0, len(pending), MAX_SCOPED_CLEANUP_IDS):
+                try:
+                    self.store.sweep_unbound_artifacts(
+                        apply=True, artifact_ids=pending[start:start + MAX_SCOPED_CLEANUP_IDS])
+                except BaseException as exc:
+                    with self._condition:
+                        self._v3_published_ids.update(pending[start:])
+                    if isinstance(exc, Conflict) and exc.code == "GC_ACTIVE_WORK":
+                        return
+                    raise
 
     def run_pending(self, *, batch_id: Optional[str] = None, worker_id: str = "vision-local") -> List[Dict[str, Any]]:
         with self._condition:
@@ -4936,8 +4937,13 @@ class VisionJobs:
                         pass
                 self._extractors = None
                 self._loaded_optional_config = None
-            return {"stopped": stopped,
-                    "active_jobs": sorted(self._active_jobs), "closing": True, "drainer_error": self._drainer_error}
+        if stopped:
+            self._sweep_finished_evidence()
+        with self._condition:
+            pending = len(self._v3_published_ids)
+            return {"stopped": stopped and not pending, "workers_stopped": stopped,
+                    "pending_cleanup_count": pending, "active_jobs": sorted(self._active_jobs),
+                    "closing": True, "drainer_error": self._drainer_error}
 
     def _validate_candidate(self, value: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
         parameters = _validate_job(job)

@@ -1526,6 +1526,35 @@ def test_close_stops_runner_and_cancels_active(store):
     assert report["stopped"] is True
 
 
+def test_http_close_finishes_deferred_vision_cleanup_after_other_workers(store, monkeypatch):
+    from contextlib import ExitStack
+    from trace_annotate.workspace.server import make_server
+
+    server = make_server(store)
+    # End the idle poller so the pending object is handled by shutdown.
+    server.vision_jobs.close(timeout=5)
+    seen = []
+    with ExitStack() as publication:
+        publication.enter_context(store._evidence_publication_scope())
+        artifact = store._put_artifact(b"unbound test frame")
+        path = store.root / artifact["relative_path"]
+        server.vision_jobs._v3_published_ids.add(artifact["id"])
+        close_render = server.render_jobs.close
+
+        def finish_other_worker(**kwargs):
+            seen.append(path.is_file())
+            publication.close()
+            return close_render(**kwargs)
+
+        monkeypatch.setattr(server.render_jobs, "close", finish_other_worker)
+        server.server_close()
+
+    assert seen == [True]
+    assert server.shutdown_report["vision_worker"]["stopped"] is True
+    assert server.shutdown_report["vision_worker"]["pending_cleanup_count"] == 0
+    assert not path.exists()
+
+
 def test_http_vision_job_reports_eight_frames_need_nine(tmp_path, eight_frame_clip):
     """The workbench vision route must state 8<9 instead of silently reporting none."""
     import threading
