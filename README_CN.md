@@ -38,9 +38,9 @@ trace-annotate workspace serve --project ../traceannotate-workspace
 
 打开命令输出的本地网址，选择视频，等待导入完成后，在各自任务中创建并保存标注。工作台支持选择解码帧、重叠多轨、专业 JSON 和可选的带标注视频导出；后续使用同一个项目目录继续工作。请保留原片和经验证的项目备份：JSON 导出不包含完整媒体及全部历史工件。详见[工作台指南](docs/WORKSPACE_DEVELOPMENT.md)和[专业 JSON 指南](docs/PROFESSIONAL_JSON.md)。
 
-![使用合成视频和测试标签的多视频工作台](docs/media/workspace-synthetic.png)
+![TraceAnnotate 工作台中的实拍视频、片段编辑、相邻帧对照与多轨时间轴](docs/media/workspace-demo.png)
 
-截图来自实际浏览器，使用合成测试视频和测试标签；图中分析结果仍是候选，尚未保存为报告。
+这是实际浏览器中的多轨标注示例，展示已保存的片段、视频预览和相邻帧对照。画面取自 Elene B 在 Wikimedia Commons 发布的 [《Patata tortilla》](https://commons.wikimedia.org/wiki/File:Patata_tortilla.webm)。截图将视频取帧与工作台标注合在同一画面，按 [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) 提供。
 
 原有 `video-ui` 和 `embodied-ui` 仍是独立流程，其文件和工作台任务不会自动互通；两者都没有框选和对象轨迹编辑界面。工作台的可选视觉提供器只生成待复核候选，不会证明标注语义正确。
 

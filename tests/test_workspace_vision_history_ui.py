@@ -273,4 +273,3 @@ def test_late_history_and_running_status_cannot_overwrite_the_user_selection(pro
             assert not errors, errors
         finally:
             page.close()
-
