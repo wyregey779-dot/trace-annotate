@@ -253,10 +253,12 @@ class _Handler(BaseHTTPRequestHandler):
             "FORBIDDEN_ORIGIN": "Request origin or host is not allowed",
             "INVALID_TOKEN": "Workspace token is missing or invalid",
             "INVALID_JSON": "Request must contain valid bounded JSON",
+            "INVALID_QUERY": "Invalid query parameters",
             "SCHEMA_INVALID": "Request does not match the command schema",
             "LIMIT_EXCEEDED": "Request exceeds the configured size limit",
             "COMMAND_UNKNOWN": "No durable receipt exists for this command",
             "REVISION_CONFLICT": "Task revision changed; reload before retrying",
+            "VISION_STALE": "Vision candidate belongs to an older task revision",
             "IDEMPOTENCY_CONFLICT": "Command ID was already used for another request",
             "UNSUPPORTED_OPERATION": "Operation is not supported by this server",
             "METHOD_NOT_ALLOWED": "HTTP method is not supported",
@@ -381,20 +383,26 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.query:
             frame_query = re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/media/[A-Za-z0-9_-]+/frames", parsed.path)
             export_query = re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/tasks/[A-Za-z0-9_-]+/export", parsed.path)
+            history_query = re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/tasks/[A-Za-z0-9_-]+/vision-history", parsed.path)
             imports_async = (self.command == "POST" and
                              re.fullmatch(r"/api/v1/projects/[A-Za-z0-9_-]+/imports", parsed.path))
-            max_len = 160 if frame_query else (4096 if export_query else 32)
-            if (self.command != "GET" or not (frame_query or export_query)) and not imports_async:
+            if (self.command != "GET" or not (frame_query or export_query or history_query)) and not imports_async:
                 raise NotFound("NOT_FOUND", "Unknown route")
+            max_len = 160 if frame_query else (4096 if export_query else (384 if history_query else 32))
             if len(parsed.query) > max_len:
                 raise NotFound("NOT_FOUND", "Unknown route")
             try:
                 if re.search(r"%(?![0-9a-fA-F]{2})", parsed.query):
                     raise ValueError("Malformed percent escape")
                 self._query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True, errors="strict")
-                allowed = {"offset", "limit", "time_n", "time_d", "mode"} if frame_query else {"format", "track", "track_id", "evidence"}
-                if imports_async:
+                if frame_query:
+                    allowed = {"offset", "limit", "time_n", "time_d", "mode"}
+                elif history_query:
+                    allowed = {"limit", "cursor"}
+                elif imports_async:
                     allowed = {"async"}
+                else:
+                    allowed = {"format", "track", "track_id", "evidence"}
                 if set(self._query) - allowed or any(len(value) != 1 for value in self._query.values()):
                     raise ValueError("Unexpected query parameter")
                 if export_query:
@@ -670,6 +678,14 @@ class _Handler(BaseHTTPRequestHandler):
             if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "hand-object-geometry":
                 _require_id(parts[1], "job_id")
                 self._send_json(200, self.server.vision_jobs.hand_object_geometry(parts[1]))
+                return
+            if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "vision-history":
+                _require_id(parts[1], "task_id")
+                limit = self._query.get("limit", ["20"])[0]
+                if re.fullmatch(r"[1-9][0-9]{0,2}", limit) is None:
+                    raise BadRequest("INVALID_QUERY", "Vision history limit must be a positive decimal integer")
+                self._send_json(200, self.server.vision_jobs.history(
+                    parts[1], limit=int(limit), cursor=self._query.get("cursor", [None])[0]))
                 return
             if len(parts) == 3 and parts[0] == "tasks" and parts[2] == "vision-status":
                 _require_id(parts[1], "task_id")

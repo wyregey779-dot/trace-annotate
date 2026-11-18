@@ -704,6 +704,14 @@ def _job_identity(*, content_evidence_contract: Optional[str] = CONTENT_EVIDENCE
             "capability_identity": "implementation+ffmpeg+ffprobe+local resources frozen by sha256"}
 
 
+def _validate_window(window: Optional[Dict[str, Any]]) -> None:
+    if window is not None and (
+            not isinstance(window, dict) or set(window) != {"start", "end"}
+            or any(S.rational(window[key]) != window[key] for key in ("start", "end"))
+            or not 0 <= S.rational_value(window["start"]) < S.rational_value(window["end"])):
+        raise SchemaInvalid("SCHEMA_INVALID", "window must be a reduced rational half-open interval")
+
+
 def _parameters(window: Optional[Dict[str, Any]] = None,
                 subject_annotation_id: Optional[str] = None, *,
                 hand_configuration: Optional[Dict[str, Any]] = None,
@@ -721,11 +729,7 @@ def _parameters(window: Optional[Dict[str, Any]] = None,
         S.require_id(subject_annotation_id)
         if window is None:
             raise SchemaInvalid("SCHEMA_INVALID", "An annotation subject requires an interval")
-    if window is not None:
-        if (not isinstance(window, dict) or set(window) != {"start", "end"}
-                or any(S.rational(window[key]) != window[key] for key in ("start", "end"))
-                or not 0 <= S.rational_value(window["start"]) < S.rational_value(window["end"])):
-            raise SchemaInvalid("SCHEMA_INVALID", "window must be a reduced rational half-open interval")
+    _validate_window(window)
     return json.loads(S.canonical_json({"window": window, "subject_annotation_id": subject_annotation_id,
                                         "time_domain": DOMAIN, "job_identity": _job_identity(
                                             hand_configuration=hand_configuration,
@@ -5229,6 +5233,16 @@ class VisionJobs:
                     or self.store.task_digest(job["task_snapshot"]) != job["input_sha256"]):
                 raise WorkspaceError("RECOVERY_REQUIRED", "Vision frozen input was altered")
 
+    def history(self, task_id: str, *, limit: int = 20,
+                cursor: Optional[str] = None) -> Dict[str, Any]:
+        """List persisted vision jobs without loading or republishing results."""
+        jobs, next_cursor = self.queue.list_task_jobs(task_id, OPERATION, limit=limit, cursor=cursor)
+        for job in jobs:
+            window = job.pop("parameters").get("window")
+            _validate_window(window)
+            job["window"] = window
+        return {"task_id": task_id, "jobs": jobs, "next_cursor": next_cursor}
+
     def job_status(self, job_id: str) -> Dict[str, Any]:
         """Read-only progress for one vision job, including a terminal error."""
         S.require_id(job_id)
@@ -5506,6 +5520,10 @@ class VisionJobs:
                 raise Conflict("MEDIA_CHANGED", "Task content hash mismatch",
                                details={"expected_sha256": expected_sha256,
                                         "current_sha256": current["content_sha256"]})
+            if (result["input_revision"], result["input_sha256"]) != (expected_revision, expected_sha256):
+                raise Conflict("VISION_STALE", "Vision candidate was produced for an older task revision",
+                               details={"expected_revision": result["input_revision"],
+                                        "current_revision": current["revision"]})
             media = self.queue.get_job(job_id)["media_snapshot"]
             template = next(value for value in self.store.list_templates()
                             if (value["id"], value["version"]) ==

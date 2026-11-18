@@ -11,17 +11,19 @@ import errno
 import json
 import math
 import re
+import sqlite3
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import schema as S
-from .errors import Conflict, LimitExceeded, NotFound, SchemaInvalid, WorkspaceError
+from .errors import BadRequest, Conflict, LimitExceeded, NotFound, SchemaInvalid, WorkspaceError
 
 
 MAX_CONCURRENCY = 8
 MAX_BATCH_ITEMS = 1000
 MAX_RESULT_BYTES = 16 * 1024 * 1024
+MAX_JOB_HISTORY_PAGE = 100
 _DDL = (
     "CREATE TABLE IF NOT EXISTS batches (id TEXT PRIMARY KEY, configuration_sha256 TEXT NOT NULL, "
     "dispatch_paused INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)",
@@ -217,6 +219,55 @@ class DurableQueue:
         with self.store.transaction():
             ids = self.store.conn.execute("SELECT id FROM batches ORDER BY rowid").fetchall()
             return [self.get_batch(row[0]) for row in ids]
+
+    def list_task_jobs(self, task_id: str, operation: str, *, limit: int = 20,
+                       cursor: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Page frozen job summaries, independent of batches, retries and results."""
+        _ident(task_id, "task_id")
+        _text(operation, "operation")
+        if type(limit) is not int or not 1 <= limit <= MAX_JOB_HISTORY_PAGE:
+            raise BadRequest("INVALID_QUERY", "Job history page size must be between 1 and 100")
+        if cursor is not None and (not isinstance(cursor, str) or S.ID_RE.fullmatch(cursor) is None):
+            raise BadRequest("INVALID_QUERY", "Invalid job history cursor")
+        with self.store.transaction():
+            self.store.get_task(task_id)
+            before = ""
+            values: Tuple[str, ...] = ()
+            if cursor is not None:
+                anchor = self.store.conn.execute(
+                    "SELECT created_at,input FROM jobs WHERE id=?", (cursor,)).fetchone()
+                if anchor is None:
+                    raise BadRequest("INVALID_QUERY", "Job history cursor does not match this task")
+                spec = json.loads(anchor[1])
+                if (spec["task_id"], spec["operation"]) != (task_id, operation):
+                    raise BadRequest("INVALID_QUERY", "Job history cursor does not match this task")
+                before = " AND (created_at < ? OR (created_at = ? AND id < ?))"
+                values = (anchor[0], anchor[0], cursor)
+            columns = "SELECT id,state,created_at,error_code,input FROM jobs WHERE "
+            order = " ORDER BY created_at DESC,id DESC"
+            try:
+                rows = self.store.conn.execute(
+                    columns + "json_extract(input,'$.task_id')=? AND json_extract(input,'$.operation')=?"
+                    + before + order + " LIMIT ?", (task_id, operation, *values, limit + 1))
+            except sqlite3.OperationalError as exc:
+                if "no such function: json_extract" not in str(exc):
+                    raise
+                # JSON1 was an optional build feature before SQLite 3.38.
+                rows = self.store.conn.execute(columns + "1=1" + before + order, values)
+            page = []
+            try:
+                for job_id, state, created, error, raw in rows:
+                    spec = json.loads(raw)
+                    if (spec["task_id"], spec["operation"]) != (task_id, operation):
+                        continue
+                    if len(page) == limit:
+                        return page, page[-1]["id"]
+                    page.append({"id": job_id, "state": state, "created_at": created, "error_code": error,
+                                 "input_revision": spec["input_revision"], "input_sha256": spec["input_sha256"],
+                                 "processor_version": spec["processor_version"], "parameters": spec["parameters"]})
+            finally:
+                rows.close()
+            return page, None
 
     def snapshot(self) -> Dict[str, Any]:
         return read_queue_snapshot(self.store)

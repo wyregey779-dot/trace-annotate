@@ -64,6 +64,14 @@ dialog:modal{overscroll-behavior:contain}dialog::backdrop{overflow:hidden;oversc
 .measurement-summary{font-size:10px;color:var(--muted);line-height:1.6;margin-bottom:6px;overflow-wrap:anywhere}
 .tag-note{font-size:9px;color:var(--muted);line-height:1.5}
 .candidate-review-fields{display:grid;grid-template-columns:minmax(110px,auto) minmax(0,1fr);gap:7px 12px;align-items:center;padding:12px 15px;border-top:1px solid var(--line)}.candidate-review-fields label{font-size:11px;color:var(--muted)}.candidate-review-fields select{min-height:38px}.candidate-review-fields textarea,.candidate-review-fields p{grid-column:1/-1}.candidate-review-fields p{font-size:11px;line-height:1.6}.vision-evidence{border-top:1px solid var(--line);padding:12px 15px;background:#0c1723}
+.vision-history{margin:0 15px 12px;border:1px solid var(--line);border-radius:8px}
+.vision-history summary{padding:10px 12px;cursor:pointer;font-size:13px;font-weight:600}
+.vision-history-content{padding:0 12px 10px;min-width:0}
+.vision-history-list{display:grid;gap:6px;padding:0;margin:8px 0;list-style:none}
+.vision-history-list button{width:100%;text-align:left;min-height:38px;white-space:normal;overflow-wrap:anywhere}
+.vision-history-list button[aria-current="true"]{border-color:var(--accent)}
+.vision-history-list button span{display:block}
+.vision-history-nav{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
 .vision-evidence[hidden]{display:none}
 .vision-evidence h4{font-size:13px;margin:0 0 7px}
 .vision-evidence p{font-size:11px;line-height:1.6;margin:5px 0;overflow-wrap:anywhere}
@@ -168,7 +176,19 @@ dialog:modal{overscroll-behavior:contain}dialog::backdrop{overflow:hidden;oversc
    </section>
   </div>
   <section class="panel segment-panel" aria-labelledby="segments-title"><div class="panel-head"><h3 id="segments-title">已保存片段</h3><span class="muted" id="revision-label"></span></div><div class="table-wrap"><table id="segments"><thead><tr><th scope="col">标签 / 选择</th><th scope="col">时间区间</th><th scope="col">内容</th><th scope="col">轨道</th><th scope="col">审核</th></tr></thead><tbody></tbody></table><p id="no-segments" class="empty-small">尚无片段。播放视频后，填写起止时间并保存。</p></div></section>
-  <section class="panel" id="vision-panel" aria-labelledby="vision-title"><div class="panel-head"><h3 id="vision-title">视觉辅助候选</h3><span class="muted" id="vision-options">正在读取能力…</span></div><p class="empty-small">只在已准入的播放媒体上运行；候选默认未审核，必须由你逐条核对后才算人工结论。模型推断不会写成事实。</p><form id="vision-window-form" class="vision-window-form" method="post" action="" novalidate><fieldset class="vision-window-fields" aria-describedby="vision-window-help"><legend>本次分析区间</legend><div class="vision-window-grid"><label for="vision-window-start">起点（秒）<input id="vision-window-start" name="start" type="text" inputmode="decimal" required aria-invalid="false" aria-describedby="vision-window-help" placeholder="0"></label><label for="vision-window-end">终点（秒，不包含）<input id="vision-window-end" name="end" type="text" inputmode="decimal" required aria-invalid="false" aria-describedby="vision-window-help" placeholder="30"></label></div><p id="vision-window-help" class="vision-window-help">每次最多分析 120 秒；长片请分段提交。输入十进制秒或分数，例如 1.25 或 5/4。这里只生成稀疏候选，不代表逐帧识别。</p><p id="vision-window-error" class="vision-window-error" role="alert" hidden></p></fieldset><div class="form-actions"><button id="vision-run" class="primary" type="submit" disabled>分析选定区间</button><button id="vision-refresh" type="button" class="quiet">刷新状态</button><button id="vision-apply" type="button" disabled hidden>应用为候选片段</button><button id="vision-cancel" type="button" class="danger" disabled hidden>取消任务</button><button id="vision-retry" type="button" disabled hidden>重试任务</button></div></form><div id="vision-coverage" class="vision-coverage" role="status" aria-live="polite"></div><div id="vision-job" class="empty-small" hidden></div><section id="vision-evidence" class="vision-evidence" aria-labelledby="vision-evidence-title" hidden><h4 id="vision-evidence-title">逐帧证据检查（只读）</h4><p id="vision-evidence-scope"></p><p id="vision-evidence-loss"></p><div class="vision-evidence-controls"><button id="vision-evidence-prev" type="button" class="quiet" aria-label="上一组视觉采样帧">上一组</button><label for="vision-evidence-frame">采样帧</label><select id="vision-evidence-frame"></select><button id="vision-evidence-next" type="button" class="quiet" aria-label="下一组视觉采样帧">下一组</button><span id="vision-evidence-page" class="muted"></span></div><p id="vision-evidence-status" role="status" aria-live="polite"></p><div class="vision-evidence-stage"><img id="vision-evidence-image" alt="" hidden><svg id="vision-evidence-overlay" aria-hidden="true" hidden></svg></div><p id="vision-evidence-identity" class="vision-evidence-hash"></p><ol id="vision-evidence-notes" class="vision-evidence-notes"></ol><div id="vision-hand-object" class="vision-hand-object" role="group" aria-labelledby="vision-hand-object-title"><h5 id="vision-hand-object-title">同帧手与物体几何（只读）</h5><p id="vision-hand-object-status" role="status" aria-live="polite">尚未加载几何证据。</p><p id="vision-hand-object-coverage"></p><ol id="vision-hand-object-pairs" class="vision-evidence-notes"></ol></div></section><div class="candidate-review-fields"><label for="vision-actor-type">实际操作主体</label><select id="vision-actor-type"><option value="">请选择</option><option value="human">本人（仅自声明）</option><option value="assistant">助手</option><option value="tool">其他工具</option></select><label for="vision-actor-id">主体标识</label><input id="vision-actor-id" type="text" required maxlength="96" pattern="[A-Za-z][A-Za-z0-9_-]{0,95}" placeholder="如 reviewer-1 或 assistant-1"><label for="vision-diff-summary">修改摘要（仅采纳编辑时填写）</label><textarea id="vision-diff-summary" rows="2" maxlength="500" placeholder="说明哪些字段因逐帧核对而修改"></textarea><p class="muted">身份由操作者自声明，并非身份认证；助手或工具的决定仍是未审核，不会记为人工签核。拒绝会移除活动候选，但保留来源与证据记录。</p></div><div class="table-wrap"><table id="vision-candidates" hidden><thead><tr><th scope="col">候选</th><th scope="col">时间区间</th><th scope="col">来源</th><th scope="col">审核</th><th scope="col">操作</th></tr></thead><tbody></tbody></table></div></section>
+  <section class="panel" id="vision-panel" aria-labelledby="vision-title"><div class="panel-head"><h3 id="vision-title">视觉辅助候选</h3><span class="muted" id="vision-options">正在读取能力…</span></div><p class="empty-small">只在已准入的播放媒体上运行；候选默认未审核，必须由你逐条核对后才算人工结论。模型推断不会写成事实。</p><details id="vision-history" class="vision-history">
+   <summary id="vision-history-toggle">作业历史</summary>
+   <div class="vision-history-content">
+    <p id="vision-history-status" class="muted" role="status">展开后读取该视频已有的分析作业。</p>
+    <ul id="vision-history-list" class="vision-history-list" aria-label="视觉分析作业"></ul>
+    <div class="vision-history-nav">
+     <button id="vision-history-prev" type="button" class="quiet" disabled>上一页</button>
+     <button id="vision-history-next" type="button" class="quiet" disabled>下一页</button>
+     <button id="vision-history-refresh" type="button" class="quiet">刷新列表</button>
+    </div>
+   </div>
+  </details>
+  <form id="vision-window-form" class="vision-window-form" method="post" action="" novalidate><fieldset class="vision-window-fields" aria-describedby="vision-window-help"><legend>本次分析区间</legend><div class="vision-window-grid"><label for="vision-window-start">起点（秒）<input id="vision-window-start" name="start" type="text" inputmode="decimal" required aria-invalid="false" aria-describedby="vision-window-help" placeholder="0"></label><label for="vision-window-end">终点（秒，不包含）<input id="vision-window-end" name="end" type="text" inputmode="decimal" required aria-invalid="false" aria-describedby="vision-window-help" placeholder="30"></label></div><p id="vision-window-help" class="vision-window-help">每次最多分析 120 秒；长片请分段提交。输入十进制秒或分数，例如 1.25 或 5/4。这里只生成稀疏候选，不代表逐帧识别。</p><p id="vision-window-error" class="vision-window-error" role="alert" hidden></p></fieldset><div class="form-actions"><button id="vision-run" class="primary" type="submit" disabled>分析选定区间</button><button id="vision-refresh" type="button" class="quiet">刷新状态</button><button id="vision-apply" type="button" disabled hidden>应用为候选片段</button><button id="vision-cancel" type="button" class="danger" disabled hidden>取消任务</button><button id="vision-retry" type="button" disabled hidden>重试任务</button></div></form><div id="vision-coverage" class="vision-coverage" role="status" aria-live="polite"></div><div id="vision-job" class="empty-small" hidden></div><section id="vision-evidence" class="vision-evidence" aria-labelledby="vision-evidence-title" hidden><h4 id="vision-evidence-title">逐帧证据检查（只读）</h4><p id="vision-evidence-scope"></p><p id="vision-evidence-loss"></p><div class="vision-evidence-controls"><button id="vision-evidence-prev" type="button" class="quiet" aria-label="上一组视觉采样帧">上一组</button><label for="vision-evidence-frame">采样帧</label><select id="vision-evidence-frame"></select><button id="vision-evidence-next" type="button" class="quiet" aria-label="下一组视觉采样帧">下一组</button><span id="vision-evidence-page" class="muted"></span></div><p id="vision-evidence-status" role="status" aria-live="polite"></p><div class="vision-evidence-stage"><img id="vision-evidence-image" alt="" hidden><svg id="vision-evidence-overlay" aria-hidden="true" hidden></svg></div><p id="vision-evidence-identity" class="vision-evidence-hash"></p><ol id="vision-evidence-notes" class="vision-evidence-notes"></ol><div id="vision-hand-object" class="vision-hand-object" role="group" aria-labelledby="vision-hand-object-title"><h5 id="vision-hand-object-title">同帧手与物体几何（只读）</h5><p id="vision-hand-object-status" role="status" aria-live="polite">尚未加载几何证据。</p><p id="vision-hand-object-coverage"></p><ol id="vision-hand-object-pairs" class="vision-evidence-notes"></ol></div></section><div class="candidate-review-fields"><label for="vision-actor-type">实际操作主体</label><select id="vision-actor-type"><option value="">请选择</option><option value="human">本人（仅自声明）</option><option value="assistant">助手</option><option value="tool">其他工具</option></select><label for="vision-actor-id">主体标识</label><input id="vision-actor-id" type="text" required maxlength="96" pattern="[A-Za-z][A-Za-z0-9_-]{0,95}" placeholder="如 reviewer-1 或 assistant-1"><label for="vision-diff-summary">修改摘要（仅采纳编辑时填写）</label><textarea id="vision-diff-summary" rows="2" maxlength="500" placeholder="说明哪些字段因逐帧核对而修改"></textarea><p class="muted">身份由操作者自声明，并非身份认证；助手或工具的决定仍是未审核，不会记为人工签核。拒绝会移除活动候选，但保留来源与证据记录。</p></div><div class="table-wrap"><table id="vision-candidates" hidden><thead><tr><th scope="col">候选</th><th scope="col">时间区间</th><th scope="col">来源</th><th scope="col">审核</th><th scope="col">操作</th></tr></thead><tbody></tbody></table></div></section>
   <p class="footer-note"><span class="connected"></span>本机持久化 · 稀疏片段标注 · 导出为开发版工作区快照，不含媒体文件，也不是可直接导入的便携项目包。</p>
  </section>
 </main>
@@ -274,10 +294,10 @@ async function decideVisionCandidate(annotationId,decision){
  notice((decision==='rejected'?'候选已拒绝并留存来源':actor.actor_type==='human'?'决定已记录为本人自声明复核':'决定已记录，仍为未审核')+' · 修订 r'+receipt.revision+' · 普通撤销不会移除此决定','success');
 }
 async function refreshVisionStatus(){
- const taskId=state.task?.id;if(!taskId)return;const generation=state.visionGeneration;
+ const taskId=state.task?.id;if(!taskId)return;const sequence=state.sequence;
  try{
   const status=await json('/tasks/'+encodeURIComponent(taskId)+'/vision-status');
-  if(generation!==state.visionGeneration||state.task?.id!==taskId)return;
+  if(sequence!==state.sequence||state.task?.id!==taskId)return;
   if(status.task_id!==taskId||status.revision!==state.task.revision||status.content_sha256!==state.task.content_sha256){
    state.visionCandidateDigests={};renderVisionCandidates([]);
    notice('候选状态与当前任务修订不一致，请重新加载任务后核对。','warning');return;
@@ -287,7 +307,7 @@ async function refreshVisionStatus(){
   renderVisionCandidates(candidates);
   if(state.visionEvidenceReviewAnnotation&&!candidates.some(item=>item.id===state.visionEvidenceReviewAnnotation&&item.provenance?.job_id===state.visionEvidenceReviewJob?.id)){clearVisionEvidence();renderVisionEvidence();}
  }catch(error){
-  if(generation!==state.visionGeneration||state.task?.id!==taskId)return;
+  if(sequence!==state.sequence||state.task?.id!==taskId)return;
   state.visionCandidateDigests={};renderVisionCandidates([]);
   if(error.code!=='CONNECTION_FAILED')notice('视觉候选状态读取失败：'+describeError(error),'error');
  }
@@ -296,8 +316,19 @@ function resetVision(){
  // Saving reloads the same task; switching tasks suspends only its UI polling.
  // Keep one frozen job reference per task so neither action loses real work.
  if(state.task?.id&&state.visionJob?.task_id===state.task.id){if(!state.visionTasks)state.visionTasks=new Map();state.visionTasks.set(state.task.id,{job:state.visionJob,result:state.visionResult});}
- if(state.visionRetryOwner){state.busy=false;state.visionRetryOwner=null;}state.visionGeneration++;if(state.visionTimer){clearTimeout(state.visionTimer);state.visionTimer=null;}if(state.visionAbort){state.visionAbort.abort();state.visionAbort=null;}
+ if(state.visionRetryOwner){state.busy=false;state.visionRetryOwner=null;}
+ stopVisionPolling();
+ if(state.visionHistory){
+  state.visionHistory=null;
+  $('vision-history-list').replaceChildren();
+  $('vision-history-status').textContent='正在切换视频…';
+ }
  state.visionJob=null;state.visionResult=null;state.visionCandidateDigests={};if(typeof clearVisionEvidence==='function')clearVisionEvidence();renderVisionCandidates([]);renderVisionJob();
+}
+function stopVisionPolling(){
+ state.visionGeneration++;
+ if(state.visionTimer){clearTimeout(state.visionTimer);state.visionTimer=null;}
+ if(state.visionAbort){state.visionAbort.abort();state.visionAbort=null;}
 }
 function restoreTaskVision(){
  const cached=state.visionTasks?.get(state.task?.id);if(!cached||cached.job.task_id!==state.task.id)return;
@@ -306,6 +337,102 @@ function restoreTaskVision(){
 }
 function visionInputIsStale(){const job=state.visionJob,task=state.task;return Boolean(job&&task&&(job.task_id!==task.id||job.input_revision!==task.revision||job.input_sha256!==task.content_sha256));}
 function visionIsCurrent(taskId,generation,jobId){return state.visionGeneration===generation&&state.task?.id===taskId&&(!jobId||state.visionJob?.id===jobId);}
+const VISION_HISTORY_PAGE_SIZE=20;
+const VISION_JOB_STATE={queued:'排队',running:'运行中',cancel_requested:'取消中',succeeded:'已完成',failed:'失败',cancelled:'已取消'};
+function updateVisionHistorySelection(){
+ for(const button of $('vision-history-list').querySelectorAll('[data-vision-job-id]')){
+  if(button.dataset.visionJobId===state.visionJob?.id)button.setAttribute('aria-current','true');
+  else button.removeAttribute('aria-current');
+ }
+}
+function updateVisionHistoryNavigation(history){
+ $('vision-history-prev').disabled=history.loading||history.page===0;
+ $('vision-history-next').disabled=history.loading||!history.next;
+}
+function renderVisionHistory(history,moveFocus){
+ const list=$('vision-history-list');
+ list.replaceChildren();
+ for(const job of history.jobs){
+  const row=document.createElement('li');
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='quiet';
+  button.dataset.visionJobId=job.id;
+  const label=document.createElement('span');
+  label.textContent=(VISION_JOB_STATE[job.state]||'未知状态')+' · 作业 '+job.id.slice(-8);
+  const detail=document.createElement('span');
+  detail.className='muted';
+  const created=new Date(job.created_at);
+  const dateText=Number.isNaN(created.getTime())?job.created_at:created.toLocaleString('zh-CN',{hour12:false});
+  const range=job.window?showTime(job.window.start)+'–'+showTime(job.window.end)+' 秒':'全片';
+  const stale=job.input_revision!==state.task.revision||job.input_sha256!==state.task.content_sha256;
+  detail.textContent=dateText+' · '+range+' · r'+job.input_revision+(stale?' · 旧修订':'')+
+   (job.error_code?' · '+describeError({code:job.error_code}):'');
+  button.append(label,detail);
+  button.addEventListener('click',()=>selectVisionHistoryJob(history,job));
+  row.append(button);
+  list.append(row);
+ }
+ updateVisionHistorySelection();
+ updateVisionHistoryNavigation(history);
+ $('vision-history-status').textContent=history.jobs.length?
+  '第 '+(history.page+1)+' 页 · '+history.jobs.length+' 个作业'+(history.next?' · 还有更早作业':' · 已到最后一页'):
+  '这个视频还没有分析作业。';
+ if(moveFocus&&$('vision-history').open)(list.querySelector('button')||$('vision-history-refresh')).focus();
+}
+async function loadVisionHistory(page=0,{reset=false,moveFocus=false}={}){
+ const task=state.task;
+ if(!task)return;
+ if(reset||state.visionHistory?.taskId!==task.id){
+  $('vision-history-list').replaceChildren();
+  state.visionHistory={taskId:task.id,cursors:[null],page:0,next:null,jobs:[],loading:false};
+ }
+ const history=state.visionHistory;
+ if(history.loading||page<0||page>=history.cursors.length)return;
+ history.loading=true;
+ updateVisionHistoryNavigation(history);
+ $('vision-history-status').textContent='正在读取作业历史…';
+ const query=new URLSearchParams({limit:String(VISION_HISTORY_PAGE_SIZE)});
+ if(history.cursors[page])query.set('cursor',history.cursors[page]);
+ const current=()=>state.visionHistory===history&&state.task?.id===task.id;
+ try{
+  const data=await json('/tasks/'+encodeURIComponent(task.id)+'/vision-history?'+query.toString());
+  if(!current())return;
+  if(data.task_id!==task.id||!Array.isArray(data.jobs))throw new Error('作业历史与当前视频不一致');
+  history.page=page;
+  history.jobs=data.jobs;
+  history.next=data.next_cursor;
+  history.cursors.length=page+1;
+  if(history.next)history.cursors.push(history.next);
+  history.loading=false;
+  renderVisionHistory(history,moveFocus);
+ }catch(error){
+  if(!current())return;
+  history.loading=false;
+  updateVisionHistoryNavigation(history);
+  $('vision-history-status').textContent='读取作业历史失败：'+describeError(error)+'。请刷新列表重试。';
+ }
+}
+function selectVisionHistoryJob(history,job){
+ const task=state.task;
+ if(state.visionHistory!==history||!task||history.taskId!==task.id)return;
+ if(state.loadingTask||state.busy||state.pending){
+  notice('请等待当前任务操作完成再切换作业。','warning');
+  return;
+ }
+ stopVisionPolling();
+ clearVisionEvidence();
+ state.visionResult=null;
+ state.visionJob={...job,task_id:task.id,requested_window:job.window,terminal:false};
+ updateVisionHistorySelection();
+ renderVisionJob();
+ pollVision();
+}
+function refreshVisionPanel(){
+ refreshVisionStatus();
+ if(!state.visionJob)$('vision-history').open=true;
+ if($('vision-history').open)loadVisionHistory(0,{reset:true});
+}
 function setVisionWindowMedia(media){
  if(!media||state.visionWindowTaskId===state.task?.id)return;
  state.visionWindowTaskId=state.task?.id;
@@ -338,7 +465,7 @@ function selectedVisionWindow(){
 function renderVisionCoverage(){
  const box=$('vision-coverage'),job=state.visionJob,result=state.visionResult;
  renderActionVideoCoverage(job?result?.action_video_sampling:null);
- if(!job){box.textContent='尚未运行。请选择起止时间；长片需分段分析，候选仍需逐条核对。';return;}
+ if(!job){box.textContent='请选择分析区间，或从作业历史打开已有结果。';return;}
  const window=result?.window||job.requested_window;
  const range=window?'请求区间 '+showTime(window.start)+'–'+showTime(window.end)+' 秒（不含终点）':'旧作业请求整段媒体';
  if(!result){box.textContent=range+' · '+(job.state==='failed'?'作业失败，未取得可核对的完整结果。':job.state==='cancelled'?'作业已取消，未取得可核对的完整结果。':'结果尚未产生，不能推断已分析覆盖范围。');return;}
@@ -454,8 +581,8 @@ async function retryVision(){
  finally{if(state.visionAbort===controller)state.visionAbort=null;if(state.visionRetryOwner===owner){state.busy=false;state.visionRetryOwner=null;}renderSaveState();}
 }
 function renderVisionJob(){const box=$('vision-job'),cancel=$('vision-cancel');renderVisionCoverage();if(!state.visionJob){box.hidden=true;$('vision-apply').hidden=true;cancel.hidden=true;cancel.disabled=true;renderVisionRetry();return;}box.hidden=false;const names={queued:'排队',running:'运行中',cancel_requested:'取消中',succeeded:'已完成',failed:'失败',cancelled:'已取消'};const modules=state.visionResult?.module_status||{};const moduleText=['person','landmarks','face','ocr','clip','vlm','scene','motion','boundary'].filter(name=>modules[name]&&modules[name]!=='not_run').map(name=>name+'='+modules[name]).join(' ');const capability=state.visionResult?(()=>{const c=state.visionResult.content_sampling||{},a=state.visionResult.actions_sampling||{};const supported=(a.supported||[]).join('/')||'无';const unsupported=(a.unsupported||[]).join('/')||'无';return '六项能力 转场='+(modules.transition||'not_run')+' 内容='+(c.status||'not_run')+'('+(c.changes??0)+'变化/'+(c.filtered??0)+'过滤)'+' 人体/人脸/景别/运镜='+(modules.person||'not_run')+'/'+(modules.face||'not_run')+'/'+(modules.framing||'not_run')+'/'+(modules.motion||'not_run')+' 人脸关键点='+(modules.landmarks||'not_run')+' 动作='+(a.status||modules.actions||'not_run')+'('+(a.candidates?.length??0)+'候选;支持'+supported+';未支持'+unsupported+')'+' 表情='+(modules.expressive||'not_run')+(modules.expressive_reason?'('+modules.expressive_reason+')':'')+' 声学='+(modules.acoustics||'not_run')})():'';const runs=state.visionResult?.model_runs||[];const content=state.visionResult?.content_sampling;const contentText=content?' · 内容采样 '+content.status+' '+content.returned+' 帧 / 需 '+content.required_samples+' 帧'+(content.insufficient_scenes?'（'+content.insufficient_scenes+' 个镜头不足）':''):'';box.textContent='视觉任务 '+state.visionJob.id.slice(-8)+' · '+(names[state.visionJob.state]||state.visionJob.state)+(state.visionJob.error_code?' · '+describeError({code:state.visionJob.error_code}):'')+(state.visionResult?' · 候选镜头 '+state.visionResult.scenes.length+' 个、关键帧 '+state.visionResult.keyframes.length+' 个、运行记录 '+runs.length+' 条':'')+(moduleText?' · '+moduleText:'')+contentText+(capability?' · '+capability:'')+(visionInputIsStale()?' · 当前任务已修订，结果仅供查看；重新运行分析后才能应用。':'');const active=['queued','running','cancel_requested'].includes(state.visionJob.state);cancel.hidden=!active;cancel.disabled=!active||state.visionJob.state==='cancel_requested'||state.busy||state.loadingTask;$('vision-apply').hidden=!(state.visionJob.state==='succeeded'&&state.visionResult);$('vision-apply').disabled=Boolean(state.busy||state.pending||state.loadingTask||state.dirty||visionInputIsStale());renderVisionRetry();}
-async function pollVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||job.terminal||!taskId)return;const controller=new AbortController();state.visionAbort=controller;try{const status=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-status',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;if(status.task_id!==taskId||status.job_id!==job.id)throw new Error('视觉任务身份不匹配');state.visionJob={...job,...status};if(status.state==='succeeded'){state.visionResult=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-result',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;const content=state.visionResult.content_sampling;if(content?.status==='insufficient_samples'){const first=(content.scene_results||[]).find(item=>item.status==='insufficient_samples');notice('内容变化采样不足：'+(first?.message||('需要至少 '+content.required_samples+' 帧，当前 '+content.returned+' 帧'))+' 该镜头未判定为无变化。','warning');}state.visionJob.terminal=true;if(typeof renderVisionEvidence==='function')renderVisionEvidence();}else if(['failed','cancelled'].includes(status.state)){state.visionJob.terminal=true;}renderVisionJob();if(!state.visionJob.terminal)state.visionTimer=setTimeout(pollVision,1500);}catch(error){if(error.name==='AbortError'||!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:'failed',error_code:error.code||'STATUS_FAILED',error_message:error.message||'',terminal:true};renderVisionJob();notice('视觉任务状态读取失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;}}
-async function runVision(event){event?.preventDefault?.();if(!state.task||state.busy||state.dirty||state.loadingTask){notice('请先保存当前片段并等待任务加载完成。','warning');return;}const window=selectedVisionWindow();if(!window)return;const task=state.task;const sequence=state.sequence;state.busy=true;renderSaveState();try{const batch=await json('/tasks/'+encodeURIComponent(task.id)+'/vision-jobs',{method:'POST',body:JSON.stringify({command_id:commandId('vis'),expected_revision:task.revision,expected_sha256:task.content_sha256,window,subject_annotation_id:null})});if(sequence!==state.sequence||task.id!==state.task?.id)return;const item=batch.jobs?.[0];if(!item)throw new Error('Vision batch has no job');if(state.visionTimer){clearTimeout(state.visionTimer);state.visionTimer=null;}state.visionResult=null;clearVisionEvidence();state.visionJob={id:item.id||item.job_id,task_id:task.id,input_revision:task.revision,input_sha256:task.content_sha256,state:item.state||'queued',requested_window:window};renderVisionJob();pollVision();notice('已提交 '+showTime(window.start)+'–'+showTime(window.end)+' 秒的视觉分析；只生成候选，不自动改标注。','success');}catch(error){if(sequence===state.sequence&&task.id===state.task?.id)notice('视觉任务提交失败：'+describeError(error),'error');}finally{if(sequence===state.sequence)state.busy=false;renderSaveState();}}
+async function pollVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||job.terminal||!taskId)return;const controller=new AbortController();state.visionAbort=controller;try{const status=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-status',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;if(status.task_id!==taskId||status.job_id!==job.id)throw new Error('视觉任务身份不匹配');state.visionJob={...job,...status};if(status.state==='succeeded'){const candidate=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-result',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;state.visionResult=candidate;const content=candidate.content_sampling;if(content?.status==='insufficient_samples'){const first=(content.scene_results||[]).find(item=>item.status==='insufficient_samples');notice('内容变化采样不足：'+(first?.message||('需要至少 '+content.required_samples+' 帧，当前 '+content.returned+' 帧'))+' 该镜头未判定为无变化。','warning');}state.visionJob.terminal=true;if(typeof renderVisionEvidence==='function')renderVisionEvidence();}else if(['failed','cancelled'].includes(status.state)){state.visionJob.terminal=true;}renderVisionJob();if(!state.visionJob.terminal)state.visionTimer=setTimeout(pollVision,1500);}catch(error){if(error.name==='AbortError'||!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:'failed',error_code:error.code||'STATUS_FAILED',error_message:error.message||'',terminal:true};renderVisionJob();notice('视觉任务状态读取失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;}}
+async function runVision(event){event?.preventDefault?.();if(!state.task||state.busy||state.dirty||state.loadingTask){notice('请先保存当前片段并等待任务加载完成。','warning');return;}const window=selectedVisionWindow();if(!window)return;const task=state.task;const sequence=state.sequence;state.busy=true;renderSaveState();try{const batch=await json('/tasks/'+encodeURIComponent(task.id)+'/vision-jobs',{method:'POST',body:JSON.stringify({command_id:commandId('vis'),expected_revision:task.revision,expected_sha256:task.content_sha256,window,subject_annotation_id:null})});if(sequence!==state.sequence||task.id!==state.task?.id)return;const item=batch.jobs?.[0];if(!item)throw new Error('Vision batch has no job');stopVisionPolling();state.visionResult=null;clearVisionEvidence();state.visionJob={id:item.id||item.job_id,task_id:task.id,input_revision:task.revision,input_sha256:task.content_sha256,state:item.state||'queued',requested_window:window};renderVisionJob();pollVision();if($('vision-history')?.open)loadVisionHistory(0,{reset:true});notice('已提交 '+showTime(window.start)+'–'+showTime(window.end)+' 秒的视觉分析；只生成候选，不自动改标注。','success');}catch(error){if(sequence===state.sequence&&task.id===state.task?.id)notice('视觉任务提交失败：'+describeError(error),'error');}finally{if(sequence===state.sequence)state.busy=false;renderSaveState();}}
 async function cancelVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||!['queued','running','cancel_requested'].includes(job.state)||state.busy)return;state.busy=true;renderSaveState();const controller=new AbortController();state.visionAbort=controller;try{const result=await json('/jobs/'+encodeURIComponent(job.id)+'/control',{method:'POST',body:JSON.stringify({command_id:commandId('vcan'),action:'cancel'}),signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:result.state,cancel_requested:true,terminal:['cancelled','succeeded','failed'].includes(result.state)};renderVisionJob();if(state.visionJob.terminal){state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;notice('视觉任务已取消；未生成或未应用的候选不会改动标注。','warning');}else{notice('已请求取消；任务在下一个检查点停止，候选不会自动应用。','warning');state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;pollVision();}}catch(error){if(error.name!=='AbortError'&&visionIsCurrent(taskId,generation,job.id))notice('取消失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;if(taskId===state.task?.id)state.busy=false;renderSaveState();}}
 async function applyVision(){if(!state.task||!state.visionJob||!state.visionResult||state.busy||state.pending||state.loadingTask||state.dirty)return;if(visionInputIsStale()){notice('当前任务修订已改变；请重新运行视觉分析，旧结果不会直接写入当前标注。','warning');return;}const task=state.task;const jobId=state.visionJob.id;state.busy=true;renderSaveState();try{const result=await json('/jobs/'+encodeURIComponent(jobId)+'/apply-vision',{method:'POST',body:JSON.stringify({command_id:commandId('vap'),expected_revision:task.revision,expected_sha256:task.content_sha256,operation:'apply_vision_job',payload:{}})});await switchTask(task.id,{force:true});notice('视觉候选已写入；请逐条核对、修改并人工复核。','success');return result;}catch(error){notice('应用候选失败：'+describeError(error),'error');}finally{state.busy=false;renderSaveState();}}
 function fillForm(annotation=null){if(state.segmentPlayback&&state.segmentPlayback.annotationId!==(annotation?.id||null))pausePlayback({clearSegment:true});state.selected=annotation?.id||null;state.original=annotation?clone(annotation):null;const start=annotation?.start||{seconds:state.media.video_start},end=annotation?.end||{seconds:state.media.video_end};$('segment-label').value=annotation?.label||'';$('segment-start').value=showTime(start.seconds);$('segment-end').value=showTime(end.seconds);$('segment-text').value=annotation?.text||'';$('segment-track').value=annotation?.track||'main';const reserved=reservedTagParts(annotation?.tags||[]);$('segment-tags').value=reserved.plain.join('\n');$('segment-transition').value=TRANSITION_VALUES.has(reserved.transition)?reserved.transition:'';$('gradient-start').value=reserved.gradientStart;$('gradient-end').value=reserved.gradientEnd;if($('segment-reviewed'))$('segment-reviewed').checked=Boolean(annotation?.review_status==='reviewed'&&annotation?.review_binding);if($('review-notice')){$('review-notice').textContent='修改时间、标签、内容、转场/渐变、轨道或语义量值后，旧复核将失效，需重新核对并勾选。';$('review-notice').style.color='var(--muted)';}state.anchors={start:clone(start),end:clone(end)};state.formBase=currentForm();state.anchorBase=clone(state.anchors);state.dirty=false;state.conflict=false;const midpoint=rat(BigInt(start.seconds.n)*BigInt(end.seconds.d)+BigInt(end.seconds.n)*BigInt(start.seconds.d),2n*BigInt(start.seconds.d)*BigInt(end.seconds.d));$('split-at').value=showTime(midpoint);renderMeasurements(annotation);$('form-title').textContent=annotation?'编辑片段':'新增片段';updateAnchorLabels();renderSaveState();renderSegments();renderExportTracks();scheduleCompare();}
@@ -533,7 +660,7 @@ async function loadCompare(){
  }catch(error){if(!current())return;clearCompareSlots();$('compare-status').textContent='边界对照失败：'+error.message;notice('边界对照未完成：'+error.message,'error');}
 }
 
-async function switchTask(id,{force=false}={}){if(!force&&id===state.task?.id)return;if(!force&&!await mayLeave())return;const sequence=++state.sequence;resetVision();releaseCompare();state.loadingTask=true;renderSaveState();pausePlayback({clearSegment:true});releaseFrame();notice('正在加载任务…');try{const task=await json('/tasks/'+encodeURIComponent(id));if(sequence!==state.sequence)return;const media=state.snapshot.media.find(m=>m.id===task.media_id);if(!media)throw new Error('Missing media');state.task=task;state.media=media;setVisionWindowMedia(media);state.playError=null;state.playWaiting=false;$('loop-selection').checked=false;$('editor').hidden=false;$('empty-workspace').hidden=true;$('frame-mode').checked=false;$('seek').disabled=false;$('player').hidden=false;$('frame-controls').hidden=true;$('frame-identity').hidden=true;$('preview-mode').textContent='连续播放';$('player').src=API+'/media/'+encodeURIComponent(media.id)+'/playback';$('player').load();$('player').playbackRate=Number($('playback-rate').value);$('seek').max=String(seconds(media.duration));$('seek').value='0';$('duration-label').textContent=showTime(media.duration)+' s';$('frame-index').value='0';$('frame-total').textContent='/ '+media.frame_count+' 帧';$('media-name').textContent=taskName(task);$('media-meta').textContent='任务 '+task.id.slice(-8)+' · '+media.source_width+' × '+media.source_height+' · '+media.frame_count+' 帧 · 画面 '+showTime(media.video_start)+'–'+showTime(media.video_end)+' s';updateUndoRedoButtons();fillForm();renderTasks();updatePlaybackTime();notice('');listRecoverableDrafts();loadVisionOptions();restoreTaskVision();refreshVisionStatus();return true;}catch(error){if(sequence===state.sequence)notice(describeError(error),'error');return false;}finally{if(sequence===state.sequence){state.loadingTask=false;renderSaveState();}}}
+async function switchTask(id,{force=false}={}){if(!force&&id===state.task?.id)return;if(!force&&!await mayLeave())return;const sequence=++state.sequence;resetVision();releaseCompare();state.loadingTask=true;renderSaveState();pausePlayback({clearSegment:true});releaseFrame();notice('正在加载任务…');try{const task=await json('/tasks/'+encodeURIComponent(id));if(sequence!==state.sequence)return;const media=state.snapshot.media.find(m=>m.id===task.media_id);if(!media)throw new Error('Missing media');state.task=task;state.media=media;setVisionWindowMedia(media);state.playError=null;state.playWaiting=false;$('loop-selection').checked=false;$('editor').hidden=false;$('empty-workspace').hidden=true;$('frame-mode').checked=false;$('seek').disabled=false;$('player').hidden=false;$('frame-controls').hidden=true;$('frame-identity').hidden=true;$('preview-mode').textContent='连续播放';$('player').src=API+'/media/'+encodeURIComponent(media.id)+'/playback';$('player').load();$('player').playbackRate=Number($('playback-rate').value);$('seek').max=String(seconds(media.duration));$('seek').value='0';$('duration-label').textContent=showTime(media.duration)+' s';$('frame-index').value='0';$('frame-total').textContent='/ '+media.frame_count+' 帧';$('media-name').textContent=taskName(task);$('media-meta').textContent='任务 '+task.id.slice(-8)+' · '+media.source_width+' × '+media.source_height+' · '+media.frame_count+' 帧 · 画面 '+showTime(media.video_start)+'–'+showTime(media.video_end)+' s';updateUndoRedoButtons();fillForm();renderTasks();updatePlaybackTime();notice('');listRecoverableDrafts();loadVisionOptions();restoreTaskVision();refreshVisionStatus();if($('vision-history')?.open)loadVisionHistory();return true;}catch(error){if(sequence===state.sequence)notice(describeError(error),'error');return false;}finally{if(sequence===state.sequence){state.loadingTask=false;renderSaveState();}}}
 // Pixel layout is presentation-only; stored rational boundaries are never changed.
 function layoutTimelineTargets(segments,duration,width){
  if(!(Number.isFinite(duration)&&duration>0&&Number.isFinite(width)&&width>0))return {items:[],rows:0};
@@ -931,7 +1058,7 @@ async function togglePlayback(){if(!playbackAllowed())return;if(!$('frame-mode')
 function skipPlayback(delta){if(!playbackAllowed())return;const from=$('frame-mode').checked&&state.frame?seconds(state.frame.seconds):$('player').currentTime;leaveFrameForPlayback();seekPlayback(from+delta);renderPlayback();}
 async function playSelected(){if(!playbackAllowed())return;const annotation=selectedSegment();if(!annotation)return;const start=seconds(annotation.start.seconds),end=seconds(annotation.end.seconds);if(!(Number.isFinite(start)&&Number.isFinite(end)&&start<end)){notice('所选片段时间无效。','error');return;}await beginPlayback({segment:{taskId:state.task.id,annotationId:annotation.id,start,end}});}
 function handlePlaybackError(){if(!state.task||state.loadingTask||!$('player').error)return;pausePlayback({clearSegment:true});state.playError='视频播放失败（媒体错误 '+$('player').error.code+'）。草稿已保留；可重试播放或使用确定帧查看。';renderPlayback();}
-function keyboardTargetIsInteractive(target){return Boolean(target instanceof Element&&target.closest('input,textarea,select,button,a,video,audio,[contenteditable],[role="textbox"],[role="slider"]'));}
+function keyboardTargetIsInteractive(target){return Boolean(target instanceof Element&&target.closest('input,textarea,select,button,summary,a,video,audio,[contenteditable],[role="textbox"],[role="slider"]'));}
 function updatePlaybackTime(){if(!state.media)return;if($('frame-mode').checked&&!state.frame){$('time-readout').textContent='尚无确定帧';return;}const time=$('frame-mode').checked&&state.frame?seconds(state.frame.seconds):$('player').currentTime;$('time-readout').textContent=(Number.isFinite(time)?time.toFixed(3):'0.000')+' s / '+showTime(state.media.duration)+' s';$('seek').value=String(time||0);const curPct=100*(time||0)/seconds(state.media.duration)+'%';$('timeline-cursor').style.setProperty('--cursor',curPct);document.querySelectorAll('.track-cursor-line').forEach(el=>{el.style.left=curPct;});}
 async function showFrame(index){
  if(!state.task||state.loadingTask||!$('frame-mode').checked)return;
@@ -1301,7 +1428,7 @@ function bind(){
  $('restore-draft-file').addEventListener('change',()=>{const file=$('restore-draft-file').files?.[0];$('restore-draft-file').value='';restoreDraftFile(file);});
  $('restore-saved-draft').addEventListener('click',()=>{try{restoreDraftEnvelope(JSON.parse($('saved-drafts').value)).catch(e=>notice(e.message,'error'));}catch(e){notice(e.message,'error');}});
  if($('segment-reviewed'))$('segment-reviewed').addEventListener('change',()=>{if($('review-notice')){$('review-notice').textContent=$('segment-reviewed').checked?'已勾选人工复核。保存后将记录为 reviewed。':'未勾选人工复核。';$('review-notice').style.color=$('segment-reviewed').checked?'var(--accent)':'var(--muted)';}updateDirty();});
- $('segment-form').addEventListener('submit',saveSegment);$('delete-segment').addEventListener('click',deleteSegment);$('file-input').addEventListener('change',importFiles);$('task-filter').addEventListener('input',renderTasks);$('refresh-workspace').addEventListener('click',refreshWorkspace);$('vision-window-form').addEventListener('submit',runVision);for(const id of ['vision-window-start','vision-window-end'])$(id).addEventListener('input',()=>visionWindowFeedback('',null));$('vision-refresh').addEventListener('click',refreshVisionStatus);$('vision-apply').addEventListener('click',applyVision);$('vision-cancel').addEventListener('click',cancelVision);$('vision-retry').addEventListener('click',retryVision);$('vision-evidence-frame').addEventListener('change',()=>{loadVisionEvidenceFrame().catch(error=>{$('vision-evidence-status').textContent=String(error.message||error);});});for(const [id,delta]of [['vision-evidence-prev',-1],['vision-evidence-next',1]])$(id).addEventListener('click',()=>{state.visionEvidencePage+=delta;renderVisionEvidence();});$('export-workspace').addEventListener('click',exportWorkspace);
+ $('segment-form').addEventListener('submit',saveSegment);$('delete-segment').addEventListener('click',deleteSegment);$('file-input').addEventListener('change',importFiles);$('task-filter').addEventListener('input',renderTasks);$('refresh-workspace').addEventListener('click',refreshWorkspace);$('vision-window-form').addEventListener('submit',runVision);for(const id of ['vision-window-start','vision-window-end'])$(id).addEventListener('input',()=>visionWindowFeedback('',null));$('vision-refresh').addEventListener('click',refreshVisionPanel);$('vision-apply').addEventListener('click',applyVision);$('vision-cancel').addEventListener('click',cancelVision);$('vision-retry').addEventListener('click',retryVision);$('vision-evidence-frame').addEventListener('change',()=>{loadVisionEvidenceFrame().catch(error=>{$('vision-evidence-status').textContent=String(error.message||error);});});for(const [id,delta]of [['vision-evidence-prev',-1],['vision-evidence-next',1]])$(id).addEventListener('click',()=>{state.visionEvidencePage+=delta;renderVisionEvidence();});$('export-workspace').addEventListener('click',exportWorkspace);
  $('stop-import').addEventListener('click',stopBatchUploads);$('cancel-batch-queued').addEventListener('click',()=>{cancelOwnedBatchIntakes().catch(()=>{});});
  $('new-segment').addEventListener('click',async()=>{if(await mayLeave())fillForm();});$('discard-draft').addEventListener('click',async()=>{if(await mayLeave())fillForm(state.original);});$('reload-task').addEventListener('click',async()=>{if(await confirmAction('丢弃此页草稿并加载任务最新修订；其他标签页已经保存的修改会保留。')){await loadSnapshot();await switchTask(state.task.id,{force:true});}});$('pending-retry').addEventListener('click',()=>recoverPending({resend:true}));
  const invalidateReview=()=>{if($('segment-reviewed')?.checked){$('segment-reviewed').checked=false;if($('review-notice')){$('review-notice').textContent='内容已修改，旧复核已自动取消。请核实当前内容后重新勾选。';$('review-notice').style.color='var(--warn)';}}};for(const id of ['segment-label','segment-text','segment-track','segment-tags'])$(id).addEventListener('input',()=>{invalidateReview();updateDirty();});for(const which of ['start','end'])$('segment-'+which).addEventListener('input',()=>{delete state.anchors[which];updateAnchorLabels();invalidateReview();updateDirty();});
@@ -1331,6 +1458,16 @@ function bind(){
  });
  $('player').addEventListener('error',handlePlaybackError);$('player').addEventListener('ratechange',()=>{const rate=String($('player').playbackRate);if(Array.from($('playback-rate').options).some(o=>o.value===rate))$('playback-rate').value=rate;renderPlayback();});$('seek').addEventListener('input',()=>{if(!$('frame-mode').checked)seekPlayback(Number($('seek').value));});$('frame-mode').addEventListener('change',toggleFrameMode);$('frame-show').addEventListener('click',()=>showFrame($('frame-index').value));for(const [id,delta]of [['frame-prev',-1n],['frame-next',1n]])$(id).addEventListener('click',()=>{try{showFrame((BigInt($('frame-index').value)+delta).toString());}catch(_){notice('请输入有效帧序号。','error');}});
  window.addEventListener('beforeunload',event=>{if(state.dirty||state.pending||state.importing||state.loadingTask||Boolean(state.batch&&state.batch.running)){event.preventDefault();event.returnValue='';}});
+ $('vision-history').addEventListener('toggle',()=>{
+  if($('vision-history').open&&!state.visionHistory)loadVisionHistory();
+ });
+ $('vision-history-prev').addEventListener('click',()=>{
+  if(state.visionHistory)loadVisionHistory(state.visionHistory.page-1,{moveFocus:true});
+ });
+ $('vision-history-next').addEventListener('click',()=>{
+  if(state.visionHistory)loadVisionHistory(state.visionHistory.page+1,{moveFocus:true});
+ });
+ $('vision-history-refresh').addEventListener('click',()=>loadVisionHistory(0,{reset:true}));
  document.addEventListener('keydown',event=>{if(event.isComposing||event.keyCode===229||$('confirm-dialog').open)return;if((event.ctrlKey||event.metaKey)&&!event.altKey&&!keyboardTargetIsInteractive(event.target)){const k=event.key.toLowerCase();if(k==='z'){event.preventDefault();if(event.shiftKey)performRedo();else performUndo();return;}if(k==='y'){event.preventDefault();performRedo();return;}}if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='s'){event.preventDefault();if(state.task&&!state.busy&&!state.pending&&!state.loadingTask)$('segment-form').requestSubmit();return;}if(event.ctrlKey||event.metaKey||event.altKey||event.shiftKey||event.repeat||keyboardTargetIsInteractive(event.target)||!playbackAllowed())return;const key=event.key.toLowerCase();if(event.code==='Space'||event.key===' '){event.preventDefault();togglePlayback();}else if(key==='i'||key==='o'){event.preventDefault();captureTime(key==='i'?'start':'end');}});
 }
 async function start(){

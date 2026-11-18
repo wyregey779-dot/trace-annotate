@@ -97,6 +97,20 @@ The process-local concurrency slot remains occupied until its processor exits.
 Separate CLI invocations cannot control a project held by a running server;
 use that server's authenticated control endpoint while it owns the project.
 
+## Visual analysis job history
+
+Open **作业历史** in the visual assistance panel for the selected video. Each
+page lists up to 20 persisted jobs, with the requested interval, original task
+revision, creation time, and state. Select a job to read its existing result or
+follow its latest status. Opening a job does not submit an analysis. A running
+job can continue while you inspect another entry.
+
+The local API exposes `GET tasks/{id}/vision-history?limit=20&cursor=CURSOR`.
+Omit the cursor on the first page and use the returned `next_cursor` for the
+next page. Job details and candidate artifacts use the existing job endpoints.
+A result from an older task revision remains readable. Applying it requires a
+fresh analysis against the current revision.
+
 ## HTTP surface
 
 `workspace serve --project PATH` prints the local URL. Requests under
