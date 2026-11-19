@@ -112,7 +112,7 @@ def _harness():
     script = "\n".join([
         "const token='fixture-token',API='/api/v1/projects/current';const $=id=>document.getElementById(id);",
         "const fixtureTask={id:'task-A',revision:7,content_sha256:'" + "a" * 64 + "',annotations:[]};",
-        "const state={snapshot:{project_id:'fixture-project'},task:fixtureTask,sequence:4,busy:false,pending:null,loadingTask:false,dirty:false,visionGeneration:0,visionJob:null,visionResult:null,visionTimer:null,visionAbort:null};",
+        "const state={snapshot:{project_id:'fixture-project'},task:fixtureTask,media:{id:'media-A',playback:{sha256:'c'.repeat(64)}},sequence:4,busy:false,pending:null,loadingTask:false,dirty:false,visionGeneration:0,visionJob:null,visionResult:null,visionTimer:null,visionAbort:null};",
         _implementation(source, "function notice(", "function confirmAction("),
         _implementation(source, "async function loadVisionOptions(", "function renderVisionCandidates("),
         _implementation(source, "function visionInputIsStale(", "async function runVision("),
@@ -167,7 +167,9 @@ def test_real_chrome_retry_click_receipts_stale_input_and_task_races(tmp_path):
                 self.send(200, {"job_id": "job-fixture", "task_id": "task-A", "input_revision": 7,
                                "input_sha256": "a" * 64, "state": observed["state"]})
             elif self.path.endswith("/vision-result"):
-                self.send(200, {"scenes": [], "keyframes": [], "model_runs": [], "module_status": {},
+                    self.send(200, {"job_id": "job-fixture", "task_id": "task-A", "input_revision": 7,
+                                   "input_sha256": "a" * 64, "media_id": "media-A", "file_sha256": "c" * 64,
+                                   "scenes": [], "keyframes": [], "model_runs": [], "module_status": {},
                                "annotations": [{"review_status": "unreviewed"}]})
             else:
                 self.send(404, {})

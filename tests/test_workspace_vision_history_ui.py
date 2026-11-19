@@ -97,6 +97,8 @@ def project(tmp_path, clip, monkeypatch):
 
 
 def _task(page, task_id, expect):
+    expect(page.locator('#task-list button[aria-current="true"]')).to_have_count(1)
+    page.wait_for_function("() => !state.loadingTask")
     button = page.locator(f'button[data-task-id="{task_id}"]')
     button.click()
     expect(button).to_have_attribute("aria-current", "true")
@@ -176,6 +178,101 @@ def test_reopened_browser_can_page_and_view_an_existing_read_only_result(project
         assert store.get_task(task_a) == initial_task
         with store.transaction():
             assert store.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 23
+
+
+@pytest.mark.parametrize("fault", ["vision-status", "vision-result", "foreign-result"])
+def test_refresh_recovers_a_read_failure_without_retrying_the_job(project, browser, fault):
+    store, _, task_id, _, job, _ = project
+    chrome, expect = browser
+    job_id = job["id"]
+    writes = []
+    initial_task = store.get_task(task_id)
+
+    def track_writes(request):
+        if request.method == "POST":
+            writes.append(request.url)
+
+    with running(store) as server:
+        page = chrome.new_page()
+        try:
+            page.on("request", track_writes)
+            page.goto(server.editor_url)
+            _task(page, task_id, expect)
+            _open(page)
+            if fault == "foreign-result":
+                page.route(_job_url(job_id, "vision-result"),
+                           lambda route: route.fulfill(json={"job_id": "foreign-job"}), times=1)
+            else:
+                page.route(_job_url(job_id, fault), lambda route: route.abort("failed"), times=1)
+            _row(page, job_id).click()
+            expect(page.locator("#vision-job")).to_contain_text("暂时无法读取")
+            expect(page.locator("#vision-job")).to_contain_text("已完成")
+            expect(page.locator("#vision-retry")).to_be_hidden()
+            expect(page.locator("#vision-apply")).to_be_hidden()
+
+            with page.expect_response(_job_url(job_id, "vision-result")) as response:
+                page.locator("#vision-refresh").click()
+            assert response.value.ok
+            assert response.value.json()["job_id"] == job_id
+            expect(page.locator("#vision-job")).to_contain_text("候选镜头")
+            expect(page.locator("#vision-job")).not_to_contain_text("暂时无法读取")
+            expect(page.locator("#status")).not_to_contain_text("暂时无法读取")
+            expect(page.locator("#vision-apply")).to_be_enabled()
+            assert not writes, writes
+            assert store.get_task(task_id) == initial_task
+        finally:
+            page.close()
+
+
+def test_cancel_receipt_clears_a_previous_read_error(project, browser):
+    store, _, task_id, _, _, _ = project
+    chrome, expect = browser
+    with running(store) as server:
+        job_id = _submit(server.vision_jobs, task_id, "cancel-after-read-error", end=60)["id"]
+        page = chrome.new_page()
+        try:
+            page.goto(server.editor_url)
+            _task(page, task_id, expect)
+            _open(page)
+            page.route(_job_url(job_id, "vision-status"), lambda route: route.abort("failed"), times=1)
+            _row(page, job_id).click()
+            expect(page.locator("#vision-job")).to_contain_text("暂时无法读取")
+            page.locator("#vision-cancel").click()
+            expect(page.locator("#vision-job")).to_contain_text("已取消")
+            expect(page.locator("#vision-job")).not_to_contain_text("暂时无法读取")
+            expect(page.locator("#vision-retry")).to_be_enabled()
+            assert server.queue.get_job(job_id)["state"] == "cancelled"
+        finally:
+            page.close()
+
+
+def test_selected_history_row_tracks_a_terminal_state_without_moving_focus(project, browser):
+    store, task_id, _, _, _, active = project
+    chrome, expect = browser
+    with running(store) as server:
+        page = chrome.new_page()
+        try:
+            page.goto(server.editor_url)
+            _task(page, task_id, expect)
+            _open(page)
+            row = _row(page, active["id"])
+            expect(row).to_contain_text("运行中")
+            order = page.locator("#vision-history [data-vision-job-id]").evaluate_all(
+                "rows => rows.map(row => row.dataset.visionJobId)"
+            )
+            with page.expect_response(_job_url(active["id"], "vision-status")):
+                row.click()
+            expect(row).to_be_focused()
+            server.queue.fail(active["id"], active["lease_generation"], "history-worker")
+            expect(page.locator("#vision-job")).to_contain_text("失败")
+            expect(row).to_contain_text("失败")
+            expect(row).to_be_focused()
+            expect(row).to_have_attribute("aria-current", "true")
+            assert page.locator("#vision-history [data-vision-job-id]").evaluate_all(
+                "rows => rows.map(row => row.dataset.visionJobId)"
+            ) == order
+        finally:
+            page.close()
 
 
 def test_late_history_and_running_status_cannot_overwrite_the_user_selection(project, browser):

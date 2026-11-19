@@ -333,7 +333,7 @@ function stopVisionPolling(){
 function restoreTaskVision(){
  const cached=state.visionTasks?.get(state.task?.id);if(!cached||cached.job.task_id!==state.task.id)return;
  state.visionJob={...cached.job};state.visionResult=cached.result;renderVisionJob();if(typeof renderVisionEvidence==='function')renderVisionEvidence();
- if(!['succeeded','failed','cancelled'].includes(state.visionJob.state))pollVision();
+ if(state.visionJob.readError||!['succeeded','failed','cancelled'].includes(state.visionJob.state))pollVision();
 }
 function visionInputIsStale(){const job=state.visionJob,task=state.task;return Boolean(job&&task&&(job.task_id!==task.id||job.input_revision!==task.revision||job.input_sha256!==task.content_sha256));}
 function visionIsCurrent(taskId,generation,jobId){return state.visionGeneration===generation&&state.task?.id===taskId&&(!jobId||state.visionJob?.id===jobId);}
@@ -349,6 +349,26 @@ function updateVisionHistoryNavigation(history){
  $('vision-history-prev').disabled=history.loading||history.page===0;
  $('vision-history-next').disabled=history.loading||!history.next;
 }
+function describeVisionHistoryJob(job,button){
+ const [label,detail]=button.children;
+ label.textContent=(VISION_JOB_STATE[job.state]||'未知状态')+' · 作业 '+job.id.slice(-8);
+ const created=new Date(job.created_at);
+ const dateText=Number.isNaN(created.getTime())?job.created_at:created.toLocaleString('zh-CN',{hour12:false});
+ const range=job.window?showTime(job.window.start)+'–'+showTime(job.window.end)+' 秒':'全片';
+ const stale=job.input_revision!==state.task.revision||job.input_sha256!==state.task.content_sha256;
+ detail.textContent=dateText+' · '+range+' · r'+job.input_revision+(stale?' · 旧修订':'')+
+  (job.error_code?' · '+describeError({code:job.error_code}):'');
+}
+function syncVisionHistoryJob(status){
+ const history=state.visionHistory;
+ if(history?.taskId!==status.task_id)return;
+ const job=history.jobs.find(item=>item.id===status.job_id);
+ if(!job||(job.state===status.state&&job.error_code===status.error_code))return;
+ job.state=status.state;
+ job.error_code=status.error_code;
+ const button=$('vision-history-list').querySelector('[data-vision-job-id="'+job.id+'"]');
+ if(button)describeVisionHistoryJob(job,button);
+}
 function renderVisionHistory(history,moveFocus){
  const list=$('vision-history-list');
  list.replaceChildren();
@@ -359,16 +379,10 @@ function renderVisionHistory(history,moveFocus){
   button.className='quiet';
   button.dataset.visionJobId=job.id;
   const label=document.createElement('span');
-  label.textContent=(VISION_JOB_STATE[job.state]||'未知状态')+' · 作业 '+job.id.slice(-8);
   const detail=document.createElement('span');
   detail.className='muted';
-  const created=new Date(job.created_at);
-  const dateText=Number.isNaN(created.getTime())?job.created_at:created.toLocaleString('zh-CN',{hour12:false});
-  const range=job.window?showTime(job.window.start)+'–'+showTime(job.window.end)+' 秒':'全片';
-  const stale=job.input_revision!==state.task.revision||job.input_sha256!==state.task.content_sha256;
-  detail.textContent=dateText+' · '+range+' · r'+job.input_revision+(stale?' · 旧修订':'')+
-   (job.error_code?' · '+describeError({code:job.error_code}):'');
   button.append(label,detail);
+  describeVisionHistoryJob(job,button);
   button.addEventListener('click',()=>selectVisionHistoryJob(history,job));
   row.append(button);
   list.append(row);
@@ -395,12 +409,15 @@ async function loadVisionHistory(page=0,{reset=false,moveFocus=false}={}){
  const query=new URLSearchParams({limit:String(VISION_HISTORY_PAGE_SIZE)});
  if(history.cursors[page])query.set('cursor',history.cursors[page]);
  const current=()=>state.visionHistory===history&&state.task?.id===task.id;
+ const selectedAtRequest=state.visionJob;
  try{
   const data=await json('/tasks/'+encodeURIComponent(task.id)+'/vision-history?'+query.toString());
   if(!current())return;
   if(data.task_id!==task.id||!Array.isArray(data.jobs))throw new Error('作业历史与当前视频不一致');
   history.page=page;
   history.jobs=data.jobs;
+  const selected=state.visionJob;
+  if(selected?.job_id&&selected!==selectedAtRequest)syncVisionHistoryJob(selected);
   history.next=data.next_cursor;
   history.cursors.length=page+1;
   if(history.next)history.cursors.push(history.next);
@@ -430,6 +447,7 @@ function selectVisionHistoryJob(history,job){
 }
 function refreshVisionPanel(){
  refreshVisionStatus();
+ if(state.visionJob?.readError&&!state.busy&&!state.loadingTask&&!state.visionAbort)pollVision();
  if(!state.visionJob)$('vision-history').open=true;
  if($('vision-history').open)loadVisionHistory(0,{reset:true});
 }
@@ -552,13 +570,13 @@ function renderActionVideoCoverage(sampling,{historicalJobId=null}={}){
  }
  details.append(scenes);panel.append(details);
 }
-function renderVisionRetry(){const button=$('vision-retry');const retryable=Boolean(state.visionJob&&['failed','cancelled'].includes(state.visionJob.state)&&state.visionJob.error_code!=='VISION_RESUBMIT_REQUIRED');button.hidden=!retryable;button.disabled=Boolean(!retryable||state.busy||state.pending||state.loadingTask||state.dirty||visionInputIsStale());}
+function renderVisionRetry(){const button=$('vision-retry');const retryable=Boolean(state.visionJob&&!state.visionJob.readError&&['failed','cancelled'].includes(state.visionJob.state)&&state.visionJob.error_code!=='VISION_RESUBMIT_REQUIRED');button.hidden=!retryable;button.disabled=Boolean(!retryable||state.busy||state.pending||state.loadingTask||state.dirty||visionInputIsStale());}
 function visionRetryKey(job){return 'traceannotate-vision-retry:'+state.snapshot.project_id+':'+job.id;}
 function savedVisionRetry(job){if(job.retryControl)return job.retryControl;try{const value=JSON.parse(sessionStorage.getItem(visionRetryKey(job))||'null');if(value?.job_id===job.id&&value.task_id===job.task_id&&value.expected_revision===job.input_revision&&value.expected_sha256===job.input_sha256&&['retry_failed','retry_cancelled'].includes(value.action)&&typeof value.command_id==='string'&&/^[A-Za-z][A-Za-z0-9_-]{0,95}$/.test(value.command_id))return value;}catch(_){}return null;}
 function stashVisionRetry(job,control){job.retryControl=control;try{if(control)sessionStorage.setItem(visionRetryKey(job),JSON.stringify(control));else sessionStorage.removeItem(visionRetryKey(job));}catch(_){notice('浏览器暂时无法保存重试回执标识；请保持当前页面直到结果确认。','warning');}}
 async function retryVision(){
  const job=state.visionJob,task=state.task,taskId=task?.id,generation=state.visionGeneration;
- if(!job||!['failed','cancelled'].includes(job.state)||job.error_code==='VISION_RESUBMIT_REQUIRED'||state.busy||state.pending||state.loadingTask||state.dirty)return;
+ if(!job||job.readError||!['failed','cancelled'].includes(job.state)||job.error_code==='VISION_RESUBMIT_REQUIRED'||state.busy||state.pending||state.loadingTask||state.dirty)return;
  if(visionInputIsStale()){notice('任务内容已改变，请重新加载并运行分析；旧任务未重试。','warning');return;}
  const owner={};state.visionRetryOwner=owner;state.busy=true;renderSaveState();const controller=new AbortController();state.visionAbort=controller;
  let control=savedVisionRetry(job);
@@ -580,11 +598,51 @@ async function retryVision(){
  }catch(error){if(error.name==='AbortError'||!current())return;const rejected=error.details?.commit_status==='not_committed';if(rejected)stashVisionRetry(job,null);if(['REVISION_CONFLICT','MEDIA_CHANGED'].includes(error.code))notice('任务内容已改变，请重新加载并运行分析；旧任务未重试。','warning');else if(rejected)notice('重试未执行：'+describeError(error)+'。请刷新状态后核对。','error');else notice('重试结果尚未确认：'+describeError(error)+'。再次点击会先核对同一命令的回执。','error');}
  finally{if(state.visionAbort===controller)state.visionAbort=null;if(state.visionRetryOwner===owner){state.busy=false;state.visionRetryOwner=null;}renderSaveState();}
 }
-function renderVisionJob(){const box=$('vision-job'),cancel=$('vision-cancel');renderVisionCoverage();if(!state.visionJob){box.hidden=true;$('vision-apply').hidden=true;cancel.hidden=true;cancel.disabled=true;renderVisionRetry();return;}box.hidden=false;const names={queued:'排队',running:'运行中',cancel_requested:'取消中',succeeded:'已完成',failed:'失败',cancelled:'已取消'};const modules=state.visionResult?.module_status||{};const moduleText=['person','landmarks','face','ocr','clip','vlm','scene','motion','boundary'].filter(name=>modules[name]&&modules[name]!=='not_run').map(name=>name+'='+modules[name]).join(' ');const capability=state.visionResult?(()=>{const c=state.visionResult.content_sampling||{},a=state.visionResult.actions_sampling||{};const supported=(a.supported||[]).join('/')||'无';const unsupported=(a.unsupported||[]).join('/')||'无';return '六项能力 转场='+(modules.transition||'not_run')+' 内容='+(c.status||'not_run')+'('+(c.changes??0)+'变化/'+(c.filtered??0)+'过滤)'+' 人体/人脸/景别/运镜='+(modules.person||'not_run')+'/'+(modules.face||'not_run')+'/'+(modules.framing||'not_run')+'/'+(modules.motion||'not_run')+' 人脸关键点='+(modules.landmarks||'not_run')+' 动作='+(a.status||modules.actions||'not_run')+'('+(a.candidates?.length??0)+'候选;支持'+supported+';未支持'+unsupported+')'+' 表情='+(modules.expressive||'not_run')+(modules.expressive_reason?'('+modules.expressive_reason+')':'')+' 声学='+(modules.acoustics||'not_run')})():'';const runs=state.visionResult?.model_runs||[];const content=state.visionResult?.content_sampling;const contentText=content?' · 内容采样 '+content.status+' '+content.returned+' 帧 / 需 '+content.required_samples+' 帧'+(content.insufficient_scenes?'（'+content.insufficient_scenes+' 个镜头不足）':''):'';box.textContent='视觉任务 '+state.visionJob.id.slice(-8)+' · '+(names[state.visionJob.state]||state.visionJob.state)+(state.visionJob.error_code?' · '+describeError({code:state.visionJob.error_code}):'')+(state.visionResult?' · 候选镜头 '+state.visionResult.scenes.length+' 个、关键帧 '+state.visionResult.keyframes.length+' 个、运行记录 '+runs.length+' 条':'')+(moduleText?' · '+moduleText:'')+contentText+(capability?' · '+capability:'')+(visionInputIsStale()?' · 当前任务已修订，结果仅供查看；重新运行分析后才能应用。':'');const active=['queued','running','cancel_requested'].includes(state.visionJob.state);cancel.hidden=!active;cancel.disabled=!active||state.visionJob.state==='cancel_requested'||state.busy||state.loadingTask;$('vision-apply').hidden=!(state.visionJob.state==='succeeded'&&state.visionResult);$('vision-apply').disabled=Boolean(state.busy||state.pending||state.loadingTask||state.dirty||visionInputIsStale());renderVisionRetry();}
-async function pollVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||job.terminal||!taskId)return;const controller=new AbortController();state.visionAbort=controller;try{const status=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-status',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;if(status.task_id!==taskId||status.job_id!==job.id)throw new Error('视觉任务身份不匹配');state.visionJob={...job,...status};if(status.state==='succeeded'){const candidate=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-result',{signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;state.visionResult=candidate;const content=candidate.content_sampling;if(content?.status==='insufficient_samples'){const first=(content.scene_results||[]).find(item=>item.status==='insufficient_samples');notice('内容变化采样不足：'+(first?.message||('需要至少 '+content.required_samples+' 帧，当前 '+content.returned+' 帧'))+' 该镜头未判定为无变化。','warning');}state.visionJob.terminal=true;if(typeof renderVisionEvidence==='function')renderVisionEvidence();}else if(['failed','cancelled'].includes(status.state)){state.visionJob.terminal=true;}renderVisionJob();if(!state.visionJob.terminal)state.visionTimer=setTimeout(pollVision,1500);}catch(error){if(error.name==='AbortError'||!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:'failed',error_code:error.code||'STATUS_FAILED',error_message:error.message||'',terminal:true};renderVisionJob();notice('视觉任务状态读取失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;}}
+function renderVisionJob(){const box=$('vision-job'),cancel=$('vision-cancel');renderVisionCoverage();if(!state.visionJob){box.hidden=true;$('vision-apply').hidden=true;cancel.hidden=true;cancel.disabled=true;renderVisionRetry();return;}box.hidden=false;const names={queued:'排队',running:'运行中',cancel_requested:'取消中',succeeded:'已完成',failed:'失败',cancelled:'已取消'};const modules=state.visionResult?.module_status||{};const moduleText=['person','landmarks','face','ocr','clip','vlm','scene','motion','boundary'].filter(name=>modules[name]&&modules[name]!=='not_run').map(name=>name+'='+modules[name]).join(' ');const capability=state.visionResult?(()=>{const c=state.visionResult.content_sampling||{},a=state.visionResult.actions_sampling||{};const supported=(a.supported||[]).join('/')||'无';const unsupported=(a.unsupported||[]).join('/')||'无';return '六项能力 转场='+(modules.transition||'not_run')+' 内容='+(c.status||'not_run')+'('+(c.changes??0)+'变化/'+(c.filtered??0)+'过滤)'+' 人体/人脸/景别/运镜='+(modules.person||'not_run')+'/'+(modules.face||'not_run')+'/'+(modules.framing||'not_run')+'/'+(modules.motion||'not_run')+' 人脸关键点='+(modules.landmarks||'not_run')+' 动作='+(a.status||modules.actions||'not_run')+'('+(a.candidates?.length??0)+'候选;支持'+supported+';未支持'+unsupported+')'+' 表情='+(modules.expressive||'not_run')+(modules.expressive_reason?'('+modules.expressive_reason+')':'')+' 声学='+(modules.acoustics||'not_run')})():'';const runs=state.visionResult?.model_runs||[];const content=state.visionResult?.content_sampling;const contentText=content?' · 内容采样 '+content.status+' '+content.returned+' 帧 / 需 '+content.required_samples+' 帧'+(content.insufficient_scenes?'（'+content.insufficient_scenes+' 个镜头不足）':''):'';box.textContent='视觉任务 '+state.visionJob.id.slice(-8)+' · '+(names[state.visionJob.state]||state.visionJob.state)+(state.visionJob.error_code?' · '+describeError({code:state.visionJob.error_code}):'')+(state.visionResult?' · 候选镜头 '+state.visionResult.scenes.length+' 个、关键帧 '+state.visionResult.keyframes.length+' 个、运行记录 '+runs.length+' 条':'')+(moduleText?' · '+moduleText:'')+contentText+(capability?' · '+capability:'')+(visionInputIsStale()?' · 当前任务已修订，结果仅供查看；重新运行分析后才能应用。':'')+(state.visionJob.readError?' · '+state.visionJob.readError:'');const active=['queued','running','cancel_requested'].includes(state.visionJob.state);cancel.hidden=!active;cancel.disabled=!active||state.visionJob.state==='cancel_requested'||state.busy||state.loadingTask;$('vision-apply').hidden=!(state.visionJob.state==='succeeded'&&state.visionResult);$('vision-apply').disabled=Boolean(state.busy||state.pending||state.loadingTask||state.dirty||state.visionJob.readError||visionInputIsStale());renderVisionRetry();}
+async function pollVision(){
+ const job=state.visionJob,taskId=state.task?.id,generation=state.visionGeneration;
+ if(!job||job.terminal||!taskId)return;
+ state.visionTimer=null;
+ const controller=new AbortController();
+ state.visionAbort=controller;
+ const current=()=>visionIsCurrent(taskId,generation,job.id);
+ let readingResult=false;
+ try{
+  const status=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-status',{signal:controller.signal});
+  if(!current())return;
+  if(status.task_id!==taskId||status.job_id!==job.id||status.input_revision!==job.input_revision||status.input_sha256!==job.input_sha256)throw new Error('视觉任务身份不匹配');
+  state.visionJob={...job,...status};
+  syncVisionHistoryJob(status);
+  if(status.state==='succeeded'){
+   readingResult=true;
+   const candidate=await json('/jobs/'+encodeURIComponent(job.id)+'/vision-result',{signal:controller.signal});
+   if(!current())return;
+   if(candidate.job_id!==job.id||candidate.task_id!==taskId||candidate.input_revision!==job.input_revision||candidate.input_sha256!==job.input_sha256||candidate.media_id!==state.media?.id||candidate.file_sha256!==state.media?.playback?.sha256)throw new Error('视觉结果身份不匹配');
+   state.visionResult=candidate;
+   const content=candidate.content_sampling;
+   if(content?.status==='insufficient_samples'){
+    const first=(content.scene_results||[]).find(item=>item.status==='insufficient_samples');
+    notice('内容变化采样不足：'+(first?.message||('需要至少 '+content.required_samples+' 帧，当前 '+content.returned+' 帧'))+' 该镜头未判定为无变化。','warning');
+   }
+   if(typeof renderVisionEvidence==='function')renderVisionEvidence();
+  }
+  state.visionJob.readError=null;
+  if(job.readError&&$('status').textContent===job.readError)notice('');
+  state.visionJob.terminal=['succeeded','failed','cancelled'].includes(status.state);
+  renderVisionJob();
+  if(!state.visionJob.terminal)state.visionTimer=setTimeout(pollVision,1500);
+ }catch(error){
+  if(controller.signal.aborted||!current())return;
+  state.visionJob.readError='暂时无法读取'+(readingResult?'结果':'状态')+'：'+describeError(error)+'。点击“刷新状态”重新读取。';
+  renderVisionJob();
+  notice(state.visionJob.readError,'warning');
+ }finally{
+  if(state.visionAbort===controller)state.visionAbort=null;
+ }
+}
 async function runVision(event){event?.preventDefault?.();if(!state.task||state.busy||state.dirty||state.loadingTask){notice('请先保存当前片段并等待任务加载完成。','warning');return;}const window=selectedVisionWindow();if(!window)return;const task=state.task;const sequence=state.sequence;state.busy=true;renderSaveState();try{const batch=await json('/tasks/'+encodeURIComponent(task.id)+'/vision-jobs',{method:'POST',body:JSON.stringify({command_id:commandId('vis'),expected_revision:task.revision,expected_sha256:task.content_sha256,window,subject_annotation_id:null})});if(sequence!==state.sequence||task.id!==state.task?.id)return;const item=batch.jobs?.[0];if(!item)throw new Error('Vision batch has no job');stopVisionPolling();state.visionResult=null;clearVisionEvidence();state.visionJob={id:item.id||item.job_id,task_id:task.id,input_revision:task.revision,input_sha256:task.content_sha256,state:item.state||'queued',requested_window:window};renderVisionJob();pollVision();if($('vision-history')?.open)loadVisionHistory(0,{reset:true});notice('已提交 '+showTime(window.start)+'–'+showTime(window.end)+' 秒的视觉分析；只生成候选，不自动改标注。','success');}catch(error){if(sequence===state.sequence&&task.id===state.task?.id)notice('视觉任务提交失败：'+describeError(error),'error');}finally{if(sequence===state.sequence)state.busy=false;renderSaveState();}}
-async function cancelVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||!['queued','running','cancel_requested'].includes(job.state)||state.busy)return;state.busy=true;renderSaveState();const controller=new AbortController();state.visionAbort=controller;try{const result=await json('/jobs/'+encodeURIComponent(job.id)+'/control',{method:'POST',body:JSON.stringify({command_id:commandId('vcan'),action:'cancel'}),signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:result.state,cancel_requested:true,terminal:['cancelled','succeeded','failed'].includes(result.state)};renderVisionJob();if(state.visionJob.terminal){state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;notice('视觉任务已取消；未生成或未应用的候选不会改动标注。','warning');}else{notice('已请求取消；任务在下一个检查点停止，候选不会自动应用。','warning');state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;pollVision();}}catch(error){if(error.name!=='AbortError'&&visionIsCurrent(taskId,generation,job.id))notice('取消失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;if(taskId===state.task?.id)state.busy=false;renderSaveState();}}
-async function applyVision(){if(!state.task||!state.visionJob||!state.visionResult||state.busy||state.pending||state.loadingTask||state.dirty)return;if(visionInputIsStale()){notice('当前任务修订已改变；请重新运行视觉分析，旧结果不会直接写入当前标注。','warning');return;}const task=state.task;const jobId=state.visionJob.id;state.busy=true;renderSaveState();try{const result=await json('/jobs/'+encodeURIComponent(jobId)+'/apply-vision',{method:'POST',body:JSON.stringify({command_id:commandId('vap'),expected_revision:task.revision,expected_sha256:task.content_sha256,operation:'apply_vision_job',payload:{}})});await switchTask(task.id,{force:true});notice('视觉候选已写入；请逐条核对、修改并人工复核。','success');return result;}catch(error){notice('应用候选失败：'+describeError(error),'error');}finally{state.busy=false;renderSaveState();}}
+async function cancelVision(){const job=state.visionJob;const taskId=state.task?.id;const generation=state.visionGeneration;if(!job||!['queued','running','cancel_requested'].includes(job.state)||state.busy)return;state.busy=true;renderSaveState();const controller=new AbortController();state.visionAbort=controller;try{const result=await json('/jobs/'+encodeURIComponent(job.id)+'/control',{method:'POST',body:JSON.stringify({command_id:commandId('vcan'),action:'cancel'}),signal:controller.signal});if(!visionIsCurrent(taskId,generation,job.id))return;state.visionJob={...job,state:result.state,cancel_requested:true,readError:null,terminal:['cancelled','succeeded','failed'].includes(result.state)};renderVisionJob();if(state.visionJob.terminal){state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;notice('视觉任务已取消；未生成或未应用的候选不会改动标注。','warning');}else{notice('已请求取消；任务在下一个检查点停止，候选不会自动应用。','warning');state.visionTimer&&clearTimeout(state.visionTimer);state.visionTimer=null;pollVision();}}catch(error){if(error.name!=='AbortError'&&visionIsCurrent(taskId,generation,job.id))notice('取消失败：'+describeError(error),'error');}finally{if(state.visionAbort===controller)state.visionAbort=null;if(taskId===state.task?.id)state.busy=false;renderSaveState();}}
+async function applyVision(){if(!state.task||!state.visionJob||!state.visionResult||state.visionJob.readError||state.busy||state.pending||state.loadingTask||state.dirty)return;if(visionInputIsStale()){notice('当前任务修订已改变；请重新运行视觉分析，旧结果不会直接写入当前标注。','warning');return;}const task=state.task;const jobId=state.visionJob.id;state.busy=true;renderSaveState();try{const result=await json('/jobs/'+encodeURIComponent(jobId)+'/apply-vision',{method:'POST',body:JSON.stringify({command_id:commandId('vap'),expected_revision:task.revision,expected_sha256:task.content_sha256,operation:'apply_vision_job',payload:{}})});await switchTask(task.id,{force:true});notice('视觉候选已写入；请逐条核对、修改并人工复核。','success');return result;}catch(error){notice('应用候选失败：'+describeError(error),'error');}finally{state.busy=false;renderSaveState();}}
 function fillForm(annotation=null){if(state.segmentPlayback&&state.segmentPlayback.annotationId!==(annotation?.id||null))pausePlayback({clearSegment:true});state.selected=annotation?.id||null;state.original=annotation?clone(annotation):null;const start=annotation?.start||{seconds:state.media.video_start},end=annotation?.end||{seconds:state.media.video_end};$('segment-label').value=annotation?.label||'';$('segment-start').value=showTime(start.seconds);$('segment-end').value=showTime(end.seconds);$('segment-text').value=annotation?.text||'';$('segment-track').value=annotation?.track||'main';const reserved=reservedTagParts(annotation?.tags||[]);$('segment-tags').value=reserved.plain.join('\n');$('segment-transition').value=TRANSITION_VALUES.has(reserved.transition)?reserved.transition:'';$('gradient-start').value=reserved.gradientStart;$('gradient-end').value=reserved.gradientEnd;if($('segment-reviewed'))$('segment-reviewed').checked=Boolean(annotation?.review_status==='reviewed'&&annotation?.review_binding);if($('review-notice')){$('review-notice').textContent='修改时间、标签、内容、转场/渐变、轨道或语义量值后，旧复核将失效，需重新核对并勾选。';$('review-notice').style.color='var(--muted)';}state.anchors={start:clone(start),end:clone(end)};state.formBase=currentForm();state.anchorBase=clone(state.anchors);state.dirty=false;state.conflict=false;const midpoint=rat(BigInt(start.seconds.n)*BigInt(end.seconds.d)+BigInt(end.seconds.n)*BigInt(start.seconds.d),2n*BigInt(start.seconds.d)*BigInt(end.seconds.d));$('split-at').value=showTime(midpoint);renderMeasurements(annotation);$('form-title').textContent=annotation?'编辑片段':'新增片段';updateAnchorLabels();renderSaveState();renderSegments();renderExportTracks();scheduleCompare();}
 function releaseFrame(){state.frameSequence++;state.frame=null;state.loadingFrame=false;delete $('frame-image').dataset.frameIndex;delete $('frame-image').dataset.mediaId;if(state.frameBlob){URL.revokeObjectURL(state.frameBlob);state.frameBlob=null;}$('frame-image').removeAttribute('src');$('frame-image').hidden=true;$('frame-placeholder').hidden=true;$('frame-identity').textContent='';}
 let compareTimer=null;
