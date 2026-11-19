@@ -37,9 +37,9 @@ trace-annotate workspace serve --project ../traceannotate-workspace
 
 Open the local URL printed by the server. Select videos, wait for admission, then create and save annotations in separate tasks. The workspace supports decoded-frame selection, overlapping tracks, professional JSON and optional annotated-video export. Reuse the project directory to resume saved work. Keep the original videos and a verified project backup; a JSON export is not a complete backup of media or historical artifacts. See the [workspace guide](docs/WORKSPACE_DEVELOPMENT.md) and [professional JSON guide](docs/PROFESSIONAL_JSON.md).
 
-![Workspace editor showing a synthetic video and a saved segment](docs/media/workspace-synthetic.png)
+![TraceAnnotate workspace showing a real cooking video, segment editor, frame comparison, and multi-track timeline](docs/media/workspace-demo.png)
 
-An actual browser screenshot using a synthetic test video and test labels. The analysis result shown is a candidate and has not yet been saved as a report. The workspace interface is currently in Chinese.
+Screenshot from the [visual-assist development branch](https://github.com/wyregey779-dot/trace-annotate/tree/feat/vision-assist-20261103), showing a saved multi-track example and adjacent-frame comparison. The video frames come from [*Patata tortilla*](https://commons.wikimedia.org/wiki/File:Patata_tortilla.webm) by Elene B. This screenshot combines frame excerpts with the annotation workspace and is available under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 
 The older `video-ui` and `embodied-ui` editors remain available as separate workflows; their files and workspace tasks are not automatically shared. The workspace does not automatically identify video content, track objects or certify annotation quality.
 
