@@ -87,6 +87,8 @@ def test_vfr_review_pack_uses_actual_before_and_current_pts(observed_vfr, tmp_pa
     css = output / manifest["review_page"]["stylesheet"]["path"]
     assert reference.sha256(page) == manifest["review_page"]["sha256"]
     assert reference.sha256(css) == manifest["review_page"]["stylesheet"]["sha256"]
+    assert b"\r\n" not in page.read_bytes()
+    assert b"\r\n" not in css.read_bytes()
     page_text = page.read_text(encoding="utf-8")
     assert "未人工复核" in page_text
     assert page_text.index('<div class="frames">') < page_text.index('<details class="metadata">')
@@ -213,15 +215,15 @@ def test_review_page_rejects_foreign_image_path_and_failed_render_has_no_manifes
 
 
 def test_partial_page_write_cannot_leave_success_manifest(observed_vfr, tmp_path, monkeypatch):
-    original = Path.write_text
+    original = Path.write_bytes
 
-    def incomplete_html(self, data, *args, **kwargs):
+    def incomplete_html(self, data):
         if self.name == "index.html.incomplete":
-            original(self, "incomplete", *args, **kwargs)
+            original(self, b"incomplete")
             raise OSError("simulated write interruption")
-        return original(self, data, *args, **kwargs)
+        return original(self, data)
 
-    monkeypatch.setattr(Path, "write_text", incomplete_html)
+    monkeypatch.setattr(Path, "write_bytes", incomplete_html)
     output = tmp_path / "interrupted-page"
     with pytest.raises(OSError, match="simulated write interruption"):
         pack.build_pack(observed_vfr[0], output)

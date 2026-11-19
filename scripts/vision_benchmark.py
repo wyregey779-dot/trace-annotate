@@ -77,7 +77,7 @@ def _sha256(path: Path) -> str:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    path.write_text(text, encoding="utf-8", newline="\n")
+    path.write_bytes(text.encode("utf-8"))
 
 
 def _finite_float(value: Any, label: str) -> float:
@@ -232,7 +232,7 @@ def run_scene_scores(video: Path, out: Path, *, ffmpeg: str = "ffmpeg",
     parsed = parse_scene_metadata(proc.stdout)
     if raw_out is not None:
         raw_out.parent.mkdir(parents=True, exist_ok=True)
-        raw_out.write_text(proc.stdout, encoding="utf-8", newline="\n")
+        raw_out.write_bytes(proc.stdout.encode("utf-8"))
     payload = {
         "schema": "traceannotate.vision-benchmark.scene-scores.v1",
         "ok": proc.returncode == 0 and parsed["complete"],

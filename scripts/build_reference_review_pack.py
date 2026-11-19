@@ -355,8 +355,8 @@ def build_pack(reference_path: Path, output: Path, *, timeout: int = 300) -> dic
         pending_css = output / "review.css.incomplete"
         pending_page = output / "index.html.incomplete"
         pending_manifest = output / "manifest.json.incomplete"
-        pending_css.write_text(REVIEW_CSS, encoding="utf-8", newline="\n")
-        pending_page.write_text(page, encoding="utf-8", newline="\n")
+        pending_css.write_bytes(REVIEW_CSS.encode("utf-8"))
+        pending_page.write_bytes(page.encode("utf-8"))
         manifest["review_page"] = {"path": "index.html", "sha256": R.sha256(pending_page),
                                    "stylesheet": {"path": "review.css", "sha256": R.sha256(pending_css)},
                                    "scope": "read-only; no human adjudication"}

@@ -143,7 +143,7 @@ jobs:
       - name: Verify offline review and visual job history in Chromium
         run: |
           python -c "import shutil, playwright.sync_api; assert shutil.which('ffmpeg') and shutil.which('ffprobe')"
-          python -m pytest tests/test_reference_review_pack.py::test_offline_review_page_loads_verified_images_in_chromium tests/test_workspace_action_video_coverage_ui.py tests/test_workspace_visual_evidence_ui.py tests/test_workspace_vision_history_ui.py -q -rs
+          python -m pytest tests/test_reference_review_pack.py::test_offline_review_page_loads_verified_images_in_chromium tests/test_workspace_action_video_coverage_ui.py tests/test_workspace_visual_evidence_ui.py tests/test_workspace_vision_history_ui.py tests/test_workspace_vision_window_ui.py -q -rs
         env:
           TRACE_ANNOTATE_REVIEW_PAGE_EVIDENCE_DIR: output/reference-review-ci
 

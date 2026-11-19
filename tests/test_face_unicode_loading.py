@@ -10,7 +10,7 @@ from trace_annotate.extractors import faces as F
 
 def install_create(monkeypatch, create):
     monkeypatch.setattr(F, "HAS_CV2", True)
-    monkeypatch.setattr(F, "cv2", SimpleNamespace(FaceDetectorYN=SimpleNamespace(create=create)))
+    monkeypatch.setattr(F, "cv2", SimpleNamespace(FaceDetectorYN=SimpleNamespace(create=create)), raising=False)
 
 
 def test_unicode_model_uses_complete_buffer_overload_without_writing_files(monkeypatch, tmp_path):

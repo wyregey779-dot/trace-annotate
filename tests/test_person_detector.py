@@ -1,6 +1,7 @@
 """Person detections retain model geometry and fail closed without a provider."""
 import json
 import stat
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,12 +30,20 @@ def test_missing_model_never_reports_zero_people(tmp_path):
     assert result['persons_detected'] == []
 
 
-def test_invalid_model_is_failed_not_missing(tmp_path):
+def test_invalid_model_is_failed_not_missing(tmp_path, monkeypatch):
     path = tmp_path / '损坏.onnx'
     path.write_bytes(b'not an onnx model')
+    def reject_invalid_model(data, *, sess_options, providers):
+        assert data == path.read_bytes()
+        assert sess_options.intra_op_num_threads == sess_options.inter_op_num_threads == 1
+        assert providers == ['CPUExecutionProvider']
+        raise RuntimeError('invalid ONNX model')
+    monkeypatch.setitem(sys.modules, 'onnxruntime', SimpleNamespace(
+        __version__='test', SessionOptions=SimpleNamespace, InferenceSession=reject_invalid_model))
     extractor = PersonExtractor(str(path))
     result = extractor.detect_people(np.zeros((100, 100, 3), dtype=np.uint8))
     assert result['status'] == 'failed'
+    assert result['reason'] == 'person_model_load_failed'
     assert result['person_count'] is None
 
 

@@ -30,6 +30,9 @@ def assert_legacy_empty(result, status):
 def test_missing_runtime_is_not_run_and_has_load_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", None)
     monkeypatch.setitem(sys.modules, "rapidocr", None)
+    def unexpected_distribution(name):
+        pytest.fail(f"Missing OCR runtime must not look up unrelated metadata: {name!r}")
+    monkeypatch.setattr(module.metadata, "distribution", unexpected_distribution)
     value = OCRExtractor()
     assert value.load_error
     assert value.code_identity["weights_sha256"] is None

@@ -243,6 +243,7 @@ def test_cli_boundary_metrics_writes_input_hashes(tmp_path: Path) -> None:
         "--tolerance-frames", "1", "--out", str(out),
     ])
     assert exit_code == 0
+    assert out.read_bytes().endswith(b"\n") and b"\r\n" not in out.read_bytes()
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert payload["best"]["f1"] == 1.0
     assert payload["inputs"]["scores_sha256"]

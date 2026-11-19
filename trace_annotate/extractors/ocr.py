@@ -67,12 +67,14 @@ class OCRExtractor(BaseExtractor):
     @property
     def code_identity(self) -> Dict[str, Any]:
         """Hash all three selected files, keeping code and model licenses separate."""
-        try:
-            distribution = metadata.distribution(self.runtime_backend)
-            runtime_version = distribution.version
-        except (metadata.PackageNotFoundError, TypeError, ValueError):
-            distribution = None
-            runtime_version = "unavailable"
+        distribution = None
+        runtime_version = "unavailable"
+        if self.runtime_backend:
+            try:
+                distribution = metadata.distribution(self.runtime_backend)
+                runtime_version = distribution.version
+            except metadata.PackageNotFoundError:
+                pass
         licenses = []
         if distribution is not None:
             for item in distribution.files or []:

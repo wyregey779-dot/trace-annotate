@@ -1,7 +1,7 @@
 """VideoMAE SSV2 remains an offline, non-authoritative window helper."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import builtins
 import hashlib
 import json
@@ -1189,6 +1189,7 @@ class FakeModel:
 
 
 def test_forward_result_keeps_participant_references_null(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(no_grad=nullcontext))
     extractor = A.VideoActionAuxiliary()
     extractor.processor = FakeProcessor()
     extractor.model = FakeModel(46)
@@ -1205,7 +1206,8 @@ def test_forward_result_keeps_participant_references_null(monkeypatch):
     assert "weights_path" not in result["model_identity"]
 
 
-def test_forward_failure_never_publishes_third_party_exception_paths():
+def test_forward_failure_never_publishes_third_party_exception_paths(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'torch', types.SimpleNamespace(no_grad=nullcontext))
     class ExplodingModel(FakeModel):
         def __call__(self, **inputs):
             raise RuntimeError(r"failed to open D:\private\models\secret.bin")

@@ -40,6 +40,7 @@ def test_window_form_submits_exact_bounded_interval_and_reports_sparse_coverage(
     assert 'id="vision-window-end"' in EDITOR_HTML
     snippets = [
         _implementation(source, "function gcd(", "function clone("),
+        _implementation(source, "function stopVisionPolling(", "function restoreTaskVision("),
         _implementation(source, "function setVisionWindowMedia(", "function renderVisionRetry("),
         _implementation(source, "async function runVision(", "async function cancelVision("),
     ]
@@ -55,7 +56,7 @@ const element=id=>{
 const calls=[],responses=[];
 const media={duration:{n:'240',d:'1'},video_start:{n:'0',d:'1'},video_end:{n:'240',d:'1'}};
 const state={task:{id:'task-A',revision:4,content_sha256:'a'.repeat(64)},media,
- sequence:1,busy:false,dirty:false,loadingTask:false,visionTimer:null,visionResult:null,visionJob:null};
+ sequence:1,busy:false,dirty:false,loadingTask:false,visionTimer:null,visionResult:null,visionJob:null,visionGeneration:0};
 const context={state,$:element,BigInt,console,JSON,crypto:{randomUUID:()=> '1'.repeat(32)},
  commandId:()=> 'vis-test',renderSaveState:()=>{},clearVisionEvidence:()=>{},renderVisionJob:()=>{},pollVision:()=>{},
  notice:(...args)=>calls.push(args),describeError:error=>String(error),
@@ -73,6 +74,8 @@ for(const snippet of snippets)vm.runInContext(snippet,context);
  assert.deepEqual(JSON.parse(JSON.stringify(responses[0].body.window)),
   {start:{n:'1',d:'3'},end:{n:'100',d:'3'}});
  assert.equal(state.visionJob.requested_window.start.n,'1');
+ assert.equal(state.visionGeneration,1);
+ assert.equal(calls.at(-1)[1],'success');
  element('vision-window-start').value='0';element('vision-window-end').value='121';
  await context.runVision({preventDefault(){}});
  assert.equal(responses.length,1,'overlong window must not reach server');
@@ -124,6 +127,7 @@ def test_real_chrome_click_submits_window_and_rejects_empty_input():
     assert "novalidate" in form
     snippets = [
         _implementation(source, "function gcd(", "function clone("),
+        _implementation(source, "function stopVisionPolling(", "function restoreTaskVision("),
         _implementation(source, "function setVisionWindowMedia(", "function renderVisionRetry("),
         _implementation(source, "async function runVision(", "async function cancelVision("),
     ]
@@ -131,7 +135,7 @@ def test_real_chrome_click_submits_window_and_rejects_empty_input():
 const $=id=>document.getElementById(id);
 const media={duration:{n:'240',d:'1'},video_start:{n:'0',d:'1'},video_end:{n:'240',d:'1'}};
 const state={task:{id:'task-A',revision:4,content_sha256:'a'.repeat(64)},media,
- sequence:1,busy:false,dirty:false,loadingTask:false,visionTimer:null,visionResult:null,visionJob:null};
+ sequence:1,busy:false,dirty:false,loadingTask:false,visionTimer:null,visionResult:null,visionJob:null,visionGeneration:0};
 const posts=[];
 const commandId=()=> 'vis-browser-test';
 const renderSaveState=()=>{},clearVisionEvidence=()=>{},renderVisionJob=()=>{},pollVision=()=>{};
@@ -155,6 +159,7 @@ async function json(path,options){posts.push({path,method:options.method,body:JS
             page.locator("#vision-window-end").fill("100/3")
             page.locator("#vision-run").click()
             page.wait_for_function("window.visionWindowPosts.length === 1")
+            page.wait_for_function("state.visionJob?.state === 'queued' && state.visionGeneration === 1")
             post = page.evaluate("window.visionWindowPosts[0]")
             assert post == {
                 "path": "/tasks/task-A/vision-jobs", "method": "POST",
